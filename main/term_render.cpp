@@ -36,8 +36,9 @@ bool TermRenderer::begin()
         ESP_LOGE(TAG, "font metrics unavailable (w=%d h=%d)", cell_w_, cell_h_);
         return false;
     }
-    cols_ = gfx_.width() / cell_w_;
-    rows_ = gfx_.height() / cell_h_;
+    cols_      = gfx_.width() / cell_w_;
+    rows_      = gfx_.height() / cell_h_;
+    full_rows_ = rows_;
 
     for (int i = 0; i < 16; ++i) {
         pal_[i] = gfx_.color565(kBase16[i][0], kBase16[i][1], kBase16[i][2]);
@@ -89,10 +90,17 @@ void append_utf8(std::string& out, uint32_t cp)
 
 }  // namespace
 
-void TermRenderer::draw_row(vt::Terminal& term, int y)
+void TermRenderer::draw_row(vt::Terminal& term, int y, int x_from, int x_to)
 {
     const int64_t t_draw = esp_timer_get_time();
-    row_.fillSprite(pal_[vt::kDefaultBg]);
+
+    // 範囲の端が全角セルを割っていると、片方だけ塗って相棒を描き直さないので
+    // グリフが半分消える。端を全角の境界まで広げる。
+    if (x_from > 0 && term.view_cell(x_from, y).width == 0) --x_from;
+    if (x_to < cols_ - 1 && term.view_cell(x_to, y).width == 2) ++x_to;
+    // 転送する範囲だけ塗る。行全体を毎回 1280px 送るのが最大の無駄だった。
+    row_.fillRect(x_from * cell_w_, 0, (x_to - x_from + 1) * cell_w_, cell_h_,
+                  pal_[vt::kDefaultBg]);
 
     // 履歴を見ている間はカーソルを描かない（過去の行の上に出ると紛らわしい）。
     const bool cursor_here =
@@ -101,8 +109,8 @@ void TermRenderer::draw_row(vt::Terminal& term, int y)
 
     // 同じ見た目が続く区間をまとめて 1 回の drawString で描く。
     // drawChar は指定した座標に描いてくれない (advance は正しいが位置が効かない) ので使わない。
-    int x = 0;
-    while (x < cols_) {
+    int x = x_from;
+    while (x <= x_to) {
         const vt::Cell& head = term.view_cell(x, y);
         if (head.width == 0) {  // 孤立した右半分（通常ここには来ない）
             ++x;
@@ -127,7 +135,7 @@ void TermRenderer::draw_row(vt::Terminal& term, int y)
 
         const int start_x = x;
         std::string run;
-        while (x < cols_) {
+        while (x <= x_to) {
             const vt::Cell& c = term.view_cell(x, y);
             if (c.width == 0) {
                 ++x;
@@ -162,8 +170,15 @@ void TermRenderer::draw_row(vt::Terminal& term, int y)
 
     const int64_t t_push = esp_timer_get_time();
     last_draw_us_ += static_cast<uint32_t>(t_push - t_draw);
-    row_.pushSprite(0, y * cell_h_);
+    // pushSprite に部分矩形版が無いので、転送先のクリップ矩形で範囲を絞る。
+    // これで 1 行 1280px を毎回送らずに済む（タイプ入力なら数セル分だけ）。
+    const int px_from = x_from * cell_w_;
+    const int px_w    = (x_to - x_from + 1) * cell_w_;
+    gfx_.setClipRect(px_from, y * cell_h_, px_w, cell_h_);
+    row_.pushSprite(&gfx_, 0, y * cell_h_);
+    gfx_.clearClipRect();
     last_push_us_ += static_cast<uint32_t>(esp_timer_get_time() - t_push);
+    last_px_ += static_cast<uint32_t>((x_to - x_from + 1) * cell_w_ * cell_h_);
 }
 
 void TermRenderer::render(vt::Terminal& term, bool force)
@@ -177,13 +192,30 @@ void TermRenderer::render(vt::Terminal& term, bool force)
     int drawn     = 0;
     last_draw_us_ = 0;
     last_push_us_ = 0;
+    last_px_      = 0;
     // 転送の準備を 1 回にまとめる。行ごとに pushSprite するとその都度セットアップが走る。
     gfx_.startWrite();
     for (int y = 0; y < rows_; ++y) {
         // カーソルが動いたら、消す側と描く側の 2 行も描き直す。
-        const bool need = force || term.is_dirty(y) || (cursor_moved && (y == cur_y_ || y == cy));
+        const bool cursor_row = cursor_moved && (y == cur_y_ || y == cy);
+        const bool need       = force || term.is_dirty(y) || cursor_row;
         if (!need) continue;
-        draw_row(term, y);
+
+        int x_from = 0;
+        int x_to   = cols_ - 1;
+        if (!force && !cursor_row && term.is_dirty(y)) {
+            x_from = term.dirty_min_x(y);
+            x_to   = term.dirty_max_x(y);
+        } else if (!force && cursor_row && term.is_dirty(y)) {
+            // カーソルが絡む行は、変更範囲とカーソル位置の両方を含める。
+            x_from = std::min(term.dirty_min_x(y), std::min(cur_x_, cx));
+            x_to   = std::max(term.dirty_max_x(y), std::max(cur_x_, cx));
+        } else if (!force && cursor_row) {
+            x_from = std::max(0, std::min(cur_x_, cx) - 1);
+            x_to   = std::min(cols_ - 1, std::max(cur_x_, cx) + 1);
+        }
+        if (x_to < x_from) continue;
+        draw_row(term, y, x_from, x_to);
         ++drawn;
     }
     gfx_.endWrite();

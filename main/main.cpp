@@ -22,6 +22,10 @@
 #include "romaji.hpp"
 #include "skk_dict.hpp"
 #include "ssh.hpp"
+#include "blake2s.hpp"
+#include "kbd_ui.hpp"
+#include "noise.hpp"
+#include "transport.hpp"
 #include "term_render.hpp"
 #include "vt100.hpp"
 #include "wifi.hpp"
@@ -33,6 +37,7 @@ const char* TAG = "boot";
 M5GFX                          display;
 std::unique_ptr<TermRenderer>  renderer;
 std::unique_ptr<vt::Terminal>  term;
+std::unique_ptr<KeyboardUi>    keyboard;
 
 // M5GFX はパネル・タッチの判別結果を NVS にキャッシュする。NVS を初期化しておかないと
 // 毎起動でフルプローブ（タッチ IC のファームウェア待ちを含む）が走る。
@@ -353,6 +358,119 @@ int cmd_key(int argc, char** argv)
     return 0;
 }
 
+// 差分転送の効き目を測る。1 文字ずつ書いたときの再描画コストを見る。
+int cmd_bench(int, char**)
+{
+    renderer->render(*term, /*force=*/true);
+    const uint32_t full_us = renderer->last_render_us();
+    const uint32_t full_px = renderer->last_pixels();
+
+    // 1 文字入力を 20 回。実際のタイプ入力に相当する。
+    uint32_t typing_us = 0, typing_px = 0;
+    for (int i = 0; i < 20; ++i) {
+        term->write("x");
+        renderer->render(*term);
+        typing_us += renderer->last_render_us();
+        typing_px += renderer->last_pixels();
+    }
+    term->write("\r\n");
+    renderer->render(*term);
+
+    std::printf("full screen: %u us (%u px)\n", (unsigned)full_us, (unsigned)full_px);
+    std::printf("20 keystrokes: %u us total, %u us each (%u px each)\n", (unsigned)typing_us,
+                (unsigned)(typing_us / 20), (unsigned)(typing_px / 20));
+    return 0;
+}
+
+int cmd_kbd(int argc, char** argv)
+{
+    const bool show = (argc < 2) || (std::string(argv[1]) != "off");
+    keyboard->set_visible(show);
+    // 隠したら画面全体を端末に使う。端末側の行数と PTY サイズも合わせる。
+    const int rows = show ? (display.height() - keyboard->height()) / renderer->cell_h()
+                          : renderer->full_rows();
+    renderer->set_rows(rows);
+    term->resize(renderer->cols(), rows);
+    if (ssh_is_connected()) ssh_resize(renderer->cols(), rows);
+    renderer->render(*term, /*force=*/true);
+    std::printf("keyboard %s, terminal %dx%d\n", show ? "shown" : "hidden", renderer->cols(), rows);
+    return 0;
+}
+
+// WireGuard の暗号とハンドシェイクを実機で検証する（ホストテストと同じ流れ）。
+int cmd_wgtest(int, char**)
+{
+    const auto& c = wg::default_crypto();
+
+    // BLAKE2s の既知値
+    uint8_t h[32];
+    wg::blake2s(h, 32, reinterpret_cast<const uint8_t*>("abc"), 3);
+    const char* want = "508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982";
+    char        got[65] = {};
+    for (int i = 0; i < 32; ++i) std::snprintf(got + i * 2, 3, "%02x", h[i]);
+    std::printf("blake2s(abc): %s\n", std::strcmp(got, want) == 0 ? "ok" : got);
+
+    // X25519 (RFC 7748 のベクタ)
+    uint8_t priv[32] = {0x77, 0x07, 0x6d, 0x0a, 0x73, 0x18, 0xa5, 0x7d, 0x3c, 0x16, 0xc1,
+                        0x72, 0x51, 0xb2, 0x66, 0x45, 0xdf, 0x4c, 0x2f, 0x87, 0xeb, 0xc0,
+                        0x99, 0x2a, 0xb1, 0x77, 0xfb, 0xa5, 0x1d, 0xb9, 0x2c, 0x2a};
+    uint8_t pub[32];
+    int64_t t0 = esp_timer_get_time();
+    bool    ok = c.dh_pubkey(pub, priv);
+    int64_t dh_us = esp_timer_get_time() - t0;
+    for (int i = 0; i < 32; ++i) std::snprintf(got + i * 2, 3, "%02x", pub[i]);
+    const char* want_pub = "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a";
+    std::printf("x25519 pubkey: %s (%lld us)\n",
+                (ok && std::strcmp(got, want_pub) == 0) ? "ok" : got, dh_us);
+
+    // ハンドシェイクを自分同士で往復させる
+    uint8_t a_priv[32], b_priv[32], a_pub[32], b_pub[32];
+    if (!c.random_bytes(a_priv, 32) || !c.random_bytes(b_priv, 32) ||
+        !c.dh_pubkey(a_pub, a_priv) || !c.dh_pubkey(b_pub, b_priv)) {
+        std::printf("key generation failed (no entropy?)\n");
+        return 1;
+    }
+
+    wg::Handshake ini(c), res(c);
+    if (!ini.set_keys(a_priv, b_pub) || !res.set_keys(b_priv, a_pub)) {
+        std::printf("set_keys failed\n");
+        return 1;
+    }
+    const uint8_t ts[12] = {0x40};
+    uint8_t       m1[148], m2[92], st[32], tsout[12];
+    wg::Keypair   ik, rk;
+
+    t0 = esp_timer_get_time();
+    bool hs = ini.create_initiation(m1, 0x1234, ts) && res.consume_initiation(m1, st, tsout) &&
+              res.create_response(m2, 0x5678, rk) && ini.consume_response(m2, ik);
+    const int64_t hs_us = esp_timer_get_time() - t0;
+    const bool    match = hs && std::memcmp(ik.send, rk.recv, 32) == 0 &&
+                       std::memcmp(ik.recv, rk.send, 32) == 0;
+    std::printf("noise IK handshake: %s (%lld us for both sides)\n", match ? "ok" : "FAILED",
+                hs_us);
+
+    if (!match) return 1;
+
+    // トランスポートの往復とリプレイ拒否
+    wg::Transport tx(c), rx(c);
+    tx.set_keypair(ik);
+    rx.set_keypair(rk);
+    uint8_t      pkt[256], out[256];
+    const char*  msg = "wireguard on esp32-p4";
+    t0 = esp_timer_get_time();
+    const size_t n = tx.encrypt(pkt, sizeof(pkt), reinterpret_cast<const uint8_t*>(msg),
+                                std::strlen(msg));
+    bool         valid = false;
+    const size_t got_len = rx.decrypt(out, sizeof(out), pkt, n, &valid);
+    const int64_t rt_us = esp_timer_get_time() - t0;
+    const bool    replay_rejected = rx.decrypt(out, sizeof(out), pkt, n, &valid) == 0;
+    std::printf("transport: %s (%lld us round trip), replay rejected: %s\n",
+                (got_len == std::strlen(msg) && std::memcmp(out, msg, got_len) == 0) ? "ok"
+                                                                                     : "FAILED",
+                rt_us, replay_rejected ? "yes" : "NO");
+    return 0;
+}
+
 void register_term_commands()
 {
     const esp_console_cmd_t cmds[] = {
@@ -367,6 +485,11 @@ void register_term_commands()
         {"conv", "ローマ字→かな→漢字を試す", "<romaji>", &cmd_conv, nullptr, nullptr, nullptr},
         {"scroll", "スクロールバックを動かす (正=過去へ)", "[lines]", &cmd_scroll, nullptr, nullptr,
          nullptr},
+        {"bench", "描画コストを測る (全画面 vs 1 文字)", nullptr, &cmd_bench, nullptr, nullptr,
+         nullptr},
+        {"kbd", "画面キーボードの表示切り替え", "[off]", &cmd_kbd, nullptr, nullptr, nullptr},
+        {"wgtest", "WireGuard の暗号とハンドシェイクを実機で検証", nullptr, &cmd_wgtest, nullptr,
+         nullptr, nullptr},
     };
     for (const auto& c : cmds) ESP_ERROR_CHECK_WITHOUT_ABORT(esp_console_cmd_register(&c));
 }
@@ -402,6 +525,16 @@ extern "C" void app_main(void)
         ESP_LOGE(TAG, "renderer init failed");
         return;
     }
+    // 画面下部をキーボードに使うので、端末の行数はその分減らす。
+    keyboard = std::make_unique<KeyboardUi>(display, *renderer);
+    // キーボードの上端は端末のセル境界に合わせる。合わせないと誰も描かない帯が残る。
+    constexpr int kWantKeyboardH = 320;  // 4 行 x 72px + ステータス帯 32px 程度
+    const int term_rows = (display.height() - kWantKeyboardH) / renderer->cell_h();
+    const int keyboard_h = display.height() - term_rows * renderer->cell_h();
+    keyboard->begin(keyboard_h);
+    renderer->set_rows(term_rows);
+    ESP_LOGI(TAG, "terminal %d rows, keyboard %d px (no gap)", term_rows, keyboard_h);
+
     term = std::make_unique<vt::Terminal>(renderer->cols(), renderer->rows());
 
     // スクロールバックは PSRAM に置く。1 行 = cols * sizeof(Cell) なので 1000 行で約 1.3MB。
@@ -432,6 +565,16 @@ extern "C" void app_main(void)
              renderer->last_rows_drawn(), (unsigned)renderer->last_render_us(),
              (unsigned)renderer->last_draw_us(), (unsigned)renderer->last_push_us());
 
+    // キーボードの出力はそのまま SSH へ流す。未接続なら端末にエコーして動作確認できるようにする。
+    keyboard->set_output([](const std::string& s) {
+        if (ssh_is_connected()) {
+            ssh_send(s.data(), s.size());
+        } else {
+            term->write(s);
+            renderer->render(*term);
+        }
+    });
+
     // WiFi。display.init() が C6 の電源 (IO エクスパンダ経由) を入れているので、必ずこの後。
     if (esp_err_t err = wifi_start(); err != ESP_OK) {
         ESP_LOGE(TAG, "wifi_start failed: %s", esp_err_to_name(err));
@@ -439,9 +582,14 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(console_start());
     register_term_commands();
 
+    // 辞書が書き込まれていればキーボードの変換に使う。
+    if (dict_open()) keyboard->set_dict(&s_dict);
+    keyboard->set_visible(true);
+
     // 描画とタッチのポーリング。キーボードが来るまではタッチが唯一の直接入力手段。
     int  last_log_s = 0;
     bool touching   = false;
+    int  last_x = 0, last_y = 0;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(20));
 
@@ -459,12 +607,23 @@ extern "C" void app_main(void)
         if (display.getTouch(&tp, 1)) {
             if (!touching) {
                 touching = true;
-                ESP_LOGI(TAG, "touch down x=%d y=%d (cell %d,%d)", tp.x, tp.y,
-                         tp.x / renderer->cell_w(), tp.y / renderer->cell_h());
+                last_x   = tp.x;
+                last_y   = tp.y;
+                if (!keyboard->touch_down(tp.x, tp.y)) {
+                    // キーボード外 = 端末領域。縦スワイプでスクロールバックを見る。
+                    ESP_LOGI(TAG, "touch down x=%d y=%d (cell %d,%d)", tp.x, tp.y,
+                             tp.x / renderer->cell_w(), tp.y / renderer->cell_h());
+                }
+            } else {
+                keyboard->touch_move(tp.x, tp.y);
+                last_x = tp.x;
+                last_y = tp.y;
             }
         } else if (touching) {
             touching = false;
-            ESP_LOGI(TAG, "touch up");
+            if (!keyboard->touch_up(last_x, last_y)) {
+                ESP_LOGI(TAG, "touch up");
+            }
         }
 
         int now_s = (int)(esp_timer_get_time() / 1000000);

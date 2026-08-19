@@ -25,7 +25,10 @@ def main() -> int:
     p.add_argument("--seconds", type=float, default=20.0)
     p.add_argument("--no-reset", action="store_true", help="リセットせず現在の出力だけ拾う")
     p.add_argument("--send", action="append", default=[],
-                   help="読み取り開始後に送る行（コンソールコマンド用、複数指定可）")
+                   help="送る行（コンソールコマンド用、複数指定可）")
+    p.add_argument("--send-delay", type=float, default=0.0,
+                   help="送信までの待ち秒数。ポートを開くとリセットが入るので、"
+                        "起動を待ってから送りたいときに使う")
     args = p.parse_args()
 
     with serial.Serial(args.port, args.baud, timeout=0.2) as s:
@@ -41,15 +44,18 @@ def main() -> int:
             s.reset_input_buffer()  # EN を放す前に捨てる。起動ログを取り逃さない
             s.rts = False           # EN 解放 -> ブート開始
 
-        for line in args.send:
-            s.write((line + "\r\n").encode())
-        s.flush()
-
         # チャンク境界でマルチバイト文字が割れるので逐次デコーダを使う。
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         total = 0
-        deadline = time.time() + args.seconds
+        start = time.time()
+        deadline = start + args.seconds
+        sent = not args.send
         while time.time() < deadline:
+            if not sent and time.time() - start >= args.send_delay:
+                for line in args.send:
+                    s.write((line + "\r\n").encode())
+                s.flush()
+                sent = True
             data = s.read(4096)
             if data:
                 total += len(data)

@@ -83,6 +83,10 @@ public:
     bool is_dirty(int y) const { return y >= 0 && y < rows_ && dirty_[y]; }
     void clear_dirty();
     bool any_dirty() const;
+    // その行で変わった列の範囲 [min, max]。1280px を毎回転送しないために使う。
+    // is_dirty(y) が false のときの値は無意味。
+    int dirty_min_x(int y) const { return (y >= 0 && y < rows_) ? dirty_min_[y] : 0; }
+    int dirty_max_x(int y) const { return (y >= 0 && y < rows_) ? dirty_max_[y] : -1; }
 
     // 端末がホストへ返す応答 (DA, DSR/CPR など)。UI 側が SSH に書き戻す。
     void set_reply(std::function<void(const std::string&)> fn) { reply_ = std::move(fn); }
@@ -144,6 +148,8 @@ private:
     void set_mode(bool enable);
 
     void mark_dirty(int y);
+    // 列範囲つき。x2 < 0 なら行全体。
+    void mark_dirty_range(int y, int x1, int x2);
     void mark_all_dirty();
     void erase_cells(int x, int y, int count);
     // 現在の背景色で埋めるだけ。全角の整合は取らないので repair_row と併用する。
@@ -174,6 +180,8 @@ private:
     std::vector<Cell> main_;
     std::vector<Cell> alt_;
     std::vector<bool> dirty_;
+    std::vector<int>  dirty_min_;
+    std::vector<int>  dirty_max_;
 
     Cursor cur_{};
     Cursor saved_main_{};  // ESC 7 / CSI s の退避先 (主画面)
