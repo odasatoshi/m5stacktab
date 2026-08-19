@@ -59,7 +59,15 @@ python tools/serial_log.py --seconds 20      # ログ採取
   なので、512KB にすると内蔵 SRAM の上半分 384KB が消える（内蔵ヒープ 567KB → 178KB）。
   underrun 対策には効かない（DPI は DMA で PSRAM を直読みする）。既定の 128KB のままにする
 - パネルはネイティブ縦 (720x1280)。横で使うなら `setRotation(1)`
-- P4 に WiFi は無い。ESP32-C6 を esp-hosted (SDIO) 経由で使う
+- P4 に WiFi は無い。ESP32-C6 を esp-hosted (SDIO) 経由で使う。ここに罠が 2 つある:
+  - **C6 の電源は I2C の IO エクスパンダ (PI4IOE5V6408 @0x44) の pin0**。しかもこのチップは
+    既定で全ピン Hi-Z なので、方向を出力にするだけでは電流が出ない。**Hi-Z レジスタ (0x07) の
+    該当ビットを 0 にする**必要がある（`esp_io_expander_pi4ioe5v6408` ドライバはこれをやらない）
+  - esp_hosted は既定で `__attribute__((constructor))` により **app_main より前に** SDIO を
+    叩き始める。C6 の電源が入る前に列挙が失敗し、以後リセットもかからず永久に失敗する。
+    `CONFIG_ESP_HOSTED_AUTO_CALL_INIT_BEFORE_APP_MAIN=n` にして順序を自分で作る
+- `CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM` は有効にしない。TX mempool の 1600B ストライドが
+  128B キャッシュラインと合わず CMD53 がアライメント検査で弾かれる
 
 ## コード方針
 

@@ -7,6 +7,8 @@
 #include <freertos/task.h>
 #include <esp_timer.h>
 #include <nvs_flash.h>
+
+#include "wifi.hpp"
 #include <cstdio>
 
 static const char* TAG = "boot";
@@ -68,10 +70,18 @@ extern "C" void app_main(void)
                   (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
     display.drawString(line, 24, 120);
 
+    // WiFi。C6 の電源投入は esp_wifi_init() より前でなければならない。
+    if (tab5_c6_power_on() == ESP_OK) {
+        esp_err_t err = wifi_start();
+        if (err != ESP_OK) ESP_LOGE(TAG, "wifi_start failed: %s", esp_err_to_name(err));
+    }
+    // SSID を渡す手段。キーボードが入るまではシリアルコンソールで設定する。
+    ESP_ERROR_CHECK_WITHOUT_ABORT(console_start());
+
     // 生存確認。WDT リセットや再起動ループを monitor で見分けるため。
     for (int i = 1;; ++i) {
         vTaskDelay(pdMS_TO_TICKS(10000));
-        ESP_LOGI(TAG, "alive %ds internal=%u psram=%u", i * 10,
+        ESP_LOGI(TAG, "alive %ds wifi=%d internal=%u psram=%u", i * 10, (int)wifi_is_connected(),
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     }

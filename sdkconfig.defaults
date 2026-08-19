@@ -19,6 +19,42 @@ CONFIG_SPIRAM_USE_MALLOC=y
 # 200MHz 化だけで underrun は解消した。
 CONFIG_CACHE_L2_CACHE_LINE_128B=y
 
+# コンソールは USB Serial JTAG（Type-C）をプライマリにする。既定はプライマリが UART0 で、
+# USB-JTAG はログ出力のみのセカンダリ扱いなので REPL の入力を受け取れない。
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
 CONFIG_FREERTOS_HZ=1000
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 CONFIG_COMPILER_CXX_EXCEPTIONS=y
+
+# --- ESP32-C6 経由の WiFi (esp-hosted / SDIO) ---
+# この 3 キーだけで SDIO のピン 8 本と reset GPIO 15 が Tab5 プリセットから導出される。
+CONFIG_SLAVE_IDF_TARGET_ESP32C6=y
+CONFIG_ESP_HOSTED_CP_TARGET_ESP32C6=y
+CONFIG_ESP32P4_TAB5_C6_BOARD=y
+# プリセットに default 行が無く range クランプ任せなので明示しておく（ビルド警告も消える）
+CONFIG_ESP_HOSTED_HOST_RESET_GPIO=15
+
+# 既定では esp_hosted が constructor で app_main より前に SDIO を叩き始める。Tab5 では
+# それより先に I2C の IO エクスパンダで C6 の電源を入れる必要があり、間に合わない
+# (電源が入る前に列挙が失敗し、以後リセットもかからないので永久に失敗する)。
+# 自動初期化を切って app_main 側で「電源 → esp_hosted_init → connect」の順を明示する。
+CONFIG_ESP_HOSTED_AUTO_CALL_INIT_BEFORE_APP_MAIN=n
+
+# ESP_HOSTED_MEMPOOL_PREFER_SPIRAM は有効にしないこと。TX mempool の 1600B ストライドが
+# 128B キャッシュラインと合わず (1600 % 128 = 64)、CMD53 がアライメント検査で弾かれる。
+
+# スループット（esp-hosted の performance_optimization.md 推奨値）
+CONFIG_WIFI_RMT_STATIC_RX_BUFFER_NUM=16
+CONFIG_WIFI_RMT_DYNAMIC_RX_BUFFER_NUM=64
+CONFIG_WIFI_RMT_DYNAMIC_TX_BUFFER_NUM=64
+CONFIG_WIFI_RMT_AMPDU_TX_ENABLED=y
+CONFIG_WIFI_RMT_TX_BA_WIN=32
+CONFIG_WIFI_RMT_AMPDU_RX_ENABLED=y
+CONFIG_WIFI_RMT_RX_BA_WIN=32
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65534
+CONFIG_LWIP_TCP_WND_DEFAULT=65534
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=64
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=64
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
+CONFIG_LWIP_TCP_SACK_OUT=y
