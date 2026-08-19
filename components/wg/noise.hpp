@@ -33,8 +33,8 @@ struct Crypto {
     bool (*aead_decrypt)(uint8_t* out, const uint8_t key[kKeyLen], uint64_t counter,
                          const uint8_t* cipher, size_t cipher_len, const uint8_t* ad,
                          size_t ad_len);
-    // 乱数。
-    void (*random_bytes)(uint8_t* out, size_t len);
+    // 乱数。失敗したら false。全ゼロを返して続行してはいけない（予測可能な鍵になる）。
+    bool (*random_bytes)(uint8_t* out, size_t len);
 };
 
 struct Keypair {
@@ -51,7 +51,8 @@ public:
     Handshake(const Crypto& crypto) : c_(crypto) {}
 
     // 自分の静的鍵と相手の静的公開鍵を設定する。psk は省略可（全ゼロ扱い）。
-    void set_keys(const uint8_t static_priv[kKeyLen], const uint8_t peer_static_pub[kKeyLen],
+    // 公開鍵の導出に失敗したら false（そのまま進むと mac1 と初期ハッシュが壊れる）。
+    bool set_keys(const uint8_t static_priv[kKeyLen], const uint8_t peer_static_pub[kKeyLen],
                   const uint8_t psk[kKeyLen] = nullptr);
 
     // MessageInitiation を作る。out は 148 バイト。

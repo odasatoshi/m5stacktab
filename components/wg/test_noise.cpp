@@ -94,16 +94,16 @@ void test_handshake_roundtrip()
     const auto& c = wg::default_crypto();
 
     uint8_t init_priv[32], resp_priv[32];
-    c.random_bytes(init_priv, 32);
-    c.random_bytes(resp_priv, 32);
+    CHECK(c.random_bytes(init_priv, 32));
+    CHECK(c.random_bytes(resp_priv, 32));
     uint8_t init_pub[32], resp_pub[32];
     CHECK(c.dh_pubkey(init_pub, init_priv));
     CHECK(c.dh_pubkey(resp_pub, resp_priv));
 
     wg::Handshake initiator(c), responder(c);
-    initiator.set_keys(init_priv, resp_pub);
+    CHECK(initiator.set_keys(init_priv, resp_pub));
     // 応答側は相手の静的鍵をハンドシェイクから学ぶが、set_keys では自分の鍵だけ確定させる。
-    responder.set_keys(resp_priv, init_pub);
+    CHECK(responder.set_keys(resp_priv, init_pub));
 
     const uint8_t timestamp[12] = {0x40, 0, 0, 0, 0x67, 0x89, 0xab, 0xcd, 0, 0, 0, 1};
 
@@ -146,10 +146,10 @@ void test_handshake_rejects_tampering()
 {
     const auto& c = wg::default_crypto();
     uint8_t     a_priv[32], b_priv[32], a_pub[32], b_pub[32];
-    c.random_bytes(a_priv, 32);
-    c.random_bytes(b_priv, 32);
-    c.dh_pubkey(a_pub, a_priv);
-    c.dh_pubkey(b_pub, b_priv);
+    CHECK(c.random_bytes(a_priv, 32));
+    CHECK(c.random_bytes(b_priv, 32));
+    CHECK(c.dh_pubkey(a_pub, a_priv));
+    CHECK(c.dh_pubkey(b_pub, b_priv));
 
     const uint8_t ts[12] = {0x40};
 
@@ -157,12 +157,12 @@ void test_handshake_rejects_tampering()
     {
         uint8_t wrong_pub[32];
         uint8_t wrong_priv[32];
-        c.random_bytes(wrong_priv, 32);
-        c.dh_pubkey(wrong_pub, wrong_priv);
+        CHECK(c.random_bytes(wrong_priv, 32));
+        CHECK(c.dh_pubkey(wrong_pub, wrong_priv));
 
         wg::Handshake initiator(c), responder(c);
-        initiator.set_keys(a_priv, wrong_pub);  // 別人宛に作る
-        responder.set_keys(b_priv, a_pub);
+        CHECK(initiator.set_keys(a_priv, wrong_pub));  // 別人宛に作る
+        CHECK(responder.set_keys(b_priv, a_pub));
         uint8_t msg1[148];
         CHECK(initiator.create_initiation(msg1, 1, ts));
         uint8_t s[32], t[12];
@@ -172,8 +172,8 @@ void test_handshake_rejects_tampering()
     // 改竄された initiation は復号に失敗する
     {
         wg::Handshake initiator(c), responder(c);
-        initiator.set_keys(a_priv, b_pub);
-        responder.set_keys(b_priv, a_pub);
+        CHECK(initiator.set_keys(a_priv, b_pub));
+        CHECK(responder.set_keys(b_priv, a_pub));
         uint8_t msg1[148];
         CHECK(initiator.create_initiation(msg1, 1, ts));
         msg1[50] ^= 0x01;  // 暗号化された静的鍵の中身をいじる
@@ -185,8 +185,8 @@ void test_handshake_rejects_tampering()
     // receiver index が違う response は拒否する
     {
         wg::Handshake initiator(c), responder(c);
-        initiator.set_keys(a_priv, b_pub);
-        responder.set_keys(b_priv, a_pub);
+        CHECK(initiator.set_keys(a_priv, b_pub));
+        CHECK(responder.set_keys(b_priv, a_pub));
         uint8_t msg1[148], msg2[92];
         CHECK(initiator.create_initiation(msg1, 0xAABBCCDD, ts));
         uint8_t s[32], t[12];
@@ -203,17 +203,17 @@ void test_psk()
     // psk を両者で共有していれば成立し、片方だけだと失敗する
     const auto& c = wg::default_crypto();
     uint8_t     a_priv[32], b_priv[32], a_pub[32], b_pub[32], psk[32];
-    c.random_bytes(a_priv, 32);
-    c.random_bytes(b_priv, 32);
-    c.random_bytes(psk, 32);
-    c.dh_pubkey(a_pub, a_priv);
-    c.dh_pubkey(b_pub, b_priv);
+    CHECK(c.random_bytes(a_priv, 32));
+    CHECK(c.random_bytes(b_priv, 32));
+    CHECK(c.random_bytes(psk, 32));
+    CHECK(c.dh_pubkey(a_pub, a_priv));
+    CHECK(c.dh_pubkey(b_pub, b_priv));
     const uint8_t ts[12] = {0x40};
 
     {
         wg::Handshake i(c), r(c);
-        i.set_keys(a_priv, b_pub, psk);
-        r.set_keys(b_priv, a_pub, psk);
+        CHECK(i.set_keys(a_priv, b_pub, psk));
+        CHECK(r.set_keys(b_priv, a_pub, psk));
         uint8_t m1[148], m2[92], s[32], t[12];
         wg::Keypair rk, ik;
         CHECK(i.create_initiation(m1, 1, ts));
@@ -224,8 +224,8 @@ void test_psk()
     }
     {
         wg::Handshake i(c), r(c);
-        i.set_keys(a_priv, b_pub, psk);
-        r.set_keys(b_priv, a_pub);  // psk なし
+        CHECK(i.set_keys(a_priv, b_pub, psk));
+        CHECK(r.set_keys(b_priv, a_pub));  // psk なし
         uint8_t m1[148], m2[92], s[32], t[12];
         wg::Keypair rk, ik;
         CHECK(i.create_initiation(m1, 1, ts));
@@ -240,14 +240,14 @@ void test_transport()
 {
     const auto& c = wg::default_crypto();
     uint8_t     a_priv[32], b_priv[32], a_pub[32], b_pub[32];
-    c.random_bytes(a_priv, 32);
-    c.random_bytes(b_priv, 32);
-    c.dh_pubkey(a_pub, a_priv);
-    c.dh_pubkey(b_pub, b_priv);
+    CHECK(c.random_bytes(a_priv, 32));
+    CHECK(c.random_bytes(b_priv, 32));
+    CHECK(c.dh_pubkey(a_pub, a_priv));
+    CHECK(c.dh_pubkey(b_pub, b_priv));
 
     wg::Handshake i(c), r(c);
-    i.set_keys(a_priv, b_pub);
-    r.set_keys(b_priv, a_pub);
+    CHECK(i.set_keys(a_priv, b_pub));
+    CHECK(r.set_keys(b_priv, a_pub));
     const uint8_t ts[12] = {0x40};
     uint8_t       m1[148], m2[92], st[32], tsout[12];
     wg::Keypair   ik, rk;
@@ -349,6 +349,68 @@ void test_replay_window()
     CHECK(rx.recv_max() == 9);
 }
 
+// レビュー指摘の回帰テスト。
+void test_review_regressions()
+{
+    const auto& c = wg::default_crypto();
+
+    // 乱数が取れないときは握手を作らせない（全ゼロの鍵で成立してはいけない）。
+    // ダミーの Crypto で「乱数が失敗する」状況を作る。
+    static wg::Crypto broken = c;
+    broken.random_bytes = [](uint8_t* out, size_t len) -> bool {
+        std::memset(out, 0, len);
+        return false;
+    };
+    {
+        uint8_t priv[32], pub[32];
+        CHECK(c.random_bytes(priv, 32));
+        CHECK(c.dh_pubkey(pub, priv));
+        wg::Handshake h(broken);
+        CHECK(h.set_keys(priv, pub));
+        uint8_t       m1[148];
+        const uint8_t ts[12] = {0x40};
+        // 乱数が失敗したら initiation を作らない
+        CHECK(!h.create_initiation(m1, 1, ts));
+    }
+
+    // 応答側は set_keys で指定した相手以外の握手を拒否する。
+    {
+        uint8_t a_priv[32], b_priv[32], c_priv[32];
+        uint8_t a_pub[32], b_pub[32], c_pub[32];
+        CHECK(c.random_bytes(a_priv, 32));
+        CHECK(c.random_bytes(b_priv, 32));
+        CHECK(c.random_bytes(c_priv, 32));
+        CHECK(c.dh_pubkey(a_pub, a_priv));
+        CHECK(c.dh_pubkey(b_pub, b_priv));
+        CHECK(c.dh_pubkey(c_pub, c_priv));
+
+        const uint8_t ts[12] = {0x40};
+        uint8_t       m1[148], st[32], tsout[12];
+
+        // C が B に握手を仕掛ける。B は A だけを相手と想定している。
+        wg::Handshake attacker(c), responder(c);
+        CHECK(attacker.set_keys(c_priv, b_pub));
+        CHECK(responder.set_keys(b_priv, a_pub));
+        CHECK(attacker.create_initiation(m1, 1, ts));
+        CHECK(!responder.consume_initiation(m1, st, tsout));
+
+        // 正しい相手 (A) なら通る
+        wg::Handshake good(c), responder2(c);
+        CHECK(good.set_keys(a_priv, b_pub));
+        CHECK(responder2.set_keys(b_priv, a_pub));
+        CHECK(good.create_initiation(m1, 1, ts));
+        CHECK(responder2.consume_initiation(m1, st, tsout));
+
+        // 相手を指定しない (全ゼロ) 応答側は誰でも受け入れる（サーバ役の用途）
+        uint8_t zero[32] = {};
+        wg::Handshake open_responder(c);
+        CHECK(open_responder.set_keys(b_priv, zero));
+        CHECK(attacker.create_initiation(m1, 2, ts));
+        CHECK(open_responder.consume_initiation(m1, st, tsout));
+        CHECK(std::memcmp(st, c_pub, 32) == 0);
+    }
+}
+
 }  // namespace
 
 int main()
@@ -360,6 +422,7 @@ int main()
     test_psk();
     test_transport();
     test_replay_window();
+    test_review_regressions();
     std::printf("ok: %d checks passed\n", g_checks);
     return 0;
 }

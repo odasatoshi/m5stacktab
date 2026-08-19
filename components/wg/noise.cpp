@@ -82,7 +82,7 @@ void compute_mac1(uint8_t out[kTagLen], const uint8_t peer_static[kKeyLen], cons
 
 }  // namespace
 
-void Handshake::set_keys(const uint8_t static_priv[kKeyLen], const uint8_t peer_static_pub[kKeyLen],
+bool Handshake::set_keys(const uint8_t static_priv[kKeyLen], const uint8_t peer_static_pub[kKeyLen],
                          const uint8_t psk[kKeyLen])
 {
     std::memcpy(static_priv_, static_priv, kKeyLen);
@@ -92,7 +92,7 @@ void Handshake::set_keys(const uint8_t static_priv[kKeyLen], const uint8_t peer_
     } else {
         std::memset(psk_, 0, kKeyLen);
     }
-    c_.dh_pubkey(static_pub_, static_priv_);
+    return c_.dh_pubkey(static_pub_, static_priv_);
 }
 
 bool Handshake::create_initiation(uint8_t out[kInitLen], uint32_t local_index,
@@ -107,7 +107,7 @@ bool Handshake::create_initiation(uint8_t out[kInitLen], uint32_t local_index,
     mix_hash(hash_, reinterpret_cast<const uint8_t*>(kIdentifier), sizeof(kIdentifier) - 1);
     mix_hash(hash_, peer_static_, kKeyLen);
 
-    c_.random_bytes(ephemeral_priv_, kKeyLen);
+    if (!c_.random_bytes(ephemeral_priv_, kKeyLen)) return false;
     if (!c_.dh_pubkey(ephemeral_pub_, ephemeral_priv_)) return false;
 
     std::memset(out, 0, kInitLen);
@@ -169,6 +169,12 @@ bool Handshake::consume_initiation(const uint8_t in[kInitLen], uint8_t peer_stat
                         kKeyLen)) {
         return false;
     }
+    // set_keys で相手の静的公開鍵が指定されているなら照合する。mac1 は自分の公開鍵
+    // (公開情報) で検証されるだけなので、ここを省くと誰でも握手を完了できてしまう。
+    if (!is_zero(peer_static_, kKeyLen) &&
+        std::memcmp(peer_static_, peer_static_out, kKeyLen) != 0) {
+        return false;
+    }
     std::memcpy(peer_static_, peer_static_out, kKeyLen);
     mix_hash(hash_, in + kInitStatic, kKeyLen + kTagLen);
 
@@ -186,7 +192,7 @@ bool Handshake::create_response(uint8_t out[kRespLen], uint32_t local_index, Key
 {
     local_index_ = local_index;
 
-    c_.random_bytes(ephemeral_priv_, kKeyLen);
+    if (!c_.random_bytes(ephemeral_priv_, kKeyLen)) return false;
     if (!c_.dh_pubkey(ephemeral_pub_, ephemeral_priv_)) return false;
 
     std::memset(out, 0, kRespLen);

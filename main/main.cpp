@@ -386,8 +386,14 @@ int cmd_kbd(int argc, char** argv)
 {
     const bool show = (argc < 2) || (std::string(argv[1]) != "off");
     keyboard->set_visible(show);
-    if (!show) renderer->render(*term, /*force=*/true);
-    std::printf("keyboard %s\n", show ? "shown" : "hidden");
+    // 隠したら画面全体を端末に使う。端末側の行数と PTY サイズも合わせる。
+    const int rows = show ? (display.height() - keyboard->height()) / renderer->cell_h()
+                          : renderer->full_rows();
+    renderer->set_rows(rows);
+    term->resize(renderer->cols(), rows);
+    if (ssh_is_connected()) ssh_resize(renderer->cols(), rows);
+    renderer->render(*term, /*force=*/true);
+    std::printf("keyboard %s, terminal %dx%d\n", show ? "shown" : "hidden", renderer->cols(), rows);
     return 0;
 }
 
@@ -419,14 +425,17 @@ int cmd_wgtest(int, char**)
 
     // ハンドシェイクを自分同士で往復させる
     uint8_t a_priv[32], b_priv[32], a_pub[32], b_pub[32];
-    c.random_bytes(a_priv, 32);
-    c.random_bytes(b_priv, 32);
-    c.dh_pubkey(a_pub, a_priv);
-    c.dh_pubkey(b_pub, b_priv);
+    if (!c.random_bytes(a_priv, 32) || !c.random_bytes(b_priv, 32) ||
+        !c.dh_pubkey(a_pub, a_priv) || !c.dh_pubkey(b_pub, b_priv)) {
+        std::printf("key generation failed (no entropy?)\n");
+        return 1;
+    }
 
     wg::Handshake ini(c), res(c);
-    ini.set_keys(a_priv, b_pub);
-    res.set_keys(b_priv, a_pub);
+    if (!ini.set_keys(a_priv, b_pub) || !res.set_keys(b_priv, a_pub)) {
+        std::printf("set_keys failed\n");
+        return 1;
+    }
     const uint8_t ts[12] = {0x40};
     uint8_t       m1[148], m2[92], st[32], tsout[12];
     wg::Keypair   ik, rk;
@@ -517,11 +526,14 @@ extern "C" void app_main(void)
         return;
     }
     // 画面下部をキーボードに使うので、端末の行数はその分減らす。
-    keyboard                 = std::make_unique<KeyboardUi>(display, *renderer);
-    constexpr int kKeyboardH = 320;  // 4 行 x 72px + ステータス帯 32px
-    keyboard->begin(kKeyboardH);
-    const int term_rows = (display.height() - kKeyboardH) / renderer->cell_h();
+    keyboard = std::make_unique<KeyboardUi>(display, *renderer);
+    // キーボードの上端は端末のセル境界に合わせる。合わせないと誰も描かない帯が残る。
+    constexpr int kWantKeyboardH = 320;  // 4 行 x 72px + ステータス帯 32px 程度
+    const int term_rows = (display.height() - kWantKeyboardH) / renderer->cell_h();
+    const int keyboard_h = display.height() - term_rows * renderer->cell_h();
+    keyboard->begin(keyboard_h);
     renderer->set_rows(term_rows);
+    ESP_LOGI(TAG, "terminal %d rows, keyboard %d px (no gap)", term_rows, keyboard_h);
 
     term = std::make_unique<vt::Terminal>(renderer->cols(), renderer->rows());
 

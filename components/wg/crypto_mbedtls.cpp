@@ -118,19 +118,26 @@ mbedtls_ctr_drbg_context& drbg()
         mbedtls_ctr_drbg_init(&ctr);
         mbedtls_entropy_init(&entropy);
         static const char* pers = "wg-noise";
-        mbedtls_ctr_drbg_seed(&ctr, mbedtls_entropy_func, &entropy,
-                              reinterpret_cast<const unsigned char*>(pers), std::strlen(pers));
-        inited = true;
+        // シードに失敗したら inited を立てない。立ててしまうと以後ずっと無言で
+        // 使えない DRBG を返し続けることになる。
+        if (mbedtls_ctr_drbg_seed(&ctr, mbedtls_entropy_func, &entropy,
+                                  reinterpret_cast<const unsigned char*>(pers),
+                                  std::strlen(pers)) == 0) {
+            inited = true;
+        }
     }
     return ctr;
 }
 
-void random_bytes(uint8_t* out, size_t len)
+bool random_bytes(uint8_t* out, size_t len)
 {
+    // 全ゼロを返して続行してはいけない。X25519 のクランプで有効なスカラーになってしまい、
+    // 誰でも計算できる一時鍵で握手が成立する。
     if (mbedtls_ctr_drbg_random(&drbg(), out, len) != 0) {
-        // 乱数が取れない状況で鍵を作るのは危険なので、全ゼロにして呼び出し側を失敗させる。
         std::memset(out, 0, len);
+        return false;
     }
+    return true;
 }
 
 const Crypto kCrypto = {

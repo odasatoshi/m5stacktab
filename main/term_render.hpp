@@ -17,7 +17,12 @@ public:
     int cols() const { return cols_; }
     int rows() const { return rows_; }
     // 画面下部を別用途（キーボード）に使うとき、端末が使う行数を狭める。
-    void set_rows(int rows) { if (rows > 0 && rows <= rows_) rows_ = rows; }
+    // full_rows() まで戻せる（キーボードを隠したときに画面全体を使うため）。
+    void set_rows(int rows)
+    {
+        if (rows > 0 && rows <= full_rows_) rows_ = rows;
+    }
+    int full_rows() const { return full_rows_; }
     int cell_w() const { return cell_w_; }
     int cell_h() const { return cell_h_; }
 
@@ -40,8 +45,9 @@ private:
     M5Canvas  row_;
     int       cell_w_ = 0;
     int       cell_h_ = 0;
-    int       cols_   = 0;
-    int       rows_   = 0;
+    int       cols_      = 0;
+    int       rows_      = 0;
+    int       full_rows_ = 0;  // 画面全体を使ったときの行数
     uint32_t  last_us_      = 0;
     uint32_t  last_draw_us_ = 0;
     uint32_t  last_push_us_ = 0;

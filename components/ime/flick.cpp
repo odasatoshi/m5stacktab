@@ -1,5 +1,6 @@
 #include "flick.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 
@@ -59,8 +60,10 @@ bool FlickKeyboard::touch_down(int px, int py)
         pressed_ = false;
         return false;
     }
-    const int col = (px - layout_.x) / layout_.key_w();
-    const int row = (py - layout_.y) / layout_.key_h();
+    // width が cols で割り切れないと右端の余りで col == cols になり、
+    // 「次の行の 0 列」として解釈されてしまうのでクランプする。
+    const int col = std::clamp((px - layout_.x) / layout_.key_w(), 0, layout_.cols - 1);
+    const int row = std::clamp((py - layout_.y) / layout_.key_h(), 0, layout_.rows - 1);
     pressed_      = true;
     press_key_    = row * layout_.cols + col;
     press_x_      = px;

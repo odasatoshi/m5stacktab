@@ -36,8 +36,9 @@ bool TermRenderer::begin()
         ESP_LOGE(TAG, "font metrics unavailable (w=%d h=%d)", cell_w_, cell_h_);
         return false;
     }
-    cols_ = gfx_.width() / cell_w_;
-    rows_ = gfx_.height() / cell_h_;
+    cols_      = gfx_.width() / cell_w_;
+    rows_      = gfx_.height() / cell_h_;
+    full_rows_ = rows_;
 
     for (int i = 0; i < 16; ++i) {
         pal_[i] = gfx_.color565(kBase16[i][0], kBase16[i][1], kBase16[i][2]);
@@ -92,6 +93,11 @@ void append_utf8(std::string& out, uint32_t cp)
 void TermRenderer::draw_row(vt::Terminal& term, int y, int x_from, int x_to)
 {
     const int64_t t_draw = esp_timer_get_time();
+
+    // 範囲の端が全角セルを割っていると、片方だけ塗って相棒を描き直さないので
+    // グリフが半分消える。端を全角の境界まで広げる。
+    if (x_from > 0 && term.view_cell(x_from, y).width == 0) --x_from;
+    if (x_to < cols_ - 1 && term.view_cell(x_to, y).width == 2) ++x_to;
     // 転送する範囲だけ塗る。行全体を毎回 1280px 送るのが最大の無駄だった。
     row_.fillRect(x_from * cell_w_, 0, (x_to - x_from + 1) * cell_w_, cell_h_,
                   pal_[vt::kDefaultBg]);

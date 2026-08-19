@@ -99,7 +99,8 @@ void KeyboardUi::draw_status()
     } else {
         line = "[かな] ";
     }
-    const std::string composing = ime_.composing() + ime_.pending_romaji();
+    // composing() は未確定のローマ字も含んでいる。ここで pending_romaji を足すと二重になる。
+    const std::string composing = ime_.composing();
     if (!composing.empty()) {
         line += composing;
         if (ime_.mode() == ime::Mode::kSelect) {

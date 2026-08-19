@@ -282,6 +282,34 @@ void test_flick_to_ime()
     EXPECT(ime.commit(), "がっ");
 }
 
+// レビュー指摘の回帰テスト。
+void test_review_regressions()
+{
+    // composing() は未確定のローマ字を含む。UI 側で pending_romaji を足すと二重になるので、
+    // ここで「composing だけで足りる」ことを固定する。
+    ime::Ime ime;
+    ime.input_char('k');
+    EXPECT(ime.composing(), "k");
+    EXPECT(ime.pending_romaji(), "k");
+    ime.input_char('y');
+    EXPECT(ime.composing(), "ky");
+    ime.input_char('o');
+    EXPECT(ime.composing(), "きょ");
+    EXPECT(ime.pending_romaji(), "");
+
+    // キー幅が割り切れないレイアウトでも、右端・下端で隣のキーに化けない。
+    ime::FlickKeyboard kb;
+    ime::FlickLayout   l;
+    l.x = 0; l.y = 0; l.width = 483; l.height = 322;  // 4 で割り切れない
+    kb.set_layout(l);
+    // 右端 1px と下端 1px
+    CHECK(kb.touch_down(l.width - 1, l.height - 1));
+    const auto r = kb.touch_up(l.width - 1, l.height - 1);
+    CHECK(r.valid);
+    // 右下は機能キー列の最下段 = モード切替。行が繰り上がって別キーになっていないこと。
+    CHECK(r.func == ime::FuncKey::kMode);
+}
+
 }  // namespace
 
 int main()
@@ -293,6 +321,7 @@ int main()
     test_modifiers();
     test_flick_keys();
     test_flick_to_ime();
+    test_review_regressions();
     std::printf("ok: %d checks passed\n", g_checks);
     return 0;
 }
