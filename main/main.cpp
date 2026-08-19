@@ -32,6 +32,10 @@
 #include "ts_client.hpp"
 #include "disco_responder.hpp"
 #include "netmap.hpp"
+#include <driver/ppa.h>
+#include <esp_memory_utils.h>
+#include <lgfx/v1/platforms/esp32p4/Panel_DSI.hpp>
+
 #include "rotate.hpp"
 #include "ts_control.hpp"
 #include "wg_netif.hpp"
@@ -844,6 +848,102 @@ int cmd_keytest(int, char**)
     return rc == 0 ? 0 : 1;
 }
 
+// PPA でフレームバッファに直接書けるかを確かめる。
+// Panel_DSI は config_detail().buffer でフレームバッファを公開している。
+int cmd_ppatest(int, char**)
+{
+    auto* panel = static_cast<lgfx::Panel_DSI*>(display.getPanel());
+    if (!panel) {
+        std::printf("panel is not Panel_DSI\n");
+        return 1;
+    }
+    const auto& cfg = panel->config_detail();
+    std::printf("frame buffer: %p (%u bytes), panel %dx%d depth %d\n", cfg.buffer,
+                (unsigned)cfg.buffer_length, (int)display.width(), (int)display.height(),
+                (int)display.getColorDepth());
+    if (!cfg.buffer) {
+        std::printf("no frame buffer exposed\n");
+        return 1;
+    }
+    // PSRAM 上のはず（1280x720x2 = 1.84MB）
+    const bool in_psram = esp_ptr_external_ram(cfg.buffer);
+    std::printf("  in psram: %d, expected size for 720x1280x2: %d\n", in_psram ? 1 : 0,
+                720 * 1280 * 2);
+
+    // PPA クライアントを登録して、1 行ぶんを 90 度回転して書いてみる。
+    ppa_client_config_t pc = {};
+    pc.oper_type          = PPA_OPERATION_SRM;
+    ppa_client_handle_t client = nullptr;
+    esp_err_t err = ppa_register_client(&pc, &client);
+    if (err != ESP_OK) {
+        std::printf("ppa_register_client failed: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    // 内蔵 RAM に 1 行ぶん（1280x24）のソースを作る。DMA するので 64B 境界に置く。
+    constexpr int kW = 1280, kH = 24;
+    auto* src = static_cast<uint16_t*>(heap_caps_aligned_alloc(64, kW * kH * 2,
+                                                              MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+    if (!src) {
+        std::printf("src alloc failed\n");
+        ppa_unregister_client(client);
+        return 1;
+    }
+    for (int y = 0; y < kH; ++y) {
+        for (int x = 0; x < kW; ++x) src[y * kW + x] = (x < kW / 2) ? 0xF800 : 0x001F;  // 赤 | 青
+    }
+
+    rot::Panel rp;
+    int nx = 0, ny = 0, nw = 0, nh = 0;
+    rot::landscape_rect_to_native(rp, 0, 0, kW, kH, &nx, &ny, &nw, &nh);
+
+    ppa_srm_oper_config_t op = {};
+    op.in.buffer            = src;
+    op.in.pic_w             = kW;
+    op.in.pic_h             = kH;
+    op.in.block_w           = kW;
+    op.in.block_h           = kH;
+    op.in.srm_cm            = PPA_SRM_COLOR_MODE_RGB565;
+    op.out.buffer = cfg.buffer;
+    // M5GFX は buffer_length を埋めていない（0 が入っている）ので自分で計算する。
+    // 0 を渡すと ppa_do_scale_rotate_mirror が ESP_ERR_INVALID_ARG を返す。
+    op.out.buffer_size = static_cast<size_t>(rp.native_w) * rp.native_h * 2;
+    op.out.pic_w            = rp.native_w;
+    op.out.pic_h            = rp.native_h;
+    op.out.block_offset_x   = nx;
+    op.out.block_offset_y   = ny;
+    op.out.srm_cm           = PPA_SRM_COLOR_MODE_RGB565;
+    op.rotation_angle       = PPA_SRM_ROTATION_ANGLE_90;
+    op.scale_x              = 1.0f;
+    op.scale_y              = 1.0f;
+    op.mode                 = PPA_TRANS_MODE_BLOCKING;
+
+    const int64_t t0 = esp_timer_get_time();
+    err = ppa_do_scale_rotate_mirror(client, &op);
+    const int64_t us = esp_timer_get_time() - t0;
+    if (err != ESP_OK) {
+        std::printf("ppa_do_scale_rotate_mirror failed: %s\n", esp_err_to_name(err));
+    } else {
+        std::printf("ppa rotate 1280x24 -> native(%d,%d) %dx%d: %lld us\n", nx, ny, nw, nh, us);
+        // 比較用に M5GFX の pushSprite も測る
+        M5Canvas sp(&display);
+        sp.setPsram(false);
+        sp.setColorDepth(16);
+        if (sp.createSprite(kW, kH)) {
+            sp.fillSprite(TFT_GREEN);
+            display.setRotation(1);
+            const int64_t t1 = esp_timer_get_time();
+            sp.pushSprite(0, kH);
+            std::printf("m5gfx pushSprite same size (rotation 1): %lld us\n",
+                        esp_timer_get_time() - t1);
+            sp.deleteSprite();
+        }
+    }
+    heap_caps_free(src);
+    ppa_unregister_client(client);
+    return err == ESP_OK ? 0 : 1;
+}
+
 // 座標変換が M5GFX の setRotation(1) と同じ向きかを実機で照合する。
 // 横向きの座標に印を描き、rotation 0 に切り替えて計算した位置に別の色で印を描く。
 // 2 つが重なれば変換が正しい。
@@ -907,6 +1007,8 @@ void register_term_commands()
          nullptr, nullptr, nullptr},
         {"rottest", "座標変換が setRotation(1) と一致するか実機で照合", nullptr, &cmd_rottest,
          nullptr, nullptr, nullptr},
+        {"ppatest", "PPA でフレームバッファに直接回転転送してみる", nullptr, &cmd_ppatest, nullptr,
+         nullptr, nullptr},
         {"ts", "Tailscale/Headscale の制御プレーンに接続", "<host> <authkey> [port] [capver]",
          &cmd_ts, nullptr, nullptr, nullptr},
         {"wg", "WireGuard トンネルの netif を操作", "<tunnel-ip> [pubkey] [endpoint] | stat | down",
@@ -955,6 +1057,13 @@ extern "C" void app_main(void)
     keyboard->begin(keyboard_h);
     renderer->set_rows(term_rows);
     ESP_LOGI(TAG, "terminal %d rows, keyboard %d px (no gap)", term_rows, keyboard_h);
+
+    // 回転を PPA に任せる（使えなければ従来の経路にとどまる）。
+    if (renderer->enable_ppa()) {
+        ESP_LOGI(TAG, "renderer: using PPA for rotation");
+    } else {
+        ESP_LOGW(TAG, "renderer: PPA unavailable, falling back to pushSprite");
+    }
 
     term = std::make_unique<vt::Terminal>(renderer->cols(), renderer->rows());
 

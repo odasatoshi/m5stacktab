@@ -2,10 +2,16 @@
 #include "term_render.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <string>
 
+#include <driver/ppa.h>
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_timer.h>
+#include <lgfx/v1/platforms/esp32p4/Panel_DSI.hpp>
+
+#include "rotate.hpp"
 
 namespace {
 
@@ -91,6 +97,87 @@ void append_utf8(std::string& out, uint32_t cp)
 
 }  // namespace
 
+bool TermRenderer::enable_ppa()
+{
+    if (ppa_) return true;
+
+    auto* panel = static_cast<lgfx::Panel_DSI*>(gfx_.getPanel());
+    if (!panel) return false;
+    const auto& cfg = panel->config_detail();
+    if (!cfg.buffer) return false;
+
+    // フレームバッファはネイティブ向き (720x1280)。M5GFX の rotation とは無関係に
+    // 物理的な並びで置かれている。
+    rot::Panel rp;
+    fb_   = static_cast<uint16_t*>(cfg.buffer);
+    fb_w_ = rp.native_w;
+    fb_h_ = rp.native_h;
+
+    // PPA の入力は DMA するので 64B 境界の内蔵 RAM に置く。
+    row_dma_ = static_cast<uint16_t*>(heap_caps_aligned_alloc(
+        64, static_cast<size_t>(gfx_.width()) * cell_h_ * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+    if (!row_dma_) {
+        ESP_LOGW(TAG, "ppa: row buffer alloc failed");
+        return false;
+    }
+
+    ppa_client_config_t pc = {};
+    pc.oper_type           = PPA_OPERATION_SRM;
+    ppa_client_handle_t client = nullptr;
+    if (ppa_register_client(&pc, &client) != ESP_OK) {
+        heap_caps_free(row_dma_);
+        row_dma_ = nullptr;
+        ESP_LOGW(TAG, "ppa: register_client failed");
+        return false;
+    }
+    ppa_ = client;
+    ESP_LOGI(TAG, "ppa enabled: fb=%p %dx%d", fb_, fb_w_, fb_h_);
+    return true;
+}
+
+// 行スプライトの一部を PPA で 90 度回転してフレームバッファへ直接書く。
+bool TermRenderer::push_row_ppa(int y, int x_from, int x_to)
+{
+    const int px  = x_from * cell_w_;
+    const int pw  = (x_to - x_from + 1) * cell_w_;
+    const int py  = y * cell_h_;
+
+    // スプライトの該当矩形を DMA バッファに詰める（行ごとにストライドが違うのでコピーが必要）。
+    const auto* src = static_cast<const uint16_t*>(row_.getBuffer());
+    if (!src) return false;
+    const int sprite_w = gfx_.width();
+    for (int r = 0; r < cell_h_; ++r) {
+        std::memcpy(row_dma_ + static_cast<size_t>(r) * pw, src + static_cast<size_t>(r) * sprite_w + px,
+                    static_cast<size_t>(pw) * 2);
+    }
+
+    rot::Panel rp;
+    int nx = 0, ny = 0, nw = 0, nh = 0;
+    rot::landscape_rect_to_native(rp, px, py, pw, cell_h_, &nx, &ny, &nw, &nh);
+
+    ppa_srm_oper_config_t op = {};
+    op.in.buffer           = row_dma_;
+    op.in.pic_w            = pw;
+    op.in.pic_h            = cell_h_;
+    op.in.block_w          = pw;
+    op.in.block_h          = cell_h_;
+    op.in.srm_cm           = PPA_SRM_COLOR_MODE_RGB565;
+    op.out.buffer          = fb_;
+    // M5GFX は buffer_length を埋めていないので自分で計算する（0 を渡すと引数エラー）。
+    op.out.buffer_size     = static_cast<size_t>(fb_w_) * fb_h_ * 2;
+    op.out.pic_w           = fb_w_;
+    op.out.pic_h           = fb_h_;
+    op.out.block_offset_x  = nx;
+    op.out.block_offset_y  = ny;
+    op.out.srm_cm          = PPA_SRM_COLOR_MODE_RGB565;
+    op.rotation_angle      = PPA_SRM_ROTATION_ANGLE_90;
+    op.scale_x             = 1.0f;
+    op.scale_y             = 1.0f;
+    op.mode                = PPA_TRANS_MODE_BLOCKING;
+
+    return ppa_do_scale_rotate_mirror(static_cast<ppa_client_handle_t>(ppa_), &op) == ESP_OK;
+}
+
 void TermRenderer::draw_row(vt::Terminal& term, int y, int x_from, int x_to)
 {
     const int64_t t_draw = esp_timer_get_time();
@@ -171,13 +258,17 @@ void TermRenderer::draw_row(vt::Terminal& term, int y, int x_from, int x_to)
 
     const int64_t t_push = esp_timer_get_time();
     last_draw_us_ += static_cast<uint32_t>(t_push - t_draw);
-    // pushSprite に部分矩形版が無いので、転送先のクリップ矩形で範囲を絞る。
-    // これで 1 行 1280px を毎回送らずに済む（タイプ入力なら数セル分だけ）。
-    const int px_from = x_from * cell_w_;
-    const int px_w    = (x_to - x_from + 1) * cell_w_;
-    gfx_.setClipRect(px_from, y * cell_h_, px_w, cell_h_);
-    row_.pushSprite(&gfx_, 0, y * cell_h_);
-    gfx_.clearClipRect();
+
+    // PPA が使えるならハードウェアで回転してフレームバッファへ直接書く。
+    // M5GFX の pushSprite は setRotation(1) の座標変換をソフトでやるので 4.6 倍遅い。
+    if (!ppa_ || !push_row_ppa(y, x_from, x_to)) {
+        // pushSprite に部分矩形版が無いので、転送先のクリップ矩形で範囲を絞る。
+        const int px_from = x_from * cell_w_;
+        const int px_w    = (x_to - x_from + 1) * cell_w_;
+        gfx_.setClipRect(px_from, y * cell_h_, px_w, cell_h_);
+        row_.pushSprite(&gfx_, 0, y * cell_h_);
+        gfx_.clearClipRect();
+    }
     last_push_us_ += static_cast<uint32_t>(esp_timer_get_time() - t_push);
     last_px_ += static_cast<uint32_t>((x_to - x_from + 1) * cell_w_ * cell_h_);
 }
