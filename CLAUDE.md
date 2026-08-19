@@ -121,6 +121,33 @@ c++ -std=c++17 -Wall -Wextra -Werror -O1 -I$M3/include -I components/wg \
 - **Montgomery カーブの `mbedtls_ecp_mul` は `f_rng` が必須**（座標ブラインディング）。NULL だと失敗する
 - **コンソールタスクのスタックは 16KB 必要**。既定 4KB では X25519 がスタック保護フォルトを起こす
 
+## Tailscale / Headscale の開発環境
+
+制御プレーンは **ローカルの Headscale** を相手に開発する。SaaS だと「なぜ弾かれたか」が
+分からないため（プロトコル自体は SaaS と 1 バイトも変わらない）。
+
+```sh
+docker run -d --name headscale-tab5 -p 8080:8080 \
+  -v <config>:/etc/headscale -v <data>:/var/lib/headscale \
+  headscale/headscale:latest serve
+docker exec headscale-tab5 headscale users create tab5
+docker exec headscale-tab5 headscale preauthkeys create --user 1 --reusable --expiration 720h
+```
+
+- `dns.override_local_dns: false` と `dns.nameservers.global` を設定しないと起動しない
+- **Rancher Desktop のポートフォワードは localhost 限定**なので、実機から届かない。
+  `tools/` には置いていないが `0.0.0.0` で待って `127.0.0.1` に中継するだけの
+  TCP プロキシを挟むと通る
+- 実機・ホストの IP は変わるので、接続先は毎回確認する
+
+## ホストテストの依存
+
+```sh
+brew install mbedtls@3 cjson   # mbedtls は 3.x を使う（4.x は API が合わない）
+```
+
+CI (Ubuntu) では `libmbedtls-dev` と `libcjson-dev`。
+
 ## コード方針
 
 - 過剰な抽象化を作らない。実装が 1 つしかない interface、使われない config は書かない
