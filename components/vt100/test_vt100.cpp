@@ -339,6 +339,136 @@ void test_real_sequences()
     CHECK_STR(t4.row_text(0), "AB");
 }
 
+// レビュー指摘の回帰テスト。番号はレビューの指摘番号。
+void test_review_regressions()
+{
+    // 1. rgb_to_256 の境界: r==248 で 256 になって 0 (黒) に化けていた
+    {
+        Terminal t(10, 2);
+        t.write("\033[38;2;248;248;248mW");
+        CHECK_EQ(t.cell(0, 0).attr.fg, 231);
+    }
+    // 2. 既定色センチネルが実パレット番号と衝突しない
+    {
+        Terminal t(10, 2);
+        t.write("\033[38;5;255mA\033[48;5;254mB");
+        CHECK_EQ(t.cell(0, 0).attr.fg, 255);
+        CHECK(t.cell(0, 0).attr.fg != vt::kDefaultFg);
+        CHECK_EQ(t.cell(1, 0).attr.bg, 254);
+        CHECK(t.cell(1, 0).attr.bg != vt::kDefaultBg);
+        // 24bit の明るいグレーも既定色に潰れない
+        t.write("\033[38;2;247;247;247mC");
+        CHECK(t.cell(2, 0).attr.fg != vt::kDefaultFg);
+    }
+    // 3. 1 桁の端末は作れない (全角が右隣を触るため)
+    {
+        Terminal t(1, 2);
+        CHECK_EQ(t.cols(), 2);
+        t.write("あ");  // 範囲外書き込みしない
+        CHECK_EQ(t.cell(0, 0).width, 2);
+        CHECK_EQ(t.cell(1, 0).width, 0);
+        // IRM 併用でも壊れない
+        Terminal t2(2, 2);
+        t2.write("\033[4h");
+        t2.write("あい");
+        CHECK_EQ(t2.cols(), 2);
+    }
+    // 4. ICH が全角を消滅させない
+    {
+        Terminal t(6, 1);
+        t.write("あいう");
+        t.write("\033[1;3H\033[1@");
+        // 挿入した空白 1 つ分ずれ、右端で割れた「う」は空白に戻る
+        CHECK_STR(t.row_text(0), "あ い");
+        CHECK_EQ(t.cell(3, 0).ch, 0x3044u);  // 「い」が生き残っている
+        CHECK_EQ(t.cell(5, 0).width, 1);     // 孤立した左半分は残さない
+    }
+    // 5. DCH が末尾の全角を壊さない
+    {
+        Terminal t(6, 1);
+        t.write("abあい");
+        t.write("\033[1;1H\033[1P");
+        CHECK_STR(t.row_text(0), "bあい");
+        CHECK_EQ(t.cell(5, 0).width, 1);
+    }
+    // 6. 範囲消去が範囲外の全角を壊さない
+    {
+        Terminal t(6, 1);
+        t.write("aあい");
+        t.write("\033[1;1H\033[1J");  // 先頭からカーソルまで = row[0] だけ
+        CHECK_STR(t.row_text(0), " あい");
+        CHECK_EQ(t.cell(1, 0).ch, 0x3042u);
+    }
+    // 7. CSI パラメータが無制限に伸びない
+    {
+        Terminal t(10, 3);
+        std::string burst = "\033[";
+        for (int i = 0; i < 5000; ++i) burst += ";";
+        burst += "H";
+        t.write(burst);  // ヒープを食い潰さず、素直に CUP として処理される
+        CHECK_EQ(t.cursor_x(), 0);
+        CHECK_EQ(t.cursor_y(), 0);
+    }
+    // 8. コロン形式の 24bit 色 (カラースペース欄が空)
+    {
+        Terminal t(10, 2);
+        t.write("\033[38:2::255:0:0mR");
+        CHECK_EQ(t.cell(0, 0).attr.fg, 196);
+        t.write("\033[48:2::0:0:255mB");
+        CHECK_EQ(t.cell(1, 0).attr.bg, 21);
+    }
+    // 9. 絵文字などの全角判定
+    {
+        CHECK_EQ(vt::char_width(0x1F680), 2);  // 🚀
+        CHECK_EQ(vt::char_width(0x231A), 2);   // ⌚
+        CHECK_EQ(vt::char_width(0x1F600), 2);
+        CHECK_EQ(vt::char_width(0x1FA70), 2);
+        CHECK_EQ(vt::char_width(0x2500), 1);   // 罫線は半角のまま
+    }
+    // 10. 旧来の代替画面切替 (47 / 1047) と 1048
+    {
+        Terminal t(8, 2);
+        t.write("main\033[?47h");
+        CHECK(t.alt_screen());
+        t.write("\033[?47l");
+        CHECK(!t.alt_screen());
+        CHECK_STR(t.row_text(0), "main");
+        t.write("\033[1;3H\033[?1048h\033[2;1H\033[?1048l");
+        CHECK_EQ(t.cursor_x(), 2);
+        CHECK_EQ(t.cursor_y(), 0);
+    }
+    // 11. カーソル上下移動がスクロールマージンを越えない
+    {
+        Terminal t(10, 6);
+        t.write("\033[3;5r");   // 領域は 3〜5 行目 (index 2〜4)
+        t.write("\033[4;1H");   // 領域内 (index 3)
+        t.write("\033[10A");
+        CHECK_EQ(t.cursor_y(), 2);
+        t.write("\033[10B");
+        CHECK_EQ(t.cursor_y(), 4);
+        // 原点モードでの絶対指定も領域内に収まる
+        t.write("\033[?6h\033[99;1H");
+        CHECK_EQ(t.cursor_y(), 4);
+    }
+    // 12. DECSC の退避先が代替画面の出入りで壊れない
+    {
+        Terminal t(10, 3);
+        t.write("\033[2;3H\0337");
+        t.write("\033[?1049h\033[1;1H\033[?1049l");
+        t.write("\0338");
+        CHECK_EQ(t.cursor_x(), 2);
+        CHECK_EQ(t.cursor_y(), 1);
+    }
+    // 13. 空タイトルでクリアされる
+    {
+        Terminal t(10, 2);
+        t.write("\033]0;abc\007");
+        CHECK_STR(t.title(), "abc");
+        t.write("\033]0;\007");
+        CHECK_STR(t.title(), "");
+    }
+}
+
 }  // namespace
 
 int main()
@@ -356,6 +486,7 @@ int main()
     test_tabs_and_bs();
     test_resize();
     test_real_sequences();
+    test_review_regressions();
     std::printf("ok: %d checks passed\n", g_checks);
     return 0;
 }

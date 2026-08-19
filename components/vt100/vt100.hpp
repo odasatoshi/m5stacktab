@@ -27,14 +27,15 @@ enum AttrFlag : uint16_t {
     kStrike    = 1 << 7,
 };
 
-// 色は 256 色パレットの番号。既定色は kDefaultFg / kDefaultBg で表す。
-// 24bit 色 (SGR 38;2;r;g;b) は 256 色パレットの最近似に丸める。
-constexpr uint8_t kDefaultFg = 255;  // パレット 255 は実質使わないので既定色の印にする
-constexpr uint8_t kDefaultBg = 254;
+// 色は 256 色パレットの番号 (0-255)。24bit 色 (SGR 38;2;r;g;b) は最近似に丸める。
+// 既定色はパレット外の値で表す。パレット内の番号を流用すると ESC[38;5;255m や
+// 24bit の明るいグレーが「既定色」に潰れる。
+constexpr uint16_t kDefaultFg = 256;
+constexpr uint16_t kDefaultBg = 257;
 
 struct Attr {
-    uint8_t  fg    = kDefaultFg;
-    uint8_t  bg    = kDefaultBg;
+    uint16_t fg    = kDefaultFg;
+    uint16_t bg    = kDefaultBg;
     uint16_t flags = 0;
 
     bool operator==(const Attr& o) const
@@ -132,7 +133,13 @@ private:
     void mark_dirty(int y);
     void mark_all_dirty();
     void erase_cells(int x, int y, int count);
+    // 現在の背景色で埋めるだけ。全角の整合は取らないので repair_row と併用する。
+    void fill_blank(int x, int y, int count);
+    // 行内の全角セルの整合を直す (孤立した右半分、相棒を失った左半分を空白に戻す)。
+    // セルをずらす操作 (ICH/DCH/IRM) や範囲消去の後に呼ぶ。
+    void repair_row(int y);
     void clear_region(int from_index, int to_index);
+    void switch_alt(bool enable, bool clear, bool save_restore_cursor);
     void scroll_up(int top, int bottom, int n);
     void scroll_down(int top, int bottom, int n);
     void index();      // カーソルを 1 行下げる (必要ならスクロール)
@@ -156,8 +163,9 @@ private:
     std::vector<bool> dirty_;
 
     Cursor cur_{};
-    Cursor saved_main_{};
-    Cursor saved_alt_{};
+    Cursor saved_main_{};  // ESC 7 / CSI s の退避先 (主画面)
+    Cursor saved_alt_{};   // ESC 7 / CSI s の退避先 (代替画面)
+    Cursor alt_entry_{};   // 代替画面に入るときの退避先。DECSC とは別スロットにする
 
     int scroll_top_    = 0;  // スクロール領域 (0-origin, inclusive)
     int scroll_bottom_ = 0;
@@ -173,9 +181,13 @@ private:
 
     std::vector<bool> tab_stops_;
 
+    // CSI パラメータの個数上限。無制限だと ";" の連打で際限なくヒープを食う。
+    static constexpr size_t kMaxParams = 32;
+
     State                state_ = State::kGround;
     std::vector<int>     params_;
-    bool                 param_seen_  = false;
+    bool                 param_seen_     = false;
+    bool                 param_overflow_ = false;
     uint8_t              csi_private_ = 0;
     uint8_t              csi_inter_   = 0;
     std::string          osc_;

@@ -17,24 +17,40 @@ struct Range {
 };
 
 constexpr Range kWide[] = {
-    {0x1100, 0x115F},   {0x2329, 0x232A},   {0x2E80, 0x303E},   {0x3041, 0x33FF},
-    {0x3400, 0x4DBF},   {0x4E00, 0x9FFF},   {0xA000, 0xA4CF},   {0xA960, 0xA97F},
-    {0xAC00, 0xD7A3},   {0xF900, 0xFAFF},   {0xFE10, 0xFE19},   {0xFE30, 0xFE6F},
-    {0xFF00, 0xFF60},   {0xFFE0, 0xFFE6},   {0x1F300, 0x1F64F}, {0x1F900, 0x1F9FF},
-    {0x20000, 0x2FFFD}, {0x30000, 0x3FFFD},
+    {0x1100, 0x115F},   {0x231A, 0x231B},   {0x2329, 0x232A},   {0x23E9, 0x23EC},
+    {0x23F0, 0x23F0},   {0x23F3, 0x23F3},   {0x25FD, 0x25FE},   {0x2614, 0x2615},
+    {0x2648, 0x2653},   {0x267F, 0x267F},   {0x2693, 0x2693},   {0x26A1, 0x26A1},
+    {0x26AA, 0x26AB},   {0x26BD, 0x26BE},   {0x26C4, 0x26C5},   {0x26CE, 0x26CE},
+    {0x26D4, 0x26D4},   {0x26EA, 0x26EA},   {0x26F2, 0x26F3},   {0x26F5, 0x26F5},
+    {0x26FA, 0x26FA},   {0x26FD, 0x26FD},   {0x2705, 0x2705},   {0x270A, 0x270B},
+    {0x2728, 0x2728},   {0x274C, 0x274C},   {0x274E, 0x274E},   {0x2753, 0x2755},
+    {0x2757, 0x2757},   {0x2795, 0x2797},   {0x27B0, 0x27B0},   {0x27BF, 0x27BF},
+    {0x2B1B, 0x2B1C},   {0x2B50, 0x2B50},   {0x2B55, 0x2B55},   {0x2E80, 0x303E},
+    {0x3041, 0x33FF},   {0x3400, 0x4DBF},   {0x4E00, 0x9FFF},   {0xA000, 0xA4CF},
+    {0xA960, 0xA97F},   {0xAC00, 0xD7A3},   {0xF900, 0xFAFF},   {0xFE10, 0xFE19},
+    {0xFE30, 0xFE6F},   {0xFF00, 0xFF60},   {0xFFE0, 0xFFE6},   {0x16FE0, 0x16FE4},
+    {0x17000, 0x18AFF}, {0x1B000, 0x1B2FF}, {0x1F004, 0x1F004}, {0x1F0CF, 0x1F0CF},
+    {0x1F18E, 0x1F18E}, {0x1F191, 0x1F19A}, {0x1F200, 0x1F320}, {0x1F32D, 0x1F335},
+    {0x1F337, 0x1F37C}, {0x1F37E, 0x1F393}, {0x1F3A0, 0x1F3CA}, {0x1F3CF, 0x1F3D3},
+    {0x1F3E0, 0x1F3F0}, {0x1F3F4, 0x1F3F4}, {0x1F3F8, 0x1F43E}, {0x1F440, 0x1F440},
+    {0x1F442, 0x1F4FC}, {0x1F4FF, 0x1F53D}, {0x1F54B, 0x1F54E}, {0x1F550, 0x1F567},
+    {0x1F57A, 0x1F57A}, {0x1F595, 0x1F596}, {0x1F5A4, 0x1F5A4}, {0x1F5FB, 0x1F64F},
+    {0x1F680, 0x1F6C5}, {0x1F6CC, 0x1F6CC}, {0x1F6D0, 0x1F6D2}, {0x1F6D5, 0x1F6DF},
+    {0x1F6EB, 0x1F6EC}, {0x1F6F4, 0x1F6FC}, {0x1F7E0, 0x1F7EB}, {0x1F90C, 0x1F9FF},
+    {0x1FA70, 0x1FAFF}, {0x20000, 0x2FFFD}, {0x30000, 0x3FFFD},
 };
 
 // 24bit 色を xterm 256 色パレットの最近似に丸める。
-uint8_t rgb_to_256(int r, int g, int b)
+uint16_t rgb_to_256(int r, int g, int b)
 {
     // グレースケール軸のほうが近ければそちらを使う。
     if (std::abs(r - g) < 8 && std::abs(g - b) < 8) {
         if (r < 8) return 16;
-        if (r > 248) return 231;
-        return static_cast<uint8_t>(232 + (r - 8) * 24 / 240);
+        if (r >= 248) return 231;  // > だと r==248 で 256 になり uint8_t で 0 (黒) に化ける
+        return static_cast<uint16_t>(232 + (r - 8) * 24 / 240);
     }
     auto q = [](int v) { return v < 48 ? 0 : v < 115 ? 1 : (v - 35) / 40; };
-    return static_cast<uint8_t>(16 + 36 * q(r) + 6 * q(g) + q(b));
+    return static_cast<uint16_t>(16 + 36 * q(r) + 6 * q(g) + q(b));
 }
 
 }  // namespace
@@ -51,7 +67,8 @@ int char_width(uint32_t cp)
 
 Terminal::Terminal(int cols, int rows)
 {
-    cols_ = std::max(1, cols);
+    // 全角文字は 2 セル使うので 1 桁の端末は許さない (put_char が右隣を触る)。
+    cols_ = std::max(2, cols);
     rows_ = std::max(1, rows);
     main_.assign(static_cast<size_t>(cols_) * rows_, Cell{});
     alt_ = main_;
@@ -123,7 +140,7 @@ std::string Terminal::row_text(int y) const
 
 void Terminal::resize(int cols, int rows)
 {
-    cols = std::max(1, cols);
+    cols = std::max(2, cols);
     rows = std::max(1, rows);
     if (cols == cols_ && rows == rows_) return;
 
@@ -178,17 +195,43 @@ void Terminal::split_wide_at(int x, int y)
     }
 }
 
-void Terminal::erase_cells(int x, int y, int count)
+void Terminal::fill_blank(int x, int y, int count)
 {
+    Cell blank{};
+    blank.attr       = cur_.attr;
+    blank.attr.flags = 0;  // 消去したセルに下線などを残さない
     for (int i = 0; i < count && x + i < cols_; ++i) {
-        split_wide_at(x + i, y);
-        Cell& c = at(x + i, y);
-        c.ch    = ' ';
-        c.width = 1;
-        c.attr  = cur_.attr;
-        c.attr.flags = 0;  // 消去したセルに下線などを残さない
+        at(x + i, y) = blank;
     }
     mark_dirty(y);
+}
+
+void Terminal::repair_row(int y)
+{
+    if (y < 0 || y >= rows_) return;
+    for (int x = 0; x < cols_; ++x) {
+        Cell& c = at(x, y);
+        if (c.width == 2) {
+            // 右半分が失われた左半分
+            if (x + 1 >= cols_ || at(x + 1, y).width != 0) {
+                c.ch    = ' ';
+                c.width = 1;
+            }
+        } else if (c.width == 0) {
+            // 左半分が失われた孤立した右半分
+            if (x == 0 || at(x - 1, y).width != 2) {
+                c.ch    = ' ';
+                c.width = 1;
+            }
+        }
+    }
+    mark_dirty(y);
+}
+
+void Terminal::erase_cells(int x, int y, int count)
+{
+    fill_blank(x, y, count);
+    repair_row(y);
 }
 
 void Terminal::scroll_up(int top, int bottom, int n)
@@ -267,6 +310,27 @@ void Terminal::tab_forward()
     cur_.x = cols_ - 1;
 }
 
+void Terminal::switch_alt(bool enable, bool clear, bool save_restore_cursor)
+{
+    if (enable == alt_active_) return;
+    if (enable) {
+        // DECSC (ESC 7) の退避先とは別スロットを使う。共用すると
+        // 「ESC 7 → ページャ起動 → ESC 8」で復元位置がすり替わる。
+        if (save_restore_cursor) alt_entry_ = cur_;
+        if (clear) std::fill(alt_.begin(), alt_.end(), Cell{});
+        alt_active_ = true;
+        if (save_restore_cursor) cur_ = Cursor{};
+    } else {
+        alt_active_ = false;
+        if (save_restore_cursor) cur_ = alt_entry_;
+    }
+    scroll_top_    = 0;
+    scroll_bottom_ = rows_ - 1;
+    cur_.pending_wrap = false;
+    clamp_cursor();
+    mark_all_dirty();
+}
+
 void Terminal::save_cursor()
 {
     (alt_active_ ? saved_alt_ : saved_main_) = cur_;
@@ -324,6 +388,7 @@ void Terminal::put_char(uint32_t cp)
         auto& s = screen();
         auto  row = s.begin() + static_cast<size_t>(cur_.y) * cols_;
         std::copy_backward(row + cur_.x, row + cols_ - w, row + cols_);
+        repair_row(cur_.y);  // ずらして割れた全角を先に直す (この後で書き込む)
     }
 
     split_wide_at(cur_.x, cur_.y);
@@ -405,22 +470,16 @@ void Terminal::set_mode(bool enable)
                     break;
                 case 7: autowrap_ = enable; break;
                 case 25: cursor_visible_ = enable; break;
+                case 47:
+                case 1047:
+                    // 旧 vim などの smcup。バッファだけ切り替え、カーソルは保存しない。
+                    switch_alt(enable, /*clear=*/enable, /*save_restore_cursor=*/false);
+                    break;
+                case 1048:
+                    if (enable) save_cursor(); else restore_cursor();
+                    break;
                 case 1049:
-                    if (enable != alt_active_) {
-                        if (enable) {
-                            saved_main_ = cur_;
-                            std::fill(alt_.begin(), alt_.end(), Cell{});
-                            alt_active_ = true;
-                            cur_        = Cursor{};
-                        } else {
-                            alt_active_ = false;
-                            cur_        = saved_main_;
-                        }
-                        scroll_top_    = 0;
-                        scroll_bottom_ = rows_ - 1;
-                        clamp_cursor();
-                        mark_all_dirty();
-                    }
+                    switch_alt(enable, /*clear=*/enable, /*save_restore_cursor=*/true);
                     break;
                 case 2004: bracketed_paste_ = enable; break;
                 default: break;  // マウス報告 (1000 系) などは未対応
@@ -465,27 +524,31 @@ void Terminal::exec_sgr()
                 bool fg  = (p == 38);
                 int  kind = param(i + 1, 0);
                 if (kind == 5) {
-                    uint8_t idx = static_cast<uint8_t>(std::clamp(param(i + 2, 0), 0, 255));
+                    uint16_t idx = static_cast<uint16_t>(std::clamp(param(i + 2, 0), 0, 255));
                     if (fg) cur_.attr.fg = idx; else cur_.attr.bg = idx;
                     i += 2;
                 } else if (kind == 2) {
-                    uint8_t idx = rgb_to_256(std::clamp(param(i + 2, 0), 0, 255),
-                                             std::clamp(param(i + 3, 0), 0, 255),
-                                             std::clamp(param(i + 4, 0), 0, 255));
+                    // コロン形式の標準は 38:2:<colorspace>:r:g:b で colorspace 欄が空。
+                    // 空欄 (-1) を r として食うと色が壊れるので 1 つ読み飛ばす。
+                    size_t j = i + 2;
+                    if (j < params_.size() && params_[j] < 0) ++j;
+                    uint16_t idx = rgb_to_256(std::clamp(param(j, 0), 0, 255),
+                                              std::clamp(param(j + 1, 0), 0, 255),
+                                              std::clamp(param(j + 2, 0), 0, 255));
                     if (fg) cur_.attr.fg = idx; else cur_.attr.bg = idx;
-                    i += 4;
+                    i = j + 2;
                 }
                 break;
             }
             default:
                 if (p >= 30 && p <= 37) {
-                    cur_.attr.fg = static_cast<uint8_t>(p - 30);
+                    cur_.attr.fg = static_cast<uint16_t>(p - 30);
                 } else if (p >= 40 && p <= 47) {
-                    cur_.attr.bg = static_cast<uint8_t>(p - 40);
+                    cur_.attr.bg = static_cast<uint16_t>(p - 40);
                 } else if (p >= 90 && p <= 97) {
-                    cur_.attr.fg = static_cast<uint8_t>(p - 90 + 8);
+                    cur_.attr.fg = static_cast<uint16_t>(p - 90 + 8);
                 } else if (p >= 100 && p <= 107) {
-                    cur_.attr.bg = static_cast<uint8_t>(p - 100 + 8);
+                    cur_.attr.bg = static_cast<uint16_t>(p - 100 + 8);
                 }
                 break;
         }
@@ -496,21 +559,26 @@ void Terminal::exec_csi(uint8_t f)
 {
     // 原点モードではスクロール領域が座標の基準になる。
     const int y_origin = origin_mode_ ? scroll_top_ : 0;
-    const int y_limit  = origin_mode_ ? scroll_bottom_ : rows_ - 1;
+    // カーソルがスクロール領域内にいるなら、上下移動はマージンで止まる (VT100 仕様)。
+    // 領域外にいるときだけ画面端まで動ける。
+    const int move_top    = (cur_.y >= scroll_top_) ? scroll_top_ : 0;
+    const int move_bottom = (cur_.y <= scroll_bottom_) ? scroll_bottom_ : rows_ - 1;
+    // 絶対位置指定 (CUP/VPA) のクランプ先。原点モードなら領域の下端で止める。
+    const int abs_limit = origin_mode_ ? scroll_bottom_ : rows_ - 1;
 
     switch (f) {
-        case 'A': cur_.y = std::max(y_origin, cur_.y - param(0, 1)); cur_.pending_wrap = false; break;
-        case 'B': cur_.y = std::min(y_limit, cur_.y + param(0, 1)); cur_.pending_wrap = false; break;
+        case 'A': cur_.y = std::max(move_top, cur_.y - param(0, 1)); cur_.pending_wrap = false; break;
+        case 'B': cur_.y = std::min(move_bottom, cur_.y + param(0, 1)); cur_.pending_wrap = false; break;
         case 'C': cur_.x = std::min(cols_ - 1, cur_.x + param(0, 1)); cur_.pending_wrap = false; break;
         case 'D': cur_.x = std::max(0, cur_.x - param(0, 1)); cur_.pending_wrap = false; break;
-        case 'E': cur_.y = std::min(y_limit, cur_.y + param(0, 1)); carriage_return(); break;
-        case 'F': cur_.y = std::max(y_origin, cur_.y - param(0, 1)); carriage_return(); break;
+        case 'E': cur_.y = std::min(move_bottom, cur_.y + param(0, 1)); carriage_return(); break;
+        case 'F': cur_.y = std::max(move_top, cur_.y - param(0, 1)); carriage_return(); break;
         case 'G':
         case '`': cur_.x = std::clamp(param(0, 1) - 1, 0, cols_ - 1); cur_.pending_wrap = false; break;
-        case 'd': cur_.y = std::clamp(y_origin + param(0, 1) - 1, 0, rows_ - 1); cur_.pending_wrap = false; break;
+        case 'd': cur_.y = std::clamp(y_origin + param(0, 1) - 1, 0, abs_limit); cur_.pending_wrap = false; break;
         case 'H':
         case 'f':
-            cur_.y            = std::clamp(y_origin + param(0, 1) - 1, 0, rows_ - 1);
+            cur_.y            = std::clamp(y_origin + param(0, 1) - 1, 0, abs_limit);
             cur_.x            = std::clamp(param(1, 1) - 1, 0, cols_ - 1);
             cur_.pending_wrap = false;
             break;
@@ -552,7 +620,10 @@ void Terminal::exec_csi(uint8_t f)
             auto& s = screen();
             auto row = s.begin() + static_cast<size_t>(cur_.y) * cols_;
             std::copy_backward(row + cur_.x, row + cols_ - n, row + cols_);
-            erase_cells(cur_.x, cur_.y, n);
+            // ずらした後の空き領域は素の blank で埋める。ここで split_wide_at を通すと
+            // 「ずらす前の残骸」を見て正しいセルを消してしまう。
+            fill_blank(cur_.x, cur_.y, n);
+            repair_row(cur_.y);
             break;
         }
         case 'P': {  // DCH
@@ -560,7 +631,8 @@ void Terminal::exec_csi(uint8_t f)
             auto& s = screen();
             auto row = s.begin() + static_cast<size_t>(cur_.y) * cols_;
             std::copy(row + cur_.x + n, row + cols_, row + cur_.x);
-            erase_cells(cols_ - n, cur_.y, n);
+            fill_blank(cols_ - n, cur_.y, n);
+            repair_row(cur_.y);
             break;
         }
         case 'X': erase_cells(cur_.x, cur_.y, std::max(1, param(0, 1))); break;
@@ -619,13 +691,11 @@ void Terminal::clear_region(int from_index, int to_index)
     from_index = std::clamp(from_index, 0, static_cast<int>(s.size()));
     to_index   = std::clamp(to_index, 0, static_cast<int>(s.size()));
     if (from_index >= to_index) return;
-    // 端が全角セルの途中なら相棒を空白にしてから塗る。
-    split_wide_at(from_index % cols_, from_index / cols_);
-    if (to_index < static_cast<int>(s.size())) {
-        split_wide_at(to_index % cols_, to_index / cols_);
-    }
     std::fill(s.begin() + from_index, s.begin() + to_index, blank);
     for (int y = from_index / cols_; y <= (to_index - 1) / cols_; ++y) mark_dirty(y);
+    // 範囲の端で全角が割れている可能性があるのは最初と最後の行だけ。
+    repair_row(from_index / cols_);
+    repair_row((to_index - 1) / cols_);
 }
 
 void Terminal::write(const std::string& s)
@@ -685,7 +755,8 @@ void Terminal::write(const uint8_t* data, size_t len)
             case State::kEsc:
                 if (b == '[') {
                     params_.clear();
-                    param_seen_  = false;
+                    param_seen_     = false;
+                    param_overflow_ = false;
                     csi_private_ = 0;
                     csi_inter_   = 0;
                     state_       = State::kCsiParam;
@@ -711,16 +782,20 @@ void Terminal::write(const uint8_t* data, size_t len)
             case State::kCsiParam:
                 if (b >= '0' && b <= '9') {
                     if (!param_seen_) {
-                        params_.push_back(0);
                         param_seen_ = true;
+                        if (params_.size() < kMaxParams) {
+                            params_.push_back(0);
+                        } else {
+                            param_overflow_ = true;  // 以降このシーケンスの数字は捨てる
+                        }
                     }
-                    if (params_.back() < 100000) {
+                    if (!param_overflow_ && params_.back() < 100000) {
                         params_.back() = params_.back() * 10 + (b - '0');
                     }
                 } else if (b == ';' || b == ':') {
                     // ':' は SGR のサブパラメータ区切りだが、ここでは ';' と同じ扱いにする。
                     // 数字が来ないまま区切られたら -1 を積む。param() がそれを既定値に読み替える。
-                    if (!param_seen_) params_.push_back(-1);
+                    if (!param_seen_ && params_.size() < kMaxParams) params_.push_back(-1);
                     param_seen_ = false;
                 } else if (b >= '<' && b <= '?') {
                     csi_private_ = b;
@@ -741,7 +816,7 @@ void Terminal::write(const uint8_t* data, size_t len)
             case State::kOsc:
                 if (b == 0x07) {
                     // OSC 0/2 はウィンドウタイトル
-                    if (osc_.size() > 2 && (osc_[0] == '0' || osc_[0] == '2') && osc_[1] == ';') {
+                    if (osc_.size() >= 2 && (osc_[0] == '0' || osc_[0] == '2') && osc_[1] == ';') {
                         title_ = osc_.substr(2);
                     }
                     state_ = State::kGround;
@@ -753,7 +828,7 @@ void Terminal::write(const uint8_t* data, size_t len)
                 break;
 
             case State::kOscEsc:
-                if (osc_.size() > 2 && (osc_[0] == '0' || osc_[0] == '2') && osc_[1] == ';') {
+                if (osc_.size() >= 2 && (osc_[0] == '0' || osc_[0] == '2') && osc_[1] == ';') {
                     title_ = osc_.substr(2);
                 }
                 state_ = State::kGround;
