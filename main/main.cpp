@@ -32,6 +32,7 @@
 #include "ts_client.hpp"
 #include "disco_responder.hpp"
 #include "netmap.hpp"
+#include "rotate.hpp"
 #include "ts_control.hpp"
 #include "wg_netif.hpp"
 #include "blake2s.hpp"
@@ -843,6 +844,46 @@ int cmd_keytest(int, char**)
     return rc == 0 ? 0 : 1;
 }
 
+// 座標変換が M5GFX の setRotation(1) と同じ向きかを実機で照合する。
+// 横向きの座標に印を描き、rotation 0 に切り替えて計算した位置に別の色で印を描く。
+// 2 つが重なれば変換が正しい。
+int cmd_rottest(int, char**)
+{
+    rot::Panel panel;
+    panel.native_w = 720;
+    panel.native_h = 1280;
+
+    struct Point { int lx, ly; uint16_t color; const char* name; };
+    const Point pts[] = {
+        {40, 40, TFT_RED, "top-left"},
+        {1240, 40, TFT_GREEN, "top-right"},
+        {40, 680, TFT_BLUE, "bottom-left"},
+        {1240, 680, TFT_YELLOW, "bottom-right"},
+    };
+
+    // まず横向き (rotation 1) で四隅に印を描く
+    display.setRotation(1);
+    display.fillScreen(TFT_BLACK);
+    for (const auto& pt : pts) display.fillCircle(pt.lx, pt.ly, 18, pt.color);
+    display.setFont(&fonts::efontJA_24);
+    display.setTextColor(TFT_WHITE, TFT_BLACK);
+    display.drawString("rotation 1: big circles", 300, 300);
+
+    // 次に rotation 0 に切り替えて、変換した座標に小さい印を描く
+    display.setRotation(0);
+    for (const auto& pt : pts) {
+        int nx = 0, ny = 0;
+        rot::landscape_to_native(panel, pt.lx, pt.ly, &nx, &ny);
+        display.fillCircle(nx, ny, 7, TFT_WHITE);
+        std::printf("  %-13s landscape(%4d,%3d) -> native(%3d,%4d)\n", pt.name, pt.lx, pt.ly, nx,
+                    ny);
+    }
+    display.setRotation(1);
+    display.drawString("white dots inside circles = ok", 300, 340);
+    std::printf("check the screen: white dots must be inside the colored circles\n");
+    return 0;
+}
+
 void register_term_commands()
 {
     const esp_console_cmd_t cmds[] = {
@@ -863,6 +904,8 @@ void register_term_commands()
         {"wgtest", "WireGuard の暗号とハンドシェイクを実機で検証", nullptr, &cmd_wgtest, nullptr,
          nullptr, nullptr},
         {"keytest", "sshkey パーティションの鍵を mbedTLS で直接パースする", nullptr, &cmd_keytest,
+         nullptr, nullptr, nullptr},
+        {"rottest", "座標変換が setRotation(1) と一致するか実機で照合", nullptr, &cmd_rottest,
          nullptr, nullptr, nullptr},
         {"ts", "Tailscale/Headscale の制御プレーンに接続", "<host> <authkey> [port] [capver]",
          &cmd_ts, nullptr, nullptr, nullptr},
