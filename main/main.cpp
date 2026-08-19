@@ -32,6 +32,11 @@
 #include "ts_client.hpp"
 #include "disco_responder.hpp"
 #include "netmap.hpp"
+#include <driver/ppa.h>
+#include <esp_memory_utils.h>
+#include <lgfx/v1/platforms/esp32p4/Panel_DSI.hpp>
+
+#include "rotate.hpp"
 #include "ts_control.hpp"
 #include "wg_netif.hpp"
 #include "blake2s.hpp"
@@ -45,6 +50,30 @@
 namespace {
 
 const char* TAG = "boot";
+
+// vt::Terminal と TermRenderer は **メインループとコンソールタスクの両方から触られる**
+// （コンソールコマンドが term に書いて描画し、メインループも SSH の受信を流して描画する）。
+// 保護しないと画面が壊れるうえ、描画時間の計測値も混ざって信用できなくなる。
+SemaphoreHandle_t s_term_lock = nullptr;
+
+class TermGuard {
+public:
+    TermGuard()
+    {
+        if (!s_term_lock) return;
+        taken_ = xSemaphoreTake(s_term_lock, pdMS_TO_TICKS(2000)) == pdTRUE;
+        if (!taken_) {
+            // 黙って通すと、ロックを入れた目的（画面の破壊と計測値の混入）がそのまま再発する。
+            // 呼び出し側は ok() を見て中断する。
+            ESP_LOGE(TAG, "terminal lock timeout - skipping this operation");
+        }
+    }
+    ~TermGuard() { if (taken_) xSemaphoreGive(s_term_lock); }
+    bool ok() const { return taken_; }
+
+private:
+    bool taken_ = false;
+};
 
 // mbedtls_pk_parse_key は EC 鍵で RNG を要求する（座標ブラインディング）。
 mbedtls_ctr_drbg_context* ts_drbg()
@@ -117,8 +146,14 @@ int cmd_term(int argc, char** argv)
         if (i > 1) s += ' ';
         s += unescape(argv[i]);
     }
+    TermGuard guard;
+    if (!guard.ok()) {
+        std::printf("busy\n");
+        return 1;
+    }
     term->write(s);
     renderer->render(*term);
+    // 計測値もロックの中で読む。外に出すとメインループの render に上書きされる。
     std::printf("wrote %d bytes, redrew %d rows in %u us (draw %u / push %u)\n", (int)s.size(),
                 renderer->last_rows_drawn(), (unsigned)renderer->last_render_us(),
                 (unsigned)renderer->last_draw_us(), (unsigned)renderer->last_push_us());
@@ -174,6 +209,11 @@ int cmd_termtest(int, char**)
 
 int cmd_termscroll(int, char**)
 {
+    TermGuard guard;
+    if (!guard.ok()) {
+        std::printf("busy\n");
+        return 1;
+    }
     for (int i = 0; i < 40; ++i) {
         char buf[64];
         std::snprintf(buf, sizeof(buf), "scroll line %d あいう\r\n", i);
@@ -300,8 +340,11 @@ int cmd_conv(int argc, char** argv)
         line += " ";
     }
     line += "\r\n";
-    term->write(line);
-    renderer->render(*term);
+    {
+        TermGuard guard;
+        term->write(line);
+        renderer->render(*term);
+    }
     return 0;
 }
 
@@ -309,6 +352,7 @@ int cmd_conv(int argc, char** argv)
 int cmd_scroll(int argc, char** argv)
 {
     const int delta = (argc > 1) ? atoi(argv[1]) : 3;
+    TermGuard guard;
     const int moved = term->scroll_view(delta);
     renderer->render(*term, /*force=*/true);
     std::printf("moved %d (offset %d / %d lines held)\n", moved, term->view_offset(),
@@ -346,9 +390,12 @@ int cmd_ssh(int argc, char** argv)
         return 1;
     }
 
-    term->write("\r\n\033[33mconnecting to ");
-    term->write(cfg.user + "@" + cfg.host + "...\033[m\r\n");
-    renderer->render(*term);
+    {
+        TermGuard guard;
+        term->write("\r\n\033[33mconnecting to ");
+        term->write(cfg.user + "@" + cfg.host + "...\033[m\r\n");
+        renderer->render(*term);
+    }
 
     esp_err_t err = ssh_connect(cfg, renderer->cols(), renderer->rows());
     if (err != ESP_OK) {
@@ -393,6 +440,8 @@ int cmd_key(int argc, char** argv)
 // 差分転送の効き目を測る。1 文字ずつ書いたときの再描画コストを見る。
 int cmd_bench(int, char**)
 {
+    // 計測中に別タスクが描画すると値が混ざるので、区間全体を押さえる。
+    TermGuard guard;
     renderer->render(*term, /*force=*/true);
     const uint32_t full_us = renderer->last_render_us();
     const uint32_t full_px = renderer->last_pixels();
@@ -417,6 +466,7 @@ int cmd_bench(int, char**)
 int cmd_kbd(int argc, char** argv)
 {
     const bool show = (argc < 2) || (std::string(argv[1]) != "off");
+    TermGuard guard;
     keyboard->set_visible(show);
     // 隠したら画面全体を端末に使う。端末側の行数と PTY サイズも合わせる。
     const int rows = show ? (display.height() - keyboard->height()) / renderer->cell_h()
@@ -595,6 +645,7 @@ int cmd_ts(int argc, char** argv)
     if (!st.assigned_address.empty()) {
         std::printf("  >>> assigned address: %s\n", st.assigned_address.c_str());
         std::string line = "\r\n\033[32mtailscale: " + st.assigned_address + "\033[m\r\n";
+        TermGuard guard;
         term->write(line);
         renderer->render(*term);
     }
@@ -843,6 +894,156 @@ int cmd_keytest(int, char**)
     return rc == 0 ? 0 : 1;
 }
 
+// PPA でフレームバッファに直接書けるかを確かめる。
+// Panel_DSI は config_detail().buffer でフレームバッファを公開している。
+int cmd_ppatest(int, char**)
+{
+    // フレームバッファに直接書くので、他のタスクの描画と重ならないようにする。
+    TermGuard guard;
+    if (!guard.ok()) {
+        std::printf("busy\n");
+        return 1;
+    }
+    auto* panel = static_cast<lgfx::Panel_DSI*>(display.getPanel());
+    if (!panel) {
+        std::printf("panel is not Panel_DSI\n");
+        return 1;
+    }
+    const auto& cfg = panel->config_detail();
+    std::printf("frame buffer: %p (%u bytes), panel %dx%d depth %d\n", cfg.buffer,
+                (unsigned)cfg.buffer_length, (int)display.width(), (int)display.height(),
+                (int)display.getColorDepth());
+    if (!cfg.buffer) {
+        std::printf("no frame buffer exposed\n");
+        return 1;
+    }
+    // PSRAM 上のはず（1280x720x2 = 1.84MB）
+    const bool in_psram = esp_ptr_external_ram(cfg.buffer);
+    std::printf("  in psram: %d, expected size for 720x1280x2: %d\n", in_psram ? 1 : 0,
+                720 * 1280 * 2);
+
+    // PPA クライアントを登録して、1 行ぶんを 90 度回転して書いてみる。
+    ppa_client_config_t pc = {};
+    pc.oper_type          = PPA_OPERATION_SRM;
+    ppa_client_handle_t client = nullptr;
+    esp_err_t err = ppa_register_client(&pc, &client);
+    if (err != ESP_OK) {
+        std::printf("ppa_register_client failed: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    // 内蔵 RAM に 1 行ぶん（1280x24）のソースを作る。DMA するので 64B 境界に置く。
+    constexpr int kW = 1280, kH = 24;
+    auto* src = static_cast<uint16_t*>(heap_caps_aligned_alloc(64, kW * kH * 2,
+                                                              MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+    if (!src) {
+        std::printf("src alloc failed\n");
+        ppa_unregister_client(client);
+        return 1;
+    }
+    for (int y = 0; y < kH; ++y) {
+        for (int x = 0; x < kW; ++x) src[y * kW + x] = (x < kW / 2) ? 0xF800 : 0x001F;  // 赤 | 青
+    }
+
+    rot::Panel rp;
+    int nx = 0, ny = 0, nw = 0, nh = 0;
+    rot::landscape_rect_to_native(rp, 0, 0, kW, kH, &nx, &ny, &nw, &nh);
+
+    ppa_srm_oper_config_t op = {};
+    op.in.buffer            = src;
+    op.in.pic_w             = kW;
+    op.in.pic_h             = kH;
+    op.in.block_w           = kW;
+    op.in.block_h           = kH;
+    op.in.srm_cm            = PPA_SRM_COLOR_MODE_RGB565;
+    op.out.buffer = cfg.buffer;
+    // M5GFX は buffer_length を埋めていない（0 が入っている）ので自分で計算する。
+    // 0 を渡すと ppa_do_scale_rotate_mirror が ESP_ERR_INVALID_ARG を返す。
+    op.out.buffer_size = static_cast<size_t>(rp.native_w) * rp.native_h * 2;
+    op.out.pic_w            = rp.native_w;
+    op.out.pic_h            = rp.native_h;
+    op.out.block_offset_x   = nx;
+    op.out.block_offset_y   = ny;
+    op.out.srm_cm           = PPA_SRM_COLOR_MODE_RGB565;
+    op.rotation_angle       = PPA_SRM_ROTATION_ANGLE_90;
+    op.scale_x              = 1.0f;
+    op.scale_y              = 1.0f;
+    op.mode                 = PPA_TRANS_MODE_BLOCKING;
+
+    const int64_t t0 = esp_timer_get_time();
+    err = ppa_do_scale_rotate_mirror(client, &op);
+    const int64_t us = esp_timer_get_time() - t0;
+    if (err != ESP_OK) {
+        std::printf("ppa_do_scale_rotate_mirror failed: %s\n", esp_err_to_name(err));
+    } else {
+        std::printf("ppa rotate 1280x24 -> native(%d,%d) %dx%d: %lld us\n", nx, ny, nw, nh, us);
+        // 比較用に M5GFX の pushSprite も測る
+        M5Canvas sp(&display);
+        sp.setPsram(false);
+        sp.setColorDepth(16);
+        if (sp.createSprite(kW, kH)) {
+            sp.fillSprite(TFT_GREEN);
+            display.setRotation(1);
+            const int64_t t1 = esp_timer_get_time();
+            sp.pushSprite(0, kH);
+            std::printf("m5gfx pushSprite same size (rotation 1): %lld us\n",
+                        esp_timer_get_time() - t1);
+            sp.deleteSprite();
+        }
+    }
+    heap_caps_free(src);
+    ppa_unregister_client(client);
+    return err == ESP_OK ? 0 : 1;
+}
+
+// 座標変換が M5GFX の setRotation(1) と同じ向きかを実機で照合する。
+// 横向きの座標に印を描き、rotation 0 に切り替えて計算した位置に別の色で印を描く。
+// 2 つが重なれば変換が正しい。
+int cmd_rottest(int, char**)
+{
+    // rotation を一時的に変えるので、他のタスクが描画しないよう押さえる。
+    // 変えている最中に render されると、スプライトのストライドとタッチ座標がずれる。
+    TermGuard guard;
+    if (!guard.ok()) {
+        std::printf("busy\n");
+        return 1;
+    }
+    rot::Panel panel;
+    panel.native_w = 720;
+    panel.native_h = 1280;
+
+    struct Point { int lx, ly; uint16_t color; const char* name; };
+    const Point pts[] = {
+        {40, 40, TFT_RED, "top-left"},
+        {1240, 40, TFT_GREEN, "top-right"},
+        {40, 680, TFT_BLUE, "bottom-left"},
+        {1240, 680, TFT_YELLOW, "bottom-right"},
+    };
+
+    // まず横向き (rotation 1) で四隅に印を描く
+    display.setRotation(1);
+    display.fillScreen(TFT_BLACK);
+    for (const auto& pt : pts) display.fillCircle(pt.lx, pt.ly, 18, pt.color);
+    display.setFont(&fonts::efontJA_24);
+    display.setTextColor(TFT_WHITE, TFT_BLACK);
+    display.drawString("rotation 1: big circles", 300, 300);
+
+    // 次に rotation 0 に切り替えて、変換した座標に小さい印を描く
+    display.setRotation(0);
+    for (const auto& pt : pts) {
+        int nx = 0, ny = 0;
+        rot::landscape_to_native(panel, pt.lx, pt.ly, &nx, &ny);
+        display.fillCircle(nx, ny, 7, TFT_WHITE);
+        std::printf("  %-13s landscape(%4d,%3d) -> native(%3d,%4d)\n", pt.name, pt.lx, pt.ly, nx,
+                    ny);
+    }
+    display.setRotation(1);
+    display.drawString("white dots inside circles = ok", 300, 340);
+    std::printf("check the screen: white dots must be inside the colored circles\n");
+    std::printf("run `termtest` or type to restore the terminal\n");
+    return 0;
+}
+
 void register_term_commands()
 {
     const esp_console_cmd_t cmds[] = {
@@ -864,6 +1065,10 @@ void register_term_commands()
          nullptr, nullptr},
         {"keytest", "sshkey パーティションの鍵を mbedTLS で直接パースする", nullptr, &cmd_keytest,
          nullptr, nullptr, nullptr},
+        {"rottest", "座標変換が setRotation(1) と一致するか実機で照合", nullptr, &cmd_rottest,
+         nullptr, nullptr, nullptr},
+        {"ppatest", "PPA でフレームバッファに直接回転転送してみる", nullptr, &cmd_ppatest, nullptr,
+         nullptr, nullptr},
         {"ts", "Tailscale/Headscale の制御プレーンに接続", "<host> <authkey> [port] [capver]",
          &cmd_ts, nullptr, nullptr, nullptr},
         {"wg", "WireGuard トンネルの netif を操作", "<tunnel-ip> [pubkey] [endpoint] | stat | down",
@@ -882,6 +1087,12 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "heap: internal=%u psram=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+    s_term_lock = xSemaphoreCreateMutex();
+    if (!s_term_lock) {
+        ESP_LOGE(TAG, "could not create the terminal lock");
+        return;
+    }
 
     init_nvs();
 
@@ -912,6 +1123,13 @@ extern "C" void app_main(void)
     keyboard->begin(keyboard_h);
     renderer->set_rows(term_rows);
     ESP_LOGI(TAG, "terminal %d rows, keyboard %d px (no gap)", term_rows, keyboard_h);
+
+    // 回転を PPA に任せる（使えなければ従来の経路にとどまる）。
+    if (renderer->enable_ppa()) {
+        ESP_LOGI(TAG, "renderer: using PPA for rotation");
+    } else {
+        ESP_LOGW(TAG, "renderer: PPA unavailable, falling back to pushSprite");
+    }
 
     term = std::make_unique<vt::Terminal>(renderer->cols(), renderer->rows());
 
@@ -948,6 +1166,7 @@ extern "C" void app_main(void)
         if (ssh_is_connected()) {
             ssh_send(s.data(), s.size());
         } else {
+            TermGuard guard;
             term->write(s);
             renderer->render(*term);
         }
@@ -971,18 +1190,25 @@ extern "C" void app_main(void)
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(20));
 
-        // リモートからの出力を端末に流す。term を触るのはこのループだけに保つ。
-        uint8_t rx[1024];
-        for (;;) {
-            size_t n = ssh_receive(rx, sizeof(rx));
-            if (n == 0) break;
-            term->write(rx, n);
+        // リモートからの出力を端末に流す。コンソールタスクも term を触るのでロックする。
+        {
+            TermGuard guard;
+            if (guard.ok()) {
+                uint8_t rx[1024];
+                for (;;) {
+                    size_t n = ssh_receive(rx, sizeof(rx));
+                    if (n == 0) break;
+                    term->write(rx, n);
+                }
+                if (term->any_dirty()) renderer->render(*term);
+            }
         }
 
-        if (term->any_dirty()) renderer->render(*term);
-
+        // キーボードの描画も同じロックで守る。PPA は転送のたびにフレームバッファの
+        // キャッシュを無効化するので、M5GFX がキャッシュ経由で描いた内容と競合する。
+        TermGuard touch_guard;
         lgfx::touch_point_t tp;
-        if (display.getTouch(&tp, 1)) {
+        if (touch_guard.ok() && display.getTouch(&tp, 1)) {
             if (!touching) {
                 touching = true;
                 last_x   = tp.x;
@@ -997,7 +1223,7 @@ extern "C" void app_main(void)
                 last_x = tp.x;
                 last_y = tp.y;
             }
-        } else if (touching) {
+        } else if (touching && touch_guard.ok()) {
             touching = false;
             if (!keyboard->touch_up(last_x, last_y)) {
                 ESP_LOGI(TAG, "touch up");

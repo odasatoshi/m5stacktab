@@ -30,6 +30,11 @@ public:
     // dirty 行 (とカーソルが動いた行) だけ描画する。force で全面。
     void render(vt::Terminal& term, bool force = false);
 
+    // 回転を PPA (ハードウェア) に任せる経路を使う。使えなければ false を返して
+    // 従来の pushSprite にとどまる（M5GFX の setRotation(1) はソフトで座標変換するので遅い）。
+    bool enable_ppa();
+    bool ppa_enabled() const { return ppa_ != nullptr; }
+
     uint32_t last_render_us() const { return last_us_; }
     int      last_rows_drawn() const { return last_rows_; }
     // 内訳 (最適化の判断用): スプライトへの描画と、パネルへの転送。
@@ -58,4 +63,12 @@ private:
     int       cur_y_ = -1;
     // 0-255 が xterm パレット、256 が既定前景、257 が既定背景 (vt::kDefaultFg/Bg に対応)。
     uint16_t  pal_[258] = {};
+    // PPA を使う経路。ppa_client_handle_t を持つと driver/ppa.h を公開ヘッダに
+    // 引き込むので void* で持つ。
+    void*     ppa_       = nullptr;
+    uint16_t* fb_        = nullptr;  // パネルのフレームバッファ (PSRAM)
+    int       fb_w_      = 0;
+    int       fb_h_      = 0;
+    uint16_t* row_dma_   = nullptr;  // PPA の入力にする 64B 境界のバッファ
+    bool      push_row_ppa(int y, int x_from, int x_to);
 };

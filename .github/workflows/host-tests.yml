@@ -54,6 +54,13 @@ jobs:
               components/wg/crypto_mbedtls.cpp components/wg/transport.cpp -lmbedcrypto
           /tmp/test_noise
 
+      - name: landscape/native coordinate rotation
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \
+              -I components/rotate -o /tmp/test_rot components/rotate/test_rotate.cpp \
+              components/rotate/rotate.cpp
+          /tmp/test_rot
+
       - name: nacl crypto_box (xsalsa20-poly1305)
         run: |
           c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \
