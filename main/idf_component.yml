@@ -1,3 +1,10 @@
 dependencies:
   idf: ">=5.4"
   m5stack/m5gfx: "^0.2.27"
+  # ESP32-P4 に WiFi は無い。ESP32-C6 を SDIO 経由で使う。
+  # Tab5 のピン・reset GPIO のプリセット (CONFIG_ESP32P4_TAB5_C6_BOARD) は esp_hosted 3.0.2 以降。
+  espressif/esp_wifi_remote: "^1.6"
+  espressif/esp_hosted: "^3.0.2"
+  # SSH クライアント。libssh2 1.11.1 を mbedTLS で使う ESP-IDF ポート。
+  # Registry の wolfssh / david-cermak/libssh はサーバ向けなので使わない。
+  skuodi/libssh2_esp: "^1.1.0"

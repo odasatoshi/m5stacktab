@@ -12,6 +12,7 @@
 #include <cassert>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 using vt::Terminal;
 
@@ -469,6 +470,72 @@ void test_review_regressions()
     }
 }
 
+void test_scrollback()
+{
+    Terminal t(8, 3);
+    std::vector<vt::Cell> sb(8 * 10);
+    t.set_scrollback(sb.data(), 10);
+
+    for (int i = 0; i < 6; ++i) {
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "line%d\r\n", i);
+        t.write(buf);
+    }
+    // 3 行の画面に 6 行流したので 4 行が履歴に落ちている (最後の改行で 1 行進む)。
+    CHECK_EQ(t.scrollback_lines(), 4);
+    CHECK_EQ(t.view_offset(), 0);
+    CHECK_STR(t.row_text(0), "line4");
+    CHECK_STR(t.row_text(1), "line5");
+
+    // 2 行だけ過去に戻る
+    CHECK_EQ(t.scroll_view(2), 2);
+    CHECK_EQ(t.view_offset(), 2);
+    // 上 2 行が履歴、残りが現在の画面
+    std::string top;
+    for (int x = 0; x < 8; ++x) {
+        const vt::Cell& c = t.view_cell(x, 0);
+        if (c.ch != ' ') top += static_cast<char>(c.ch);
+    }
+    // view_offset=2 のとき画面は「履歴の最後 2 行 + 現在の画面の先頭 1 行」= line2,line3,line4
+    CHECK_STR(top, "line2");
+    std::string second;
+    for (int x = 0; x < 8; ++x) {
+        const vt::Cell& c = t.view_cell(x, 1);
+        if (c.ch != ' ') second += static_cast<char>(c.ch);
+    }
+    CHECK_STR(second, "line3");
+
+    // 履歴の端で止まる
+    CHECK_EQ(t.scroll_view(100), 2);
+    CHECK_EQ(t.view_offset(), 4);
+    CHECK_EQ(t.scroll_view(-100), -4);
+    CHECK_EQ(t.view_offset(), 0);
+
+    // 代替画面ではスクロールバックを見せない
+    t.write("\033[?1049h");
+    CHECK_EQ(t.scroll_view(3), 0);
+    t.write("\033[?1049l");
+
+    // 代替画面の内容は履歴に残さない
+    const int before = t.scrollback_lines();
+    t.write("\033[?1049h");
+    for (int i = 0; i < 5; ++i) t.write("alt\r\n");
+    t.write("\033[?1049l");
+    CHECK_EQ(t.scrollback_lines(), before);
+
+    // resize で履歴は捨てられる
+    t.scroll_view(2);
+    t.resize(10, 3);
+    CHECK_EQ(t.scrollback_lines(), 0);
+    CHECK_EQ(t.view_offset(), 0);
+
+    // バッファを渡していない端末では何も起きない
+    Terminal t2(8, 3);
+    for (int i = 0; i < 10; ++i) t2.write("x\r\n");
+    CHECK_EQ(t2.scrollback_lines(), 0);
+    CHECK_EQ(t2.scroll_view(5), 0);
+}
+
 }  // namespace
 
 int main()
@@ -487,6 +554,7 @@ int main()
     test_resize();
     test_real_sequences();
     test_review_regressions();
+    test_scrollback();
     std::printf("ok: %d checks passed\n", g_checks);
     return 0;
 }
