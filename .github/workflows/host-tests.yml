@@ -14,9 +14,11 @@ jobs:
 
       # WireGuard の暗号テストは mbedTLS 3.x を使う（4.x では ChaCha20-Poly1305 が private API）。
       - name: install mbedtls and cjson
+        # apt が詰まることがあるので短いタイムアウトと 1 回のリトライを入れる。
+        timeout-minutes: 5
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libmbedtls-dev libcjson-dev
+          sudo apt-get update -qq || sudo apt-get update -qq
+          sudo apt-get install -y -qq libmbedtls-dev libcjson-dev
           dpkg -s libmbedtls-dev | grep -i version
 
       # Linux では AddressSanitizer も併用する（macOS の開発機では起動時に固まるため外している）。
@@ -54,6 +56,15 @@ jobs:
               -I components/wg -o /tmp/test_salsa20 components/wg/test_salsa20.cpp \
               components/wg/salsa20.cpp -lmbedcrypto
           /tmp/test_salsa20
+
+      - name: disco (tailscale peer discovery)
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \
+              -I components/wg -I components/ts -o /tmp/test_disco \
+              components/ts/test_disco.cpp components/ts/disco.cpp components/wg/salsa20.cpp \
+              components/wg/crypto_mbedtls.cpp components/wg/noise.cpp components/wg/blake2s.cpp \
+              -lmbedcrypto
+          /tmp/test_disco
 
       - name: tailscale ts2021 noise
         run: |
