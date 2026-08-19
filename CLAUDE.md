@@ -133,6 +133,11 @@ c++ -std=c++17 -Wall -Wextra -Werror -O1 -I$M3/include -I components/wg \
 - **X25519 は mbedTLS の `mbedtls_ecp_mul` では自動でクランプされない**。RFC 7748 のとおり
   `k[0] &= 248; k[31] &= 127; k[31] |= 64` を自分でやる
 - **Montgomery カーブの `mbedtls_ecp_mul` は `f_rng` が必須**（座標ブラインディング）。NULL だと失敗する
+- **X25519 は 1 回 72ms かかる**（実測）。P4 のハードウェア ECC は SECP192R1 / SECP256R1 のみ
+  対応で、Curve25519 はソフト実装に落ちるため。`MBEDTLS_ECP_FIXED_POINT_OPTIM` は効かない。
+  radix 2^16 の専用実装（TweetNaCl 方式）を自作して測ったが 98ms でかえって遅かった
+  （32bit CPU では 64bit 乗算 256 回が重い）。頻度が低い（rekey は 120 秒ごと、
+  DISCO の共有鍵はピアごとに 1 回）ので現状で足りている → #19
 - **X25519 は 1 回で 10KB 近くスタックを使う**。既定 4KB では即スタック保護フォルト。
   コンソールタスクは 32KB（鍵導出と netif 初期化が重なる経路があるため 16KB でも足りなかった）、
   WireGuard の受信タスクも 16KB 必要。受信バッファは static にしてスタックから外す

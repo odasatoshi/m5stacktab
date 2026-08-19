@@ -49,6 +49,17 @@ public:
     esp_err_t set_peer(const PeerConfig& peer);
     bool      handshake_done() const;
 
+    // WireGuard 以外のパケット（DISCO / STUN）を受けたときに呼ばれる。
+    // wg は ts に依存しないので、DISCO の処理は呼び出し側（ts 層）に任せる。
+    // src_ip はネットワークバイトオーダ。
+    using ForeignPacketHandler = void (*)(const uint8_t* pkt, size_t len, uint32_t src_ip,
+                                         uint16_t src_port);
+    void set_foreign_handler(ForeignPacketHandler fn);
+
+    // 同じ UDP ソケットから任意の宛先へ生のバイト列を送る（DISCO の応答用）。
+    // WireGuard と同じポートを共有するので、ここを通さないと NAT のマッピングがずれる。
+    bool send_raw(const uint8_t* data, size_t len, uint32_t dst_ip, uint16_t dst_port);
+
     // タイムスタンプの単調性を保つために、最後に送った TAI64N を保存・復元する。
     // 保存しないと再起動でカウンタが巻き戻り、ピアがリプレイとして無視する。
     using TimestampStore = bool (*)(uint64_t* seconds, bool write);

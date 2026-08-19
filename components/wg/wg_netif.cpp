@@ -52,6 +52,7 @@ struct State {
     int64_t           last_tx_us           = 0;
     uint32_t          keepalive_sec        = 25;
     NetifStats*       stats                = nullptr;
+    Netif::ForeignPacketHandler foreign     = nullptr;
     Netif::TimestampStore ts_store         = nullptr;
     uint64_t          ts_seconds           = 0;  // 最後に送った TAI64N の秒部分
 };
@@ -263,9 +264,19 @@ void rx_task(void*)
             }
             continue;
         }
-        const uint8_t type = buf[0];
+        // WireGuard のメッセージは「型 + 予約 3 バイトが 0 + 長さが固定」。
+        // 先頭 1 バイトだけで判定すると、STUN Binding Response (0x01 0x01 ...) が
+        // Initiation (型 1) と衝突し、**先頭バイトが 0x01 の任意のデータグラム 1 発で
+        // 確立済みセッションを張り直させられる**。
+        const uint8_t type      = buf[0];
+        const bool    reserved_ok = (n >= 4) && buf[1] == 0 && buf[2] == 0 && buf[3] == 0;
+        const bool    is_wg =
+            reserved_ok &&
+            ((type == kMsgInitiation && n == 148) || (type == kMsgResponse && n == 92) ||
+             (type == kMsgCookie && n == 64) ||
+             (type == kMsgTransport && n >= static_cast<ssize_t>(kTransportHeader + kTagLen)));
 
-        if (type == kMsgTransport && n >= static_cast<ssize_t>(kTransportHeader + kTagLen)) {
+        if (is_wg && type == kMsgTransport) {
             bool   valid = false;
             size_t got   = 0;
             if (xSemaphoreTake(g_state.lock, pdMS_TO_TICKS(200)) == pdTRUE) {
@@ -283,8 +294,20 @@ void rx_task(void*)
             continue;
         }
 
+        if (!is_wg) {
+            // WireGuard ではない。DISCO や STUN の応答が同じポートに来る。
+            // ハンドラは時間がかかるのでロックを持たずに呼ぶ。
+            if (g_state.foreign) {
+                g_state.foreign(buf, static_cast<size_t>(n), from.sin_addr.s_addr,
+                                ntohs(from.sin_port));
+            } else if (g_state.stats) {
+                ++g_state.stats->rx_dropped;
+            }
+            continue;
+        }
+
         if (xSemaphoreTake(g_state.lock, pdMS_TO_TICKS(200)) != pdTRUE) continue;
-        if (type == kMsgResponse && n == 92) {
+        if (type == kMsgResponse) {
             Keypair kp;
             if (g_state.hs && g_state.hs->consume_response(buf, kp)) {
                 g_state.transport->set_keypair(kp);
@@ -480,6 +503,20 @@ esp_err_t Netif::set_peer(const PeerConfig& peer)
         return ESP_FAIL;
     }
     return ESP_OK;
+}
+
+void Netif::set_foreign_handler(ForeignPacketHandler fn) { g_state.foreign = fn; }
+
+bool Netif::send_raw(const uint8_t* data, size_t len, uint32_t dst_ip, uint16_t dst_port)
+{
+    if (g_state.sock < 0) return false;
+    sockaddr_in dst{};
+    dst.sin_family      = AF_INET;
+    dst.sin_port        = htons(dst_port);
+    dst.sin_addr.s_addr = dst_ip;
+    const ssize_t n = sendto(g_state.sock, data, len, 0, reinterpret_cast<sockaddr*>(&dst),
+                             sizeof(dst));
+    return n == static_cast<ssize_t>(len);
 }
 
 bool Netif::handshake_done() const
