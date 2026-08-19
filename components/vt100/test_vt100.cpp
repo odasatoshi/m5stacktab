@@ -516,7 +516,7 @@ void test_scrollback()
     t.set_scrollback(sb.data(), 10);
 
     for (int i = 0; i < 6; ++i) {
-        char buf[16];
+        char buf[32];
         std::snprintf(buf, sizeof(buf), "line%d\r\n", i);
         t.write(buf);
     }
