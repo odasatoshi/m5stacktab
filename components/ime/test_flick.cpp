@@ -3,6 +3,7 @@
 //   c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=undefined -o /tmp/test_flick
 //       components/ime/test_flick.cpp components/ime/ime.cpp components/ime/flick.cpp
 //       components/ime/romaji.cpp components/ime/skk_dict.cpp && /tmp/test_flick
+#include <cstdint>
 #include "flick.hpp"
 #include "ime.hpp"
 

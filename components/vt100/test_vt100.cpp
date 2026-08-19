@@ -7,6 +7,7 @@
 // -fsanitize=address,undefined を付けるとよい。
 //
 // フレームワークは使わない。落ちたら assert が場所を教える。
+#include <cstdint>
 #include "vt100.hpp"
 
 #include <cassert>

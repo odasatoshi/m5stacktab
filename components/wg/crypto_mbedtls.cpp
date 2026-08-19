@@ -1,5 +1,6 @@
 // Noise IK が使う暗号プリミティブを mbedTLS で実装する。
 // ホストでも実機でも同じコードを使う（ホストでは Homebrew の mbedtls をリンクする）。
+#include <cstdint>
 #include <cstring>
 
 #include <mbedtls/chachapoly.h>

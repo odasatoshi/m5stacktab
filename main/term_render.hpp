@@ -4,6 +4,7 @@
 // 1280x720 を毎フレーム全面書き換えると間に合わないので、行単位のスプライトを使って
 // dirty 行だけ転送する。フォントは M5GFX 内蔵の日本語等幅 (efont) を使い、
 // 全角は 2 セル分の幅で描く。
+#include <cstdint>
 #include <M5GFX.h>
 
 #include "vt100.hpp"

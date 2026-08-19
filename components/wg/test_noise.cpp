@@ -4,6 +4,7 @@
 //       -o /tmp/test_noise components/wg/test_noise.cpp components/wg/noise.cpp
 //       components/wg/blake2s.cpp components/wg/crypto_mbedtls.cpp
 //       -L/opt/homebrew/lib -lmbedcrypto && /tmp/test_noise
+#include <cstdint>
 #include "noise.hpp"
 #include "transport.hpp"
 
