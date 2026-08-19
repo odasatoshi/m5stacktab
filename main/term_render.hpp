@@ -16,6 +16,8 @@ public:
 
     int cols() const { return cols_; }
     int rows() const { return rows_; }
+    // 画面下部を別用途（キーボード）に使うとき、端末が使う行数を狭める。
+    void set_rows(int rows) { if (rows > 0 && rows <= rows_) rows_ = rows; }
     int cell_w() const { return cell_w_; }
     int cell_h() const { return cell_h_; }
 

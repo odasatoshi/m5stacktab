@@ -22,6 +22,7 @@
 #include "romaji.hpp"
 #include "skk_dict.hpp"
 #include "ssh.hpp"
+#include "kbd_ui.hpp"
 #include "term_render.hpp"
 #include "vt100.hpp"
 #include "wifi.hpp"
@@ -33,6 +34,7 @@ const char* TAG = "boot";
 M5GFX                          display;
 std::unique_ptr<TermRenderer>  renderer;
 std::unique_ptr<vt::Terminal>  term;
+std::unique_ptr<KeyboardUi>    keyboard;
 
 // M5GFX はパネル・タッチの判別結果を NVS にキャッシュする。NVS を初期化しておかないと
 // 毎起動でフルプローブ（タッチ IC のファームウェア待ちを含む）が走る。
@@ -377,6 +379,15 @@ int cmd_bench(int, char**)
     return 0;
 }
 
+int cmd_kbd(int argc, char** argv)
+{
+    const bool show = (argc < 2) || (std::string(argv[1]) != "off");
+    keyboard->set_visible(show);
+    if (!show) renderer->render(*term, /*force=*/true);
+    std::printf("keyboard %s\n", show ? "shown" : "hidden");
+    return 0;
+}
+
 void register_term_commands()
 {
     const esp_console_cmd_t cmds[] = {
@@ -393,6 +404,7 @@ void register_term_commands()
          nullptr},
         {"bench", "描画コストを測る (全画面 vs 1 文字)", nullptr, &cmd_bench, nullptr, nullptr,
          nullptr},
+        {"kbd", "画面キーボードの表示切り替え", "[off]", &cmd_kbd, nullptr, nullptr, nullptr},
     };
     for (const auto& c : cmds) ESP_ERROR_CHECK_WITHOUT_ABORT(esp_console_cmd_register(&c));
 }
@@ -428,6 +440,13 @@ extern "C" void app_main(void)
         ESP_LOGE(TAG, "renderer init failed");
         return;
     }
+    // 画面下部をキーボードに使うので、端末の行数はその分減らす。
+    keyboard                 = std::make_unique<KeyboardUi>(display, *renderer);
+    constexpr int kKeyboardH = 320;  // 4 行 x 72px + ステータス帯 32px
+    keyboard->begin(kKeyboardH);
+    const int term_rows = (display.height() - kKeyboardH) / renderer->cell_h();
+    renderer->set_rows(term_rows);
+
     term = std::make_unique<vt::Terminal>(renderer->cols(), renderer->rows());
 
     // スクロールバックは PSRAM に置く。1 行 = cols * sizeof(Cell) なので 1000 行で約 1.3MB。
@@ -458,6 +477,16 @@ extern "C" void app_main(void)
              renderer->last_rows_drawn(), (unsigned)renderer->last_render_us(),
              (unsigned)renderer->last_draw_us(), (unsigned)renderer->last_push_us());
 
+    // キーボードの出力はそのまま SSH へ流す。未接続なら端末にエコーして動作確認できるようにする。
+    keyboard->set_output([](const std::string& s) {
+        if (ssh_is_connected()) {
+            ssh_send(s.data(), s.size());
+        } else {
+            term->write(s);
+            renderer->render(*term);
+        }
+    });
+
     // WiFi。display.init() が C6 の電源 (IO エクスパンダ経由) を入れているので、必ずこの後。
     if (esp_err_t err = wifi_start(); err != ESP_OK) {
         ESP_LOGE(TAG, "wifi_start failed: %s", esp_err_to_name(err));
@@ -465,9 +494,14 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(console_start());
     register_term_commands();
 
+    // 辞書が書き込まれていればキーボードの変換に使う。
+    if (dict_open()) keyboard->set_dict(&s_dict);
+    keyboard->set_visible(true);
+
     // 描画とタッチのポーリング。キーボードが来るまではタッチが唯一の直接入力手段。
     int  last_log_s = 0;
     bool touching   = false;
+    int  last_x = 0, last_y = 0;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(20));
 
@@ -485,12 +519,23 @@ extern "C" void app_main(void)
         if (display.getTouch(&tp, 1)) {
             if (!touching) {
                 touching = true;
-                ESP_LOGI(TAG, "touch down x=%d y=%d (cell %d,%d)", tp.x, tp.y,
-                         tp.x / renderer->cell_w(), tp.y / renderer->cell_h());
+                last_x   = tp.x;
+                last_y   = tp.y;
+                if (!keyboard->touch_down(tp.x, tp.y)) {
+                    // キーボード外 = 端末領域。縦スワイプでスクロールバックを見る。
+                    ESP_LOGI(TAG, "touch down x=%d y=%d (cell %d,%d)", tp.x, tp.y,
+                             tp.x / renderer->cell_w(), tp.y / renderer->cell_h());
+                }
+            } else {
+                keyboard->touch_move(tp.x, tp.y);
+                last_x = tp.x;
+                last_y = tp.y;
             }
         } else if (touching) {
             touching = false;
-            ESP_LOGI(TAG, "touch up");
+            if (!keyboard->touch_up(last_x, last_y)) {
+                ESP_LOGI(TAG, "touch up");
+            }
         }
 
         int now_s = (int)(esp_timer_get_time() / 1000000);
