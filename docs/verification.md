@@ -75,9 +75,13 @@ printf 'wgtest\r\n' > /dev/cu.usbmodem101      # 暗号プリミティブの自�
 期待する出力:
 
 ```
-handshake over udp loopback: ok (698062 us)
-data over udp loopback: ok (322 us round trip)
+handshake over udp loopback: ok (698634 us)
+data over udp loopback: ok (321 us round trip)
 reverse direction: ok
+  old-key packet after rekey: ok
+  unconfirmed sends on old key: ok
+  after confirmation both on new key: ok
+rekey crossover (no drop): ok
 
 pong says our address is 127.0.0.1:41651
 disco ping/pong over udp loopback: ok (1420 us round trip)
