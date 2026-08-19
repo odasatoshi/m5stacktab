@@ -54,7 +54,7 @@ void Transport::set_keypair(const Keypair& kp)
     std::memset(cur_.window, 0, sizeof(cur_.window));
 }
 
-const SessionState* Transport::sending_session() const
+SessionState* Transport::sending_session()
 {
     // 現世代の確認が取れていて有効ならそれで送る。
     if (cur_.valid && cur_.confirmed) return &cur_;

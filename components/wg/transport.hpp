@@ -46,8 +46,6 @@ public:
     // keepalive（平文長 0）は成功扱いで 0 を返すので、is_valid で区別する。
     size_t decrypt(uint8_t* out, size_t out_cap, const uint8_t* in, size_t len, bool* is_valid);
 
-    // 実際に送信に使っている世代のカウンタ（rekey 確認前は 1 つ前の世代）。
-    uint64_t send_counter() const { return sending_session()->send_counter; }
     // 現世代の受信カウンタ。rekey 直後に 1 つ前で通信している間は 0 を返す。
     uint64_t recv_max() const { return cur_.recv_max; }
     uint32_t replay_drops() const { return replay_drops_; }
@@ -57,11 +55,7 @@ public:
 private:
     bool check_replay(SessionState& s, uint64_t counter);
     // 送信に使う世代を選ぶ。現世代の確認が取れていなければ 1 つ前を使う。
-    const SessionState* sending_session() const;
-    SessionState* sending_session()
-    {
-        return const_cast<SessionState*>(static_cast<const Transport*>(this)->sending_session());
-    }
+    SessionState* sending_session();
 
     const Crypto& c_;
     SessionState  cur_{};
