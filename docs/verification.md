@@ -161,7 +161,26 @@ printf 'rottest\r\n' > /dev/cu.usbmodem101
 rotation matches setRotation(1): ok
 ```
 
-MISMATCH が出たら、逆向きで何個一致するかも出るので原因がすぐ分かる。
+MISMATCH が出たら、逆向き（反時計回り 90 度）で何個一致するかも出るので原因がすぐ分かる。
+
+`rottest` が見ているのは**座標の写像だけ**で、PPA の回転角は見ていない。
+角度の側は `ppatest` が判定する（左半分が赤・右半分が青の非対称なブロックを
+転送して、読み戻した画素で確かめる）。
+
+```sh
+printf 'ppatest\r\n' > /dev/cu.usbmodem101
+```
+
+```
+ppa rotate 1280x24 -> native(696,0) 24x1280: 941 us
+ppa angle check: left f800 (want f800) right 001f (want 001f) ok
+```
+
+角度と写像が食い違っていると `SWAPPED` と出る（意図的に `ANGLE_90` に戻して確認済み）。
+
+```
+ppa angle check: left 001f (want f800) right f800 (want 001f) SWAPPED - rotation_angle が rot と食い違っている
+```
 
 端末 (PPA 経路) の位置と向きは `pix` で確かめる。
 

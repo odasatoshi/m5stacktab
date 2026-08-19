@@ -1346,7 +1346,9 @@ int cmd_ppatest(int, char**)
     op.out.block_offset_x   = nx;
     op.out.block_offset_y   = ny;
     op.out.srm_cm           = PPA_SRM_COLOR_MODE_RGB565;
-    op.rotation_angle       = PPA_SRM_ROTATION_ANGLE_90;
+    // rot の対応は時計回り 90 度なので、反時計回りで数える PPA では 270。
+    // rotate.cpp と必ず対で直す（push_row_ppa と同じ組み合わせにする）。
+    op.rotation_angle       = PPA_SRM_ROTATION_ANGLE_270;
     op.scale_x              = 1.0f;
     op.scale_y              = 1.0f;
     op.mode                 = PPA_TRANS_MODE_BLOCKING;
@@ -1358,6 +1360,22 @@ int cmd_ppatest(int, char**)
         std::printf("ppa_do_scale_rotate_mirror failed: %s\n", esp_err_to_name(err));
     } else {
         std::printf("ppa rotate 1280x24 -> native(%d,%d) %dx%d: %lld us\n", nx, ny, nw, nh, us);
+
+        // **PPA の回転角が rot の変換と合っているかを画素で判定する。**
+        // rottest は写像だけを見るので、角度を間違えてもすり抜ける
+        // （実際にこのコマンド自身が ANGLE_90 のまま取り残されていた）。
+        // ソースは左半分が赤・右半分が青と非対称なので、180 度回れば入れ替わる。
+        // PPA は転送前に出力窓のキャッシュを無効化するので、読み戻しは PSRAM から来る。
+        display.setRotation(1);
+        const uint16_t left  = display.readPixel(100, kH / 2);
+        const uint16_t right = display.readPixel(kW - 100, kH / 2);
+        const bool     ok    = (left == 0xF800 && right == 0x001F);
+        std::printf("ppa angle check: left %04x (want f800) right %04x (want 001f) %s\n", left,
+                    right, ok ? "ok" : (left == 0x001F && right == 0xF800)
+                                           ? "SWAPPED - rotation_angle が rot と食い違っている"
+                                           : "MISMATCH");
+        if (!ok) err = ESP_FAIL;
+
         // 比較用に M5GFX の pushSprite も測る
         M5Canvas sp(&display);
         sp.setPsram(false);
@@ -1381,10 +1399,13 @@ int cmd_ppatest(int, char**)
 // 正しい位置・正しい向きに出ているかを、目視なしで確かめるために使う。
 int cmd_pix(int argc, char** argv)
 {
-    if (argc < 3) {
+    if (argc < 3 || (argc - 1) % 2 != 0) {
         std::printf("usage: pix <lx> <ly> [<lx> <ly> ...]   横向き座標の色を読む\n");
         return 1;
     }
+    // 横向き座標で読むので rotation 1 が前提。範囲外は readPixel が 0 を返すので、
+    // 座標を間違えたときに「黒」と誤読しないよう rotation も出す。
+    std::printf("  (rotation %d)\n", (int)display.getRotation());
     TermGuard guard;
     if (!guard.ok()) {
         std::printf("busy\n");
@@ -1422,23 +1443,6 @@ int cmd_rottest(int, char**)
         {1240, 680, TFT_YELLOW, "bottom-right"},
     };
 
-    // まず横向き (rotation 1) で四隅に印を描く
-    display.setRotation(1);
-    display.fillScreen(TFT_BLACK);
-    for (const auto& pt : pts) display.fillCircle(pt.lx, pt.ly, 18, pt.color);
-    display.setFont(&fonts::efontJA_24);
-    display.setTextColor(TFT_WHITE, TFT_BLACK);
-    display.drawString("rotation 1: big circles", 300, 300);
-
-    // 次に rotation 0 に切り替えて、変換した座標に小さい印を描く
-    display.setRotation(0);
-    for (const auto& pt : pts) {
-        int nx = 0, ny = 0;
-        rot::landscape_to_native(panel, pt.lx, pt.ly, &nx, &ny);
-        display.fillCircle(nx, ny, 7, TFT_WHITE);
-        std::printf("  %-13s landscape(%4d,%3d) -> native(%3d,%4d)\n", pt.name, pt.lx, pt.ly, nx,
-                    ny);
-    }
     // 目視に頼らず、描いたピクセルを読み戻して判定する。
     // rotation 1 で置いた色が、変換したネイティブ座標にあるかを確かめる。
     // ここが合っていないと、端末 (PPA + rot) とキーボード (M5GFX rotation 1) の
@@ -1462,12 +1466,14 @@ int cmd_rottest(int, char**)
         std::printf("rotation matches setRotation(1): ok\n");
     } else {
         // どの向きなら合うのかも出す。原因を当てる手間が要らなくなる。
-        std::printf("rotation MISMATCH (%d/4). 逆向き (nx = native_w-1-ly, ny = lx) を試す:\n", bad);
+        std::printf("rotation MISMATCH (%d/4). 逆向き (nx = ly, ny = landscape_w-1-lx) を試す:\n",
+                    bad);
         display.setRotation(0);
         int alt_bad = 0;
         for (const auto& pt : pts) {
-            const int nx2 = panel.native_w - 1 - pt.ly;
-            const int ny2 = pt.lx;
+            // 反時計回り 90 度（この修正の前に入っていた式）。
+            const int nx2 = pt.ly;
+            const int ny2 = panel.landscape_w() - 1 - pt.lx;
             const uint16_t got = display.readPixel(nx2, ny2);
             if (got != pt.color) ++alt_bad;
             std::printf("  %-13s native(%3d,%4d) want %04x got %04x\n", pt.name, nx2, ny2,

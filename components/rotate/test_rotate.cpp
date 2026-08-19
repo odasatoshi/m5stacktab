@@ -53,6 +53,36 @@ void test_corners()
     CHECK(ny == 1279);
 }
 
+// 720/1280 のリテラルだけで固めていると、native_w と landscape_h() の
+// 取り違えを検出できない（Tab5 では値が同じ）。非正方で 1 本固定する。
+void test_non_square_panel()
+{
+    rot::Panel p{100, 300};  // native 100x300 -> landscape 300x100
+    CHECK(p.landscape_w() == 300);
+    CHECK(p.landscape_h() == 100);
+
+    int nx = 0, ny = 0;
+    rot::landscape_to_native(p, 0, 0, &nx, &ny);
+    CHECK(nx == 99);  // landscape_h()-1。native_w を使っても同じなので下で分ける
+    CHECK(ny == 0);
+
+    rot::landscape_to_native(p, 299, 99, &nx, &ny);
+    CHECK(nx == 0);
+    CHECK(ny == 299);
+
+    // landscape_w() (=300) を取り違えて使うと nx が範囲外 (299) になる
+    rot::landscape_to_native(p, 0, 99, &nx, &ny);
+    CHECK(nx == 0);
+    CHECK(ny == 0);
+
+    int bx = 0, by = 0;
+    rot::native_to_landscape(p, nx, ny, &bx, &by);
+    CHECK(bx == 0);
+    CHECK(by == 99);
+}
+
+// 往復して戻ることだけを見る。**向きは見ていない**（任意の全単射で通るので、
+// 180 度ずれていてもここは通る)。向きの固定は test_corners と test_rect の仕事。
 void test_round_trip()
 {
     rot::Panel p;
@@ -114,6 +144,7 @@ int main()
 {
     test_dimensions();
     test_corners();
+    test_non_square_panel();
     test_round_trip();
     test_rect();
     std::printf("ok: %d checks passed\n", g_checks);
