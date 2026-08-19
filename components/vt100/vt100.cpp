@@ -73,6 +73,8 @@ Terminal::Terminal(int cols, int rows)
     main_.assign(static_cast<size_t>(cols_) * rows_, Cell{});
     alt_ = main_;
     dirty_.assign(rows_, true);
+    dirty_min_.assign(rows_, 0);
+    dirty_max_.assign(rows_, cols_ - 1);
     tab_stops_.assign(cols_, false);
     for (int x = 8; x < cols_; x += 8) tab_stops_[x] = true;
     scroll_top_    = 0;
@@ -82,17 +84,39 @@ Terminal::Terminal(int cols, int rows)
 
 void Terminal::mark_dirty(int y)
 {
-    if (y >= 0 && y < rows_) dirty_[y] = true;
+    mark_dirty_range(y, 0, cols_ - 1);
+}
+
+void Terminal::mark_dirty_range(int y, int x1, int x2)
+{
+    if (y < 0 || y >= rows_) return;
+    if (x2 < 0) x2 = cols_ - 1;
+    x1 = std::clamp(x1, 0, cols_ - 1);
+    x2 = std::clamp(x2, 0, cols_ - 1);
+    if (!dirty_[y]) {
+        dirty_[y]     = true;
+        dirty_min_[y] = x1;
+        dirty_max_[y] = x2;
+    } else {
+        dirty_min_[y] = std::min(dirty_min_[y], x1);
+        dirty_max_[y] = std::max(dirty_max_[y], x2);
+    }
 }
 
 void Terminal::mark_all_dirty()
 {
-    std::fill(dirty_.begin(), dirty_.end(), true);
+    for (int y = 0; y < rows_; ++y) {
+        dirty_[y]     = true;
+        dirty_min_[y] = 0;
+        dirty_max_[y] = cols_ - 1;
+    }
 }
 
 void Terminal::clear_dirty()
 {
     std::fill(dirty_.begin(), dirty_.end(), false);
+    std::fill(dirty_min_.begin(), dirty_min_.end(), 0);
+    std::fill(dirty_max_.begin(), dirty_max_.end(), -1);
 }
 
 bool Terminal::any_dirty() const
@@ -138,6 +162,10 @@ std::string Terminal::row_text(int y) const
     return out;
 }
 
+namespace {
+// resize / スクロール後は行全体を描き直す必要があるので、範囲は行全体にする。
+}  // namespace
+
 void Terminal::resize(int cols, int rows)
 {
     cols = std::max(2, cols);
@@ -166,6 +194,8 @@ void Terminal::resize(int cols, int rows)
     cols_ = cols;
     rows_ = rows;
     dirty_.assign(rows_, true);
+    dirty_min_.assign(rows_, 0);
+    dirty_max_.assign(rows_, cols_ - 1);
     tab_stops_.assign(cols_, false);
     for (int x = 8; x < cols_; x += 8) tab_stops_[x] = true;
     scroll_top_    = 0;
@@ -207,7 +237,7 @@ void Terminal::fill_blank(int x, int y, int count)
     for (int i = 0; i < count && x + i < cols_; ++i) {
         at(x + i, y) = blank;
     }
-    mark_dirty(y);
+    mark_dirty_range(y, x - 1, x + count);
 }
 
 void Terminal::repair_row(int y)
@@ -414,7 +444,8 @@ void Terminal::put_char(uint32_t cp)
         r.attr  = cur_.attr;
         r.width = 0;
     }
-    mark_dirty(cur_.y);
+    // 全角の相棒を空白化した可能性があるので 1 セル余裕を持たせる。
+    mark_dirty_range(cur_.y, cur_.x - 1, cur_.x + w);
 
     if (cur_.x + w >= cols_) {
         cur_.x            = cols_ - 1;

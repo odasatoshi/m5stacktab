@@ -100,6 +100,27 @@ python $IDF_PATH/components/partition_table/parttool.py --port /dev/cu.usbmodem1
   PEM しか解釈しないので `ssh-keygen -m PEM` が必須
 - **RSA (PEM) は動作確認済み**。ECDSA (PEM) は `mbedtls_pk_parse_key` が通らなかった（→ #17）
 
+## ホストテストで使う mbedTLS
+
+WireGuard の暗号 (`components/wg`) はホストでもテストする。ホスト側は **mbedTLS 3.x が必要**
+（`brew install mbedtls@3`）。既定の `mbedtls` は 4.x で ChaCha20-Poly1305 が private API に
+移動しており、ESP-IDF (3.x) と API が合わない。
+
+```sh
+M3=/opt/homebrew/opt/mbedtls@3
+c++ -std=c++17 -Wall -Wextra -Werror -O1 -I$M3/include -I components/wg \
+    -o /tmp/test_noise components/wg/test_noise.cpp components/wg/noise.cpp \
+    components/wg/blake2s.cpp components/wg/crypto_mbedtls.cpp components/wg/transport.cpp \
+    -L$M3/lib -lmbedcrypto && /tmp/test_noise
+```
+
+## 暗号まわりのハマりどころ
+
+- **X25519 は mbedTLS の `mbedtls_ecp_mul` では自動でクランプされない**。RFC 7748 のとおり
+  `k[0] &= 248; k[31] &= 127; k[31] |= 64` を自分でやる
+- **Montgomery カーブの `mbedtls_ecp_mul` は `f_rng` が必須**（座標ブラインディング）。NULL だと失敗する
+- **コンソールタスクのスタックは 16KB 必要**。既定 4KB では X25519 がスタック保護フォルトを起こす
+
 ## コード方針
 
 - 過剰な抽象化を作らない。実装が 1 つしかない interface、使われない config は書かない

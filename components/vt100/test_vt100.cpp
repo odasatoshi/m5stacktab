@@ -470,6 +470,45 @@ void test_review_regressions()
     }
 }
 
+void test_dirty_range()
+{
+    Terminal t(20, 4);
+    t.clear_dirty();
+
+    // 1 文字書いたら、その周りだけが dirty になる（全角の相棒を潰す可能性があるので ±1）
+    t.write("\033[2;6Hx");
+    CHECK(t.is_dirty(1));
+    CHECK(!t.is_dirty(0));
+    CHECK(t.dirty_min_x(1) <= 5);
+    CHECK(t.dirty_max_x(1) >= 5);
+    // 行全体 (20 桁) にはならないこと。これが差分転送の効き目そのもの。
+    CHECK(t.dirty_max_x(1) - t.dirty_min_x(1) < 5);
+
+    // 同じ行の離れた位置に書いたら範囲が広がる
+    t.clear_dirty();
+    t.write("\033[2;1Ha\033[2;20Hb");
+    CHECK_EQ(t.dirty_min_x(1), 0);
+    CHECK_EQ(t.dirty_max_x(1), 19);
+
+    // 行消去は行全体
+    t.clear_dirty();
+    t.write("\033[3;5H\033[2K");
+    CHECK(t.is_dirty(2));
+    CHECK_EQ(t.dirty_min_x(2), 0);
+    CHECK_EQ(t.dirty_max_x(2), 19);
+
+    // 全角は 2 セル分が範囲に入る
+    t.clear_dirty();
+    t.write("\033[4;3Hあ");
+    CHECK(t.is_dirty(3));
+    CHECK(t.dirty_min_x(3) <= 2);
+    CHECK(t.dirty_max_x(3) >= 3);
+
+    // clear_dirty 後は空の範囲になる（max < min）
+    t.clear_dirty();
+    CHECK(t.dirty_max_x(0) < t.dirty_min_x(0));
+}
+
 void test_scrollback()
 {
     Terminal t(8, 3);
@@ -554,6 +593,7 @@ int main()
     test_resize();
     test_real_sequences();
     test_review_regressions();
+    test_dirty_range();
     test_scrollback();
     std::printf("ok: %d checks passed\n", g_checks);
     return 0;
