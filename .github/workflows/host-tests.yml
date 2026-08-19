@@ -13,10 +13,10 @@ jobs:
       - uses: actions/checkout@v4
 
       # WireGuard の暗号テストは mbedTLS 3.x を使う（4.x では ChaCha20-Poly1305 が private API）。
-      - name: install mbedtls
+      - name: install mbedtls and cjson
         run: |
           sudo apt-get update
-          sudo apt-get install -y libmbedtls-dev
+          sudo apt-get install -y libmbedtls-dev libcjson-dev
           dpkg -s libmbedtls-dev | grep -i version
 
       # Linux では AddressSanitizer も併用する（macOS の開発機では起動時に固まるため外している）。
@@ -69,6 +69,13 @@ jobs:
               -I components/ts -o /tmp/test_ctrl components/ts/test_ts_control.cpp \
               components/ts/ts_control.cpp -lmbedcrypto
           /tmp/test_ctrl
+
+      - name: netmap parser
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \
+              -I components/ts -I/usr/include/cjson -o /tmp/test_nm \
+              components/ts/test_netmap.cpp components/ts/netmap.cpp -lcjson
+          /tmp/test_nm
 
       # 辞書ビルドスクリプトが壊れていないかを小さい辞書で確認する（ネットワークは使わない）。
       - name: dictionary builder

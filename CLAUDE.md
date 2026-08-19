@@ -140,6 +140,14 @@ docker exec headscale-tab5 headscale preauthkeys create --user 1 --reusable --ex
   TCP プロキシを挟むと通る
 - 実機・ホストの IP は変わるので、接続先は毎回確認する
 
+## ホストテストの依存
+
+```sh
+brew install mbedtls@3 cjson   # mbedtls は 3.x を使う（4.x は API が合わない）
+```
+
+CI (Ubuntu) では `libmbedtls-dev` と `libcjson-dev`。
+
 ## コード方針
 
 - 過剰な抽象化を作らない。実装が 1 つしかない interface、使われない config は書かない
