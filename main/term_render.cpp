@@ -1,3 +1,4 @@
+#include <cstdint>
 #include "term_render.hpp"
 
 #include <algorithm>

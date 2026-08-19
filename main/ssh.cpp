@@ -1,3 +1,4 @@
+#include <cstdint>
 #include "ssh.hpp"
 
 #include <cstdarg>

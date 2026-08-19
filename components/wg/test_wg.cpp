@@ -1,7 +1,8 @@
 // BLAKE2s と KDF のホストテスト。RFC 7693 / WireGuard のテストベクタで検証する。
 //
-//   c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=undefined \
+//   c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=undefined
 //       -o /tmp/test_wg components/wg/test_wg.cpp components/wg/blake2s.cpp && /tmp/test_wg
+#include <cstdint>
 #include "blake2s.hpp"
 
 #include <cstdio>

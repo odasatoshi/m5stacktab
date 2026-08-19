@@ -1,5 +1,6 @@
 // Noise IK が使う暗号プリミティブを mbedTLS で実装する。
 // ホストでも実機でも同じコードを使う（ホストでは Homebrew の mbedtls をリンクする）。
+#include <cstdint>
 #include <cstring>
 
 #include <mbedtls/chachapoly.h>
@@ -19,11 +20,10 @@ mbedtls_ctr_drbg_context& drbg();
 bool x25519(uint8_t out[kKeyLen], const uint8_t priv[kKeyLen], const uint8_t pub[kKeyLen])
 {
     mbedtls_ecp_group grp;
-    mbedtls_mpi       d, z;
+    mbedtls_mpi       d;
     mbedtls_ecp_point Q, R;
     mbedtls_ecp_group_init(&grp);
     mbedtls_mpi_init(&d);
-    mbedtls_mpi_init(&z);
     mbedtls_ecp_point_init(&Q);
     mbedtls_ecp_point_init(&R);
 
@@ -38,18 +38,20 @@ bool x25519(uint8_t out[kKeyLen], const uint8_t priv[kKeyLen], const uint8_t pub
         k[31] &= 127;
         k[31] |= 64;
 
-        // Curve25519 のスカラーと座標はリトルエンディアン。mpi はビッグエンディアンで読む。
-        uint8_t rev[kKeyLen];
-        for (size_t i = 0; i < kKeyLen; ++i) rev[i] = k[kKeyLen - 1 - i];
-        if (mbedtls_mpi_read_binary(&d, rev, kKeyLen) != 0) break;
-        for (size_t i = 0; i < kKeyLen; ++i) rev[i] = pub[kKeyLen - 1 - i];
-        if (mbedtls_mpi_read_binary(&Q.MBEDTLS_PRIVATE(X), rev, kKeyLen) != 0) break;
-        if (mbedtls_mpi_lset(&Q.MBEDTLS_PRIVATE(Z), 1) != 0) break;
+        // Curve25519 のスカラーと座標はリトルエンディアン。専用 API を使えば
+        // 構造体の内部メンバ (MBEDTLS_PRIVATE) に触らずに済む。
+        if (mbedtls_mpi_read_binary_le(&d, k, kKeyLen) != 0) break;
+        if (mbedtls_ecp_point_read_binary(&grp, &Q, pub, kKeyLen) != 0) break;
 
         // Montgomery カーブでは f_rng が必須（座標ブラインディングに使う）。
         if (mbedtls_ecp_mul(&grp, &R, &d, &Q, mbedtls_ctr_drbg_random, &drbg()) != 0) break;
-        if (mbedtls_mpi_write_binary(&R.MBEDTLS_PRIVATE(X), rev, kKeyLen) != 0) break;
-        for (size_t i = 0; i < kKeyLen; ++i) out[i] = rev[kKeyLen - 1 - i];
+
+        size_t olen = 0;
+        if (mbedtls_ecp_point_write_binary(&grp, &R, MBEDTLS_ECP_PF_UNCOMPRESSED, &olen, out,
+                                           kKeyLen) != 0) {
+            break;
+        }
+        if (olen != kKeyLen) break;
 
         // 全ゼロの共有鍵は不正なピア（低位数点）を意味するので弾く。
         uint8_t acc = 0;
@@ -59,7 +61,6 @@ bool x25519(uint8_t out[kKeyLen], const uint8_t priv[kKeyLen], const uint8_t pub
 
     mbedtls_ecp_point_free(&R);
     mbedtls_ecp_point_free(&Q);
-    mbedtls_mpi_free(&z);
     mbedtls_mpi_free(&d);
     mbedtls_ecp_group_free(&grp);
     return ok;

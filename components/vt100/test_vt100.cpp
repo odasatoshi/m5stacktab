@@ -1,12 +1,13 @@
 // VT100 コアのホストテスト。実機は要らない。
 //
-//   c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=undefined \
+//   c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=undefined
 //       -o /tmp/test_vt100 components/vt100/test_vt100.cpp components/vt100/vt100.cpp && /tmp/test_vt100
 //
 // AddressSanitizer は macOS のこの環境で起動時に固まるため使っていない。Linux で回すなら
 // -fsanitize=address,undefined を付けるとよい。
 //
 // フレームワークは使わない。落ちたら assert が場所を教える。
+#include <cstdint>
 #include "vt100.hpp"
 
 #include <cassert>
@@ -516,7 +517,7 @@ void test_scrollback()
     t.set_scrollback(sb.data(), 10);
 
     for (int i = 0; i < 6; ++i) {
-        char buf[16];
+        char buf[32];
         std::snprintf(buf, sizeof(buf), "line%d\r\n", i);
         t.write(buf);
     }

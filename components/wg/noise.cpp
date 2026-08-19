@@ -1,3 +1,4 @@
+#include <cstdint>
 #include "noise.hpp"
 
 #include <cstring>
