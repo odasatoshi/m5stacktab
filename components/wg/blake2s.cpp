@@ -1,3 +1,4 @@
+#include <cstdint>
 #include "blake2s.hpp"
 
 #include <algorithm>

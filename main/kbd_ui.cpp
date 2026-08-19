@@ -1,3 +1,4 @@
+#include <cstdint>
 #include "kbd_ui.hpp"
 
 #include <algorithm>

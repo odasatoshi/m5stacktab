@@ -1,9 +1,10 @@
 // Noise IK ハンドシェイクのホストテスト。開始側と応答側を同じプロセス内で突き合わせる。
 //
-//   c++ -std=c++17 -Wall -Wextra -O1 -I/opt/homebrew/include -I components/wg \
-//       -o /tmp/test_noise components/wg/test_noise.cpp components/wg/noise.cpp \
-//       components/wg/blake2s.cpp components/wg/crypto_mbedtls.cpp \
+//   c++ -std=c++17 -Wall -Wextra -O1 -I/opt/homebrew/include -I components/wg
+//       -o /tmp/test_noise components/wg/test_noise.cpp components/wg/noise.cpp
+//       components/wg/blake2s.cpp components/wg/crypto_mbedtls.cpp
 //       -L/opt/homebrew/lib -lmbedcrypto && /tmp/test_noise
+#include <cstdint>
 #include "noise.hpp"
 #include "transport.hpp"
 

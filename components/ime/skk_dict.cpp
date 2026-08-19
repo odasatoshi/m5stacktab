@@ -1,3 +1,4 @@
+#include <cstdint>
 #include "skk_dict.hpp"
 
 #include <cstring>

@@ -1,3 +1,4 @@
+#include <cstdint>
 #include "vt100.hpp"
 
 #include <algorithm>

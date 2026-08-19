@@ -1,6 +1,7 @@
 // Tab5 ファームウェアのエントリポイント。
 // 今の段階では「画面にターミナルを描く土台」と「WiFi 接続」まで。
 // SSH セッションを繋ぐのは #5 / #6。
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <memory>

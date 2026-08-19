@@ -1,8 +1,9 @@
 // IME コアのホストテスト。実機は要らない。
 //
-//   c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=undefined \
-//       -o /tmp/test_ime components/ime/test_ime.cpp components/ime/romaji.cpp \
+//   c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=undefined
+//       -o /tmp/test_ime components/ime/test_ime.cpp components/ime/romaji.cpp
 //       components/ime/skk_dict.cpp && /tmp/test_ime
+#include <cstdint>
 #include "romaji.hpp"
 #include "skk_dict.hpp"
 
