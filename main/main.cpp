@@ -51,6 +51,21 @@ namespace {
 
 const char* TAG = "boot";
 
+// vt::Terminal と TermRenderer は **メインループとコンソールタスクの両方から触られる**
+// （コンソールコマンドが term に書いて描画し、メインループも SSH の受信を流して描画する）。
+// 保護しないと画面が壊れるうえ、描画時間の計測値も混ざって信用できなくなる。
+SemaphoreHandle_t s_term_lock = nullptr;
+
+class TermGuard {
+public:
+    TermGuard() { if (s_term_lock) taken_ = xSemaphoreTake(s_term_lock, pdMS_TO_TICKS(2000)) == pdTRUE; }
+    ~TermGuard() { if (taken_) xSemaphoreGive(s_term_lock); }
+    bool ok() const { return taken_ || !s_term_lock; }
+
+private:
+    bool taken_ = false;
+};
+
 // mbedtls_pk_parse_key は EC 鍵で RNG を要求する（座標ブラインディング）。
 mbedtls_ctr_drbg_context* ts_drbg()
 {
@@ -122,8 +137,11 @@ int cmd_term(int argc, char** argv)
         if (i > 1) s += ' ';
         s += unescape(argv[i]);
     }
-    term->write(s);
-    renderer->render(*term);
+    {
+        TermGuard guard;
+        term->write(s);
+        renderer->render(*term);
+    }
     std::printf("wrote %d bytes, redrew %d rows in %u us (draw %u / push %u)\n", (int)s.size(),
                 renderer->last_rows_drawn(), (unsigned)renderer->last_render_us(),
                 (unsigned)renderer->last_draw_us(), (unsigned)renderer->last_push_us());
@@ -179,12 +197,15 @@ int cmd_termtest(int, char**)
 
 int cmd_termscroll(int, char**)
 {
-    for (int i = 0; i < 40; ++i) {
-        char buf[64];
-        std::snprintf(buf, sizeof(buf), "scroll line %d あいう\r\n", i);
-        term->write(buf);
+    {
+        TermGuard guard;
+        for (int i = 0; i < 40; ++i) {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "scroll line %d あいう\r\n", i);
+            term->write(buf);
+        }
+        renderer->render(*term);
     }
-    renderer->render(*term);
     std::printf("redrew %d rows in %u us (draw %u / push %u)\n", renderer->last_rows_drawn(),
                 (unsigned)renderer->last_render_us(), (unsigned)renderer->last_draw_us(),
                 (unsigned)renderer->last_push_us());
@@ -305,8 +326,11 @@ int cmd_conv(int argc, char** argv)
         line += " ";
     }
     line += "\r\n";
-    term->write(line);
-    renderer->render(*term);
+    {
+        TermGuard guard;
+        term->write(line);
+        renderer->render(*term);
+    }
     return 0;
 }
 
@@ -314,6 +338,7 @@ int cmd_conv(int argc, char** argv)
 int cmd_scroll(int argc, char** argv)
 {
     const int delta = (argc > 1) ? atoi(argv[1]) : 3;
+    TermGuard guard;
     const int moved = term->scroll_view(delta);
     renderer->render(*term, /*force=*/true);
     std::printf("moved %d (offset %d / %d lines held)\n", moved, term->view_offset(),
@@ -351,9 +376,12 @@ int cmd_ssh(int argc, char** argv)
         return 1;
     }
 
-    term->write("\r\n\033[33mconnecting to ");
-    term->write(cfg.user + "@" + cfg.host + "...\033[m\r\n");
-    renderer->render(*term);
+    {
+        TermGuard guard;
+        term->write("\r\n\033[33mconnecting to ");
+        term->write(cfg.user + "@" + cfg.host + "...\033[m\r\n");
+        renderer->render(*term);
+    }
 
     esp_err_t err = ssh_connect(cfg, renderer->cols(), renderer->rows());
     if (err != ESP_OK) {
@@ -398,6 +426,8 @@ int cmd_key(int argc, char** argv)
 // 差分転送の効き目を測る。1 文字ずつ書いたときの再描画コストを見る。
 int cmd_bench(int, char**)
 {
+    // 計測中に別タスクが描画すると値が混ざるので、区間全体を押さえる。
+    TermGuard guard;
     renderer->render(*term, /*force=*/true);
     const uint32_t full_us = renderer->last_render_us();
     const uint32_t full_px = renderer->last_pixels();
@@ -422,6 +452,7 @@ int cmd_bench(int, char**)
 int cmd_kbd(int argc, char** argv)
 {
     const bool show = (argc < 2) || (std::string(argv[1]) != "off");
+    TermGuard guard;
     keyboard->set_visible(show);
     // 隠したら画面全体を端末に使う。端末側の行数と PTY サイズも合わせる。
     const int rows = show ? (display.height() - keyboard->height()) / renderer->cell_h()
@@ -600,6 +631,7 @@ int cmd_ts(int argc, char** argv)
     if (!st.assigned_address.empty()) {
         std::printf("  >>> assigned address: %s\n", st.assigned_address.c_str());
         std::string line = "\r\n\033[32mtailscale: " + st.assigned_address + "\033[m\r\n";
+        TermGuard guard;
         term->write(line);
         renderer->render(*term);
     }
@@ -1028,6 +1060,12 @@ extern "C" void app_main(void)
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
+    s_term_lock = xSemaphoreCreateMutex();
+    if (!s_term_lock) {
+        ESP_LOGE(TAG, "could not create the terminal lock");
+        return;
+    }
+
     init_nvs();
 
     int64_t t0 = esp_timer_get_time();
@@ -1100,6 +1138,7 @@ extern "C" void app_main(void)
         if (ssh_is_connected()) {
             ssh_send(s.data(), s.size());
         } else {
+            TermGuard guard;
             term->write(s);
             renderer->render(*term);
         }
@@ -1123,15 +1162,17 @@ extern "C" void app_main(void)
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(20));
 
-        // リモートからの出力を端末に流す。term を触るのはこのループだけに保つ。
-        uint8_t rx[1024];
-        for (;;) {
-            size_t n = ssh_receive(rx, sizeof(rx));
-            if (n == 0) break;
-            term->write(rx, n);
+        // リモートからの出力を端末に流す。コンソールタスクも term を触るのでロックする。
+        {
+            TermGuard guard;
+            uint8_t   rx[1024];
+            for (;;) {
+                size_t n = ssh_receive(rx, sizeof(rx));
+                if (n == 0) break;
+                term->write(rx, n);
+            }
+            if (term->any_dirty()) renderer->render(*term);
         }
-
-        if (term->any_dirty()) renderer->render(*term);
 
         lgfx::touch_point_t tp;
         if (display.getTouch(&tp, 1)) {
