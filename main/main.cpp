@@ -353,6 +353,30 @@ int cmd_key(int argc, char** argv)
     return 0;
 }
 
+// 差分転送の効き目を測る。1 文字ずつ書いたときの再描画コストを見る。
+int cmd_bench(int, char**)
+{
+    renderer->render(*term, /*force=*/true);
+    const uint32_t full_us = renderer->last_render_us();
+    const uint32_t full_px = renderer->last_pixels();
+
+    // 1 文字入力を 20 回。実際のタイプ入力に相当する。
+    uint32_t typing_us = 0, typing_px = 0;
+    for (int i = 0; i < 20; ++i) {
+        term->write("x");
+        renderer->render(*term);
+        typing_us += renderer->last_render_us();
+        typing_px += renderer->last_pixels();
+    }
+    term->write("\r\n");
+    renderer->render(*term);
+
+    std::printf("full screen: %u us (%u px)\n", (unsigned)full_us, (unsigned)full_px);
+    std::printf("20 keystrokes: %u us total, %u us each (%u px each)\n", (unsigned)typing_us,
+                (unsigned)(typing_us / 20), (unsigned)(typing_px / 20));
+    return 0;
+}
+
 void register_term_commands()
 {
     const esp_console_cmd_t cmds[] = {
@@ -366,6 +390,8 @@ void register_term_commands()
         {"key", "SSH にキー入力を送る", "<text>", &cmd_key, nullptr, nullptr, nullptr},
         {"conv", "ローマ字→かな→漢字を試す", "<romaji>", &cmd_conv, nullptr, nullptr, nullptr},
         {"scroll", "スクロールバックを動かす (正=過去へ)", "[lines]", &cmd_scroll, nullptr, nullptr,
+         nullptr},
+        {"bench", "描画コストを測る (全画面 vs 1 文字)", nullptr, &cmd_bench, nullptr, nullptr,
          nullptr},
     };
     for (const auto& c : cmds) ESP_ERROR_CHECK_WITHOUT_ABORT(esp_console_cmd_register(&c));

@@ -27,9 +27,12 @@ public:
     // 内訳 (最適化の判断用): スプライトへの描画と、パネルへの転送。
     uint32_t last_draw_us() const { return last_draw_us_; }
     uint32_t last_push_us() const { return last_push_us_; }
+    // 実際にパネルへ送ったピクセル数（差分転送の効き目を見る）。
+    uint32_t last_pixels() const { return last_px_; }
 
 private:
-    void draw_row(vt::Terminal& term, int y);
+    // [x_from, x_to] のセル範囲だけ描いて転送する。
+    void draw_row(vt::Terminal& term, int y, int x_from, int x_to);
 
     M5GFX&    gfx_;
     M5Canvas  row_;
@@ -40,6 +43,7 @@ private:
     uint32_t  last_us_      = 0;
     uint32_t  last_draw_us_ = 0;
     uint32_t  last_push_us_ = 0;
+    uint32_t  last_px_      = 0;
     int       last_rows_ = 0;
     int       cur_x_ = -1;
     int       cur_y_ = -1;
