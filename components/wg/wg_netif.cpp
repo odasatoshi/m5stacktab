@@ -65,7 +65,7 @@ struct State {
 
 State g_state;
 
-void handle_initiation_locked(const uint8_t* pkt, size_t len);
+void handle_initiation_locked(const uint8_t* pkt, size_t len, const sockaddr_in& from);
 
 // TAI64N のタイムスタンプ。WireGuard はこれでリプレイを弾くので、
 // **再起動をまたいで単調増加させる必要がある**（esp_timer は 0 に戻る）。
@@ -115,9 +115,10 @@ bool start_handshake_locked()
 }
 
 // 相手からのハンドシェイク要求に応答する。ロックを持った状態で呼ぶ。
-void handle_initiation_locked(const uint8_t* pkt, size_t len)
+// from は受信元。**認証が通ってから** endpoint を更新する（本家 wg と同じ）。
+void handle_initiation_locked(const uint8_t* pkt, size_t len, const sockaddr_in& from)
 {
-    if (len != 148 || !g_state.responder || !g_state.has_peer) return;
+    if (len != 148 || !g_state.responder || !g_state.has_peer || !g_state.transport) return;
 
     if (!g_state.responder->set_keys(g_state.static_priv, g_state.peer_pub)) return;
 
@@ -143,6 +144,17 @@ void handle_initiation_locked(const uint8_t* pkt, size_t len)
     if (!g_state.responder->create_response(msg2, local_index, kp)) {
         ESP_LOGW(TAG, "could not build handshake response");
         return;
+    }
+    // **認証が通った時点で endpoint を送信元に更新する。**
+    // 設定時の宛先に返し続けると、ピアの NAT マッピングが変わったときに
+    // msg2 が死んだ宛先へ飛び、しかも新しい鍵に張り替えてしまうので
+    // 受信方向まで死んで復帰しなくなる（本家 wg は認証済みパケットの送信元を使う）。
+    if (from.sin_addr.s_addr != g_state.peer_addr.sin_addr.s_addr ||
+        from.sin_port != g_state.peer_addr.sin_port) {
+        char ip[16];
+        inet_ntop(AF_INET, &from.sin_addr, ip, sizeof(ip));
+        ESP_LOGI(TAG, "peer endpoint moved to %s:%u", ip, (unsigned)ntohs(from.sin_port));
+        g_state.peer_addr = from;
     }
     if (!send_to_peer(msg2, sizeof(msg2))) return;
 
@@ -359,7 +371,7 @@ void rx_task(void*)
         if (xSemaphoreTake(g_state.lock, pdMS_TO_TICKS(200)) != pdTRUE) continue;
         if (type == kMsgResponse) {
             Keypair kp;
-            if (g_state.hs && g_state.hs->consume_response(buf, kp)) {
+            if (g_state.hs && g_state.transport && g_state.hs->consume_response(buf, kp)) {
                 g_state.transport->set_keypair(kp);
                 g_state.last_handshake_us = esp_timer_get_time();
                 g_state.last_tx_us       = 0;  // すぐ keepalive を送って経路を開ける
@@ -371,7 +383,7 @@ void rx_task(void*)
             // 相手からの（再）ハンドシェイク。応答側として返す。
             // WireGuard は両側から rekey するので、これを実装しないと相手主導の
             // 鍵更新に追随できない（相手は 180 秒で鍵を捨てるので通信が止まる）。
-            handle_initiation_locked(buf, static_cast<size_t>(n));
+            handle_initiation_locked(buf, static_cast<size_t>(n), from);
         }
         xSemaphoreGive(g_state.lock);
     }
@@ -540,6 +552,13 @@ esp_err_t Netif::set_peer(const PeerConfig& peer)
     if (inet_pton(AF_INET, host.c_str(), &g_state.peer_addr.sin_addr) != 1) {
         last_error_ = "endpoint must be a literal IPv4 address";
         return ESP_ERR_INVALID_ARG;
+    }
+    // ピアが変わったらリプレイ判定の状態も捨てる。残すと、実クロックを持つ相手から
+    // uptime 基準のタイムスタンプを出す相手に切り替えたときに、
+    // 新しいピアの initiation が全部 stale 扱いになって永久に応答しなくなる。
+    if (std::memcmp(g_state.peer_pub, peer.public_key, kKeyLen) != 0) {
+        g_state.have_peer_timestamp = false;
+        std::memset(g_state.peer_timestamp, 0, sizeof(g_state.peer_timestamp));
     }
     std::memcpy(g_state.peer_pub, peer.public_key, kKeyLen);
     g_state.keepalive_sec = peer.keepalive_sec;

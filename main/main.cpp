@@ -19,6 +19,7 @@
 #include <nvs_flash.h>
 
 #include <esp_netif.h>
+#include <arpa/inet.h>
 #include <lwip/sockets.h>
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/entropy.h>
@@ -886,29 +887,42 @@ int cmd_wgloop(int, char**)
     const int64_t t1 = esp_timer_get_time();
     const size_t  wlen =
         ta.encrypt(buf, sizeof(buf), reinterpret_cast<const uint8_t*>(payload), plen);
+    if (wlen == 0) {
+        // 暗号化の失敗と経路の不通を区別できるようにする（検証コマンドなので重要）。
+        std::printf("encrypt failed\n");
+        close(sa);
+        close(sb);
+        return 1;
+    }
     sendto(sa, buf, wlen, 0, reinterpret_cast<sockaddr*>(&addr_b), sizeof(addr_b));
     n = recvfrom(sb, buf, sizeof(buf), 0, nullptr, nullptr);
     static uint8_t out[2048];
     bool           valid = false;
     const size_t   got = (n > 0) ? tb.decrypt(out, sizeof(out), buf, static_cast<size_t>(n), &valid)
                                  : 0;
-    const int64_t rt_us = esp_timer_get_time() - t1;
-    std::printf("data over udp loopback: %s (%lld us round trip)\n",
-                (valid && got == plen && std::memcmp(out, payload, plen) == 0) ? "ok" : "FAILED",
+    const int64_t rt_us    = esp_timer_get_time() - t1;
+    const bool    data_ok  = valid && got == plen && std::memcmp(out, payload, plen) == 0;
+    std::printf("data over udp loopback: %s (%lld us round trip)\n", data_ok ? "ok" : "FAILED",
                 rt_us);
 
     // 逆方向も確認する（応答側の鍵で送れること）
     const size_t rlen = tb.encrypt(buf, sizeof(buf), reinterpret_cast<const uint8_t*>("reply"), 5);
-    sendto(sb, buf, rlen, 0, reinterpret_cast<sockaddr*>(&addr_a), sizeof(addr_a));
-    n = recvfrom(sa, buf, sizeof(buf), 0, nullptr, nullptr);
-    const size_t got2 =
-        (n > 0) ? ta.decrypt(out, sizeof(out), buf, static_cast<size_t>(n), &valid) : 0;
-    std::printf("reverse direction: %s\n",
-                (valid && got2 == 5 && std::memcmp(out, "reply", 5) == 0) ? "ok" : "FAILED");
+    bool         rev_ok = false;
+    if (rlen == 0) {
+        std::printf("reverse encrypt failed\n");
+    } else {
+        sendto(sb, buf, rlen, 0, reinterpret_cast<sockaddr*>(&addr_a), sizeof(addr_a));
+        n = recvfrom(sa, buf, sizeof(buf), 0, nullptr, nullptr);
+        const size_t got2 =
+            (n > 0) ? ta.decrypt(out, sizeof(out), buf, static_cast<size_t>(n), &valid) : 0;
+        rev_ok = valid && got2 == 5 && std::memcmp(out, "reply", 5) == 0;
+    }
+    std::printf("reverse direction: %s\n", rev_ok ? "ok" : "FAILED");
 
     close(sa);
     close(sb);
-    return keys_match ? 0 : 1;
+    // 3 つ全部が通って初めて成功。検証手順から戻り値で判定できるようにする。
+    return (keys_match && data_ok && rev_ok) ? 0 : 1;
 }
 
 // DISCO レスポンダ。WireGuard と同じ UDP ポートに来るので、netif の
