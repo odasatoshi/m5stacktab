@@ -264,9 +264,19 @@ void rx_task(void*)
             }
             continue;
         }
-        const uint8_t type = buf[0];
+        // WireGuard のメッセージは「型 + 予約 3 バイトが 0 + 長さが固定」。
+        // 先頭 1 バイトだけで判定すると、STUN Binding Response (0x01 0x01 ...) が
+        // Initiation (型 1) と衝突し、**先頭バイトが 0x01 の任意のデータグラム 1 発で
+        // 確立済みセッションを張り直させられる**。
+        const uint8_t type      = buf[0];
+        const bool    reserved_ok = (n >= 4) && buf[1] == 0 && buf[2] == 0 && buf[3] == 0;
+        const bool    is_wg =
+            reserved_ok &&
+            ((type == kMsgInitiation && n == 148) || (type == kMsgResponse && n == 92) ||
+             (type == kMsgCookie && n == 64) ||
+             (type == kMsgTransport && n >= static_cast<ssize_t>(kTransportHeader + kTagLen)));
 
-        if (type == kMsgTransport && n >= static_cast<ssize_t>(kTransportHeader + kTagLen)) {
+        if (is_wg && type == kMsgTransport) {
             bool   valid = false;
             size_t got   = 0;
             if (xSemaphoreTake(g_state.lock, pdMS_TO_TICKS(200)) == pdTRUE) {
@@ -284,8 +294,20 @@ void rx_task(void*)
             continue;
         }
 
+        if (!is_wg) {
+            // WireGuard ではない。DISCO や STUN の応答が同じポートに来る。
+            // ハンドラは時間がかかるのでロックを持たずに呼ぶ。
+            if (g_state.foreign) {
+                g_state.foreign(buf, static_cast<size_t>(n), from.sin_addr.s_addr,
+                                ntohs(from.sin_port));
+            } else if (g_state.stats) {
+                ++g_state.stats->rx_dropped;
+            }
+            continue;
+        }
+
         if (xSemaphoreTake(g_state.lock, pdMS_TO_TICKS(200)) != pdTRUE) continue;
-        if (type == kMsgResponse && n == 92) {
+        if (type == kMsgResponse) {
             Keypair kp;
             if (g_state.hs && g_state.hs->consume_response(buf, kp)) {
                 g_state.transport->set_keypair(kp);
@@ -295,18 +317,6 @@ void rx_task(void*)
             } else {
                 ESP_LOGW(TAG, "handshake response rejected");
             }
-        } else if (type != kMsgResponse && type != kMsgTransport && type != kMsgInitiation &&
-                   type != kMsgCookie) {
-            // WireGuard のメッセージ型ではない。DISCO や STUN の応答が同じポートに来る。
-            // ロックを持ったまま外に出さない（応答の送信で時間がかかる）。
-            auto handler = g_state.foreign;
-            xSemaphoreGive(g_state.lock);
-            if (handler) {
-                handler(buf, static_cast<size_t>(n), from.sin_addr.s_addr, ntohs(from.sin_port));
-            } else if (g_state.stats) {
-                ++g_state.stats->rx_dropped;
-            }
-            continue;
         } else if (type == kMsgInitiation) {
             // 相手からの再ハンドシェイク要求。応答側の役はまだ実装していないので、
             // 自分から作り直して経路を復活させる。

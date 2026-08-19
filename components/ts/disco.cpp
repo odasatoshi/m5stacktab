@@ -33,7 +33,9 @@ bool disco_open(const uint8_t* pkt, size_t len, const uint8_t shared_key[32], Di
     const size_t   box_len = len - kDiscoHeaderLen;
     if (box_len < wg::kBoxMacLen + 2) return false;
 
-    uint8_t plain[256];
+    // Tailscale は経路 MTU 探索のために大きくパディングした Ping を送るので、
+    // 1 パケットぶん受けられるようにしておく（256 バイトだと無言で落ちる）。
+    uint8_t      plain[1536];
     const size_t plain_len = box_len - wg::kBoxMacLen;
     if (plain_len > sizeof(plain)) return false;
     if (!wg::secretbox_open(plain, box, box_len, nonce, shared_key)) return false;
