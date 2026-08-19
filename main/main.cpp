@@ -19,6 +19,7 @@
 #include <nvs_flash.h>
 
 #include <esp_netif.h>
+#include <lwip/sockets.h>
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/error.h>
@@ -653,6 +654,131 @@ int cmd_ts(int argc, char** argv)
     return ok ? 0 : 1;
 }
 
+// WireGuard のハンドシェイクと暗号化を、実機のループバック相手に往復させる。
+// 相手機や WiFi が無くても「トンネルとして成立するか」を確かめられる。
+// 2 つの独立した鍵ペアを作り、UDP でお互いに投げ合う（実装は wg_netif とは別経路）。
+int cmd_wgloop(int, char**)
+{
+    const auto& c = wg::default_crypto();
+    uint8_t a_priv[32], a_pub[32], b_priv[32], b_pub[32];
+    if (!c.random_bytes(a_priv, 32) || !c.random_bytes(b_priv, 32) ||
+        !c.dh_pubkey(a_pub, a_priv) || !c.dh_pubkey(b_pub, b_priv)) {
+        std::printf("key generation failed\n");
+        return 1;
+    }
+
+    // 2 つの UDP ソケットを作って localhost で向き合わせる。
+    const int sa = socket(AF_INET, SOCK_DGRAM, 0);
+    const int sb = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sa < 0 || sb < 0) {
+        std::printf("socket failed\n");
+        if (sa >= 0) close(sa);
+        if (sb >= 0) close(sb);
+        return 1;
+    }
+    sockaddr_in addr_a{}, addr_b{};
+    addr_a.sin_family      = addr_b.sin_family = AF_INET;
+    addr_a.sin_addr.s_addr = addr_b.sin_addr.s_addr = htonl(0x7f000001);  // 127.0.0.1
+    addr_a.sin_port        = htons(51820);
+    addr_b.sin_port        = htons(51821);
+    bool ok = bind(sa, reinterpret_cast<sockaddr*>(&addr_a), sizeof(addr_a)) == 0 &&
+              bind(sb, reinterpret_cast<sockaddr*>(&addr_b), sizeof(addr_b)) == 0;
+    timeval tv{2, 0};
+    setsockopt(sa, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sb, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (!ok) {
+        std::printf("bind failed\n");
+        close(sa);
+        close(sb);
+        return 1;
+    }
+
+    wg::Handshake ha(c), hb(c);
+    if (!ha.set_keys(a_priv, b_pub) || !hb.set_keys(b_priv, a_pub)) {
+        std::printf("set_keys failed\n");
+        close(sa);
+        close(sb);
+        return 1;
+    }
+
+    // A が initiation を送る
+    static uint8_t buf[2048];
+    uint8_t        ts[12] = {0x40, 0, 0, 0, 0x67, 0x89, 0xab, 0xcd, 0, 0, 0, 1};
+    const int64_t  t0 = esp_timer_get_time();
+    if (!ha.create_initiation(buf, 0x1111, ts)) {
+        std::printf("create_initiation failed\n");
+        close(sa);
+        close(sb);
+        return 1;
+    }
+    sendto(sa, buf, 148, 0, reinterpret_cast<sockaddr*>(&addr_b), sizeof(addr_b));
+
+    // B が受けて応答する
+    ssize_t n = recvfrom(sb, buf, sizeof(buf), 0, nullptr, nullptr);
+    if (n != 148) {
+        std::printf("initiation not received (%d)\n", (int)n);
+        close(sa);
+        close(sb);
+        return 1;
+    }
+    uint8_t     learned[32], tsout[12];
+    wg::Keypair kb, ka;
+    if (!hb.consume_initiation(buf, learned, tsout) || !hb.create_response(buf, 0x2222, kb)) {
+        std::printf("responder side failed\n");
+        close(sa);
+        close(sb);
+        return 1;
+    }
+    sendto(sb, buf, 92, 0, reinterpret_cast<sockaddr*>(&addr_a), sizeof(addr_a));
+
+    // A が応答を受けて鍵を確定する
+    n = recvfrom(sa, buf, sizeof(buf), 0, nullptr, nullptr);
+    if (n != 92 || !ha.consume_response(buf, ka)) {
+        std::printf("response not accepted (%d)\n", (int)n);
+        close(sa);
+        close(sb);
+        return 1;
+    }
+    const int64_t hs_us = esp_timer_get_time() - t0;
+    const bool    keys_match = std::memcmp(ka.send, kb.recv, 32) == 0 &&
+                            std::memcmp(ka.recv, kb.send, 32) == 0;
+    std::printf("handshake over udp loopback: %s (%lld us)\n", keys_match ? "ok" : "KEY MISMATCH",
+                hs_us);
+
+    // 確定した鍵で実際にパケットを往復させる
+    wg::Transport ta(c), tb(c);
+    ta.set_keypair(ka);
+    tb.set_keypair(kb);
+    const char*  payload = "tunnel payload over loopback";
+    const size_t plen    = std::strlen(payload);
+    const int64_t t1 = esp_timer_get_time();
+    const size_t  wlen =
+        ta.encrypt(buf, sizeof(buf), reinterpret_cast<const uint8_t*>(payload), plen);
+    sendto(sa, buf, wlen, 0, reinterpret_cast<sockaddr*>(&addr_b), sizeof(addr_b));
+    n = recvfrom(sb, buf, sizeof(buf), 0, nullptr, nullptr);
+    static uint8_t out[2048];
+    bool           valid = false;
+    const size_t   got = (n > 0) ? tb.decrypt(out, sizeof(out), buf, static_cast<size_t>(n), &valid)
+                                 : 0;
+    const int64_t rt_us = esp_timer_get_time() - t1;
+    std::printf("data over udp loopback: %s (%lld us round trip)\n",
+                (valid && got == plen && std::memcmp(out, payload, plen) == 0) ? "ok" : "FAILED",
+                rt_us);
+
+    // 逆方向も確認する（応答側の鍵で送れること）
+    const size_t rlen = tb.encrypt(buf, sizeof(buf), reinterpret_cast<const uint8_t*>("reply"), 5);
+    sendto(sb, buf, rlen, 0, reinterpret_cast<sockaddr*>(&addr_a), sizeof(addr_a));
+    n = recvfrom(sa, buf, sizeof(buf), 0, nullptr, nullptr);
+    const size_t got2 =
+        (n > 0) ? ta.decrypt(out, sizeof(out), buf, static_cast<size_t>(n), &valid) : 0;
+    std::printf("reverse direction: %s\n",
+                (valid && got2 == 5 && std::memcmp(out, "reply", 5) == 0) ? "ok" : "FAILED");
+
+    close(sa);
+    close(sb);
+    return keys_match ? 0 : 1;
+}
+
 // DISCO レスポンダ。WireGuard と同じ UDP ポートに来るので、netif の
 // 「WireGuard 以外のパケット」ハンドラから呼ぶ。
 ts::DiscoResponder s_disco;
@@ -720,8 +846,9 @@ int cmd_wg(int argc, char** argv)
                     nif.is_up() ? 1 : 0, nif.handshake_done() ? 1 : 0, (unsigned)st.tx_packets,
                     (unsigned)st.tx_bytes, (unsigned)st.tx_dropped, (unsigned)st.rx_packets,
                     (unsigned)st.rx_bytes, (unsigned)st.rx_dropped);
-        std::printf("  handshakes=%u rekeys=%u keepalives=%u\n", (unsigned)st.handshakes,
-                    (unsigned)st.rekeys, (unsigned)st.keepalives);
+        std::printf("  handshakes=%u rekeys=%u keepalives=%u responses=%u stale=%u\n",
+                    (unsigned)st.handshakes, (unsigned)st.rekeys, (unsigned)st.keepalives,
+                    (unsigned)st.responses_sent, (unsigned)st.stale_initiations);
         return 0;
     }
     if (argc < 2) {
@@ -1063,6 +1190,8 @@ void register_term_commands()
         {"kbd", "画面キーボードの表示切り替え", "[off]", &cmd_kbd, nullptr, nullptr, nullptr},
         {"wgtest", "WireGuard の暗号とハンドシェイクを実機で検証", nullptr, &cmd_wgtest, nullptr,
          nullptr, nullptr},
+        {"wgloop", "UDP ループバックでトンネルを往復させる（相手機不要）", nullptr, &cmd_wgloop,
+         nullptr, nullptr, nullptr},
         {"keytest", "sshkey パーティションの鍵を mbedTLS で直接パースする", nullptr, &cmd_keytest,
          nullptr, nullptr, nullptr},
         {"rottest", "座標変換が setRotation(1) と一致するか実機で照合", nullptr, &cmd_rottest,
