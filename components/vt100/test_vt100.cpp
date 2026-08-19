@@ -1,6 +1,6 @@
 // VT100 コアのホストテスト。実機は要らない。
 //
-//   c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=undefined \
+//   c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=undefined
 //       -o /tmp/test_vt100 components/vt100/test_vt100.cpp components/vt100/vt100.cpp && /tmp/test_vt100
 //
 // AddressSanitizer は macOS のこの環境で起動時に固まるため使っていない。Linux で回すなら
