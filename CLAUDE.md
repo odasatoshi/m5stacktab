@@ -58,8 +58,47 @@ python tools/serial_log.py --seconds 20      # ログ採取
 - **L2 キャッシュを増やしてはいけない**。`SRAM_HIGH_SIZE = 0x80000 - CONFIG_CACHE_L2_CACHE_SIZE`
   なので、512KB にすると内蔵 SRAM の上半分 384KB が消える（内蔵ヒープ 567KB → 178KB）。
   underrun 対策には効かない（DPI は DMA で PSRAM を直読みする）。既定の 128KB のままにする
-- パネルはネイティブ縦 (720x1280)。横で使うなら `setRotation(1)`
-- P4 に WiFi は無い。ESP32-C6 を esp-hosted (SDIO) 経由で使う
+- パネルはネイティブ縦 (720x1280)。横で使うなら `setRotation(1)`。
+  **ただし回転すると転送が 3.3 倍遅くなる**（実測: 1280x24 の pushSprite が rot=0 で 1.21ms、
+  rot=1 で 3.96ms）。回転時は M5GFX がピクセル単位で座標変換するため。
+  全画面書き換えは 111ms（≒9fps）。差分更新なら 1 行 4ms で足りる。
+  横向きのまま速くするには ESP32-P4 の PPA (Pixel Processing Accelerator) で回転させる必要がある → #16
+- `Panel_DSI` はフレームバッファを `config_detail().buffer` で公開している（`Panel_FrameBufferBase` 派生）
+- **M5GFX の `drawChar(uniCode, x, y)` は使えない**。送り幅は正しく返すが、指定した座標に描かない
+  （実機で確認: 別の行に重なって出る）。`drawString` は正常なので、セル描画は
+  「同じ見た目が続く区間を UTF-8 文字列にまとめて `drawString`」でやる。まとめる分だけ速くもなる
+- P4 に WiFi は無い。ESP32-C6 を esp-hosted (SDIO) 経由で使う。**順序が決定的に重要**:
+  - C6 の電源は P4 の GPIO ではなく I2C の IO エクスパンダ (PI4IOE5V6408 @0x44) の pin0 にある。
+    ここは **`display.init()` (M5GFX の Tab5 初期化) が出力 High にしている**（実機で確認）。
+    つまり自分で叩く必要はないが、**必ず display.init() を先に呼ぶ**こと
+  - esp_hosted は既定で `__attribute__((constructor))` により **app_main より前に** SDIO を
+    叩き始める。C6 の電源が入る前に列挙が失敗し (`send_op_cond returned 0x107`)、
+    以後リセットもかからず永久に失敗する。
+    `CONFIG_ESP_HOSTED_AUTO_CALL_INIT_BEFORE_APP_MAIN=n` にして、
+    「display.init() → esp_hosted_init() → connect_to_slave() → esp_wifi_init()」の順を自分で作る
+  - GPIO31/32 の I2C は M5GFX が `I2C_NUM_1` で握っている。別のポートで同じピンに
+    `i2c_new_master_bus` すると GPIO マトリクスの出力選択を奪い合うので、
+    このピンを触りたいときは M5GFX 側の I2C を使う
+- `CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM` は有効にしない。TX mempool の 1600B ストライドが
+  128B キャッシュラインと合わず CMD53 がアライメント検査で弾かれる
+
+## SSH の鍵
+
+秘密鍵は `sshkey` パーティションに置く（NVS の blob 長制限と base64 経由を避けるため）。
+
+```sh
+ssh-keygen -t rsa -b 2048 -m PEM -N '' -f ~/.ssh/id_rsa_tab5
+cat ~/.ssh/id_rsa_tab5.pub >> ~/.ssh/authorized_keys   # 接続先で
+python $IDF_PATH/components/partition_table/parttool.py --port /dev/cu.usbmodem101 \
+    write_partition --partition-name sshkey --input ~/.ssh/id_rsa_tab5
+```
+
+**鍵の形式に制約がある**（libssh2 の mbedTLS バックエンド）:
+
+- **ed25519 は使えない**（`LIBSSH2_ED25519 = 0`）
+- **OpenSSH 形式 (`-----BEGIN OPENSSH PRIVATE KEY-----`) は使えない**。mbedTLS は PKCS#1 / SEC1 の
+  PEM しか解釈しないので `ssh-keygen -m PEM` が必須
+- **RSA (PEM) は動作確認済み**。ECDSA (PEM) は `mbedtls_pk_parse_key` が通らなかった（→ #17）
 
 ## コード方針
 

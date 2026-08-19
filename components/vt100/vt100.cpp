@@ -171,6 +171,10 @@ void Terminal::resize(int cols, int rows)
     scroll_top_    = 0;
     scroll_bottom_ = rows_ - 1;
     cur_.pending_wrap = false;
+    // 履歴は cols_ 単位で詰めてあるので、桁数が変わったら使い回せない。
+    sb_count_    = 0;
+    sb_head_     = 0;
+    view_offset_ = 0;
     clamp_cursor();
 }
 
@@ -239,6 +243,13 @@ void Terminal::scroll_up(int top, int bottom, int n)
     if (n <= 0 || top > bottom) return;
     n = std::min(n, bottom - top + 1);
     auto& s = screen();
+    // 画面外へ押し出される行を履歴に残す。代替画面 (vim など) の中身は残さない。
+    // スクロール領域が画面上端から始まっているときだけが「流れて消えた行」。
+    if (!alt_active_ && sb_buf_ && top == 0) {
+        for (int i = 0; i < n; ++i) {
+            push_scrollback(&s[static_cast<size_t>(top + i) * cols_]);
+        }
+    }
     for (int y = top; y <= bottom - n; ++y) {
         std::copy(s.begin() + static_cast<size_t>(y + n) * cols_,
                   s.begin() + static_cast<size_t>(y + n + 1) * cols_,
@@ -844,6 +855,56 @@ void Terminal::write(const uint8_t* data, size_t len)
                 break;
         }
     }
+}
+
+
+void Terminal::set_scrollback(Cell* buffer, int max_lines)
+{
+    sb_buf_      = (max_lines > 0) ? buffer : nullptr;
+    sb_max_      = (buffer && max_lines > 0) ? max_lines : 0;
+    sb_count_    = 0;
+    sb_head_     = 0;
+    view_offset_ = 0;
+}
+
+void Terminal::push_scrollback(const Cell* row)
+{
+    if (!sb_buf_ || sb_max_ <= 0) return;
+    std::copy(row, row + cols_, sb_buf_ + static_cast<size_t>(sb_head_) * cols_);
+    sb_head_ = (sb_head_ + 1) % sb_max_;
+    if (sb_count_ < sb_max_) ++sb_count_;
+    // 履歴を見ている最中に新しい行が来たら、見ている位置を保つ (画面が勝手に動かない)。
+    if (view_offset_ > 0 && view_offset_ < sb_count_) ++view_offset_;
+}
+
+const Cell* Terminal::sb_line(int lines_back) const
+{
+    // lines_back = 1 が最新の履歴行。
+    if (!sb_buf_ || lines_back <= 0 || lines_back > sb_count_) return nullptr;
+    const int idx = (sb_head_ - lines_back + sb_max_ * 2) % sb_max_;
+    return sb_buf_ + static_cast<size_t>(idx) * cols_;
+}
+
+int Terminal::scroll_view(int delta)
+{
+    const int before = view_offset_;
+    // 代替画面ではスクロールバックを見せない (vim の画面が壊れて見えるだけ)。
+    const int limit = alt_active_ ? 0 : sb_count_;
+    view_offset_    = std::clamp(view_offset_ + delta, 0, limit);
+    if (view_offset_ != before) mark_all_dirty();
+    return view_offset_ - before;
+}
+
+const Cell& Terminal::view_cell(int x, int y) const
+{
+    static const Cell blank{};
+    if (x < 0 || x >= cols_ || y < 0 || y >= rows_) return blank;
+    if (y < view_offset_) {
+        // 画面上部には履歴の古い方から順に並べる。
+        const Cell* line = sb_line(view_offset_ - y);
+        return line ? line[x] : blank;
+    }
+    return screen()[static_cast<size_t>(y - view_offset_) * cols_ + x];
 }
 
 }  // namespace vt

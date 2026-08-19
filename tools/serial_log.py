@@ -5,6 +5,7 @@ idf.py monitor は TTY を要求するので、非対話環境（CI やエージ
 Reality Check のログ採取はこれを使う。
 
   python tools/serial_log.py [--port PORT] [--seconds N] [--no-reset]
+  python tools/serial_log.py --no-reset --send wifi-status --seconds 3
 
 1 バイトも受信できなかったときは終了コード 1 を返す（ポート違いや起動失敗を
 「採取成功」と誤認しないため）。
@@ -23,6 +24,8 @@ def main() -> int:
     p.add_argument("--baud", type=int, default=115200)
     p.add_argument("--seconds", type=float, default=20.0)
     p.add_argument("--no-reset", action="store_true", help="リセットせず現在の出力だけ拾う")
+    p.add_argument("--send", action="append", default=[],
+                   help="読み取り開始後に送る行（コンソールコマンド用、複数指定可）")
     args = p.parse_args()
 
     with serial.Serial(args.port, args.baud, timeout=0.2) as s:
@@ -37,6 +40,10 @@ def main() -> int:
             time.sleep(0.1)
             s.reset_input_buffer()  # EN を放す前に捨てる。起動ログを取り逃さない
             s.rts = False           # EN 解放 -> ブート開始
+
+        for line in args.send:
+            s.write((line + "\r\n").encode())
+        s.flush()
 
         # チャンク境界でマルチバイト文字が割れるので逐次デコーダを使う。
         decoder = codecs.getincrementaldecoder("utf-8")("replace")

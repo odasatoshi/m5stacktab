@@ -100,6 +100,19 @@ public:
     // デバッグ・テスト用: 1 行を UTF-8 文字列にする (末尾の空白は落とす)。
     std::string row_text(int y) const;
 
+    // --- スクロールバック ---
+    //
+    // バッファは呼び出し側が用意する (cols * max_lines 個の Cell)。ESP-IDF 側は PSRAM から
+    // 確保して渡す。コア側で確保するとアロケータを選べないため。
+    // resize() すると桁数が変わるので履歴は破棄される。
+    void set_scrollback(Cell* buffer, int max_lines);
+    int  scrollback_lines() const { return sb_count_; }
+    int  view_offset() const { return view_offset_; }
+    // 表示位置を動かす (正 = 過去へ)。実際に動いた行数を返す。
+    int  scroll_view(int delta);
+    // 表示用のセル。スクロールバックを見ている間は履歴を返す。
+    const Cell& view_cell(int x, int y) const;
+
 private:
     struct Cursor {
         int  x = 0;
@@ -180,6 +193,15 @@ private:
     bool app_cursor_keys_ = false;
 
     std::vector<bool> tab_stops_;
+
+    // スクロールバック (呼び出し側所有のリングバッファ)。
+    Cell* sb_buf_      = nullptr;
+    int   sb_max_      = 0;
+    int   sb_count_    = 0;   // 保持している行数
+    int   sb_head_     = 0;   // 次に書く位置
+    int   view_offset_ = 0;   // 0 = 最新
+    const Cell* sb_line(int lines_back) const;
+    void  push_scrollback(const Cell* row);
 
     // CSI パラメータの個数上限。無制限だと ";" の連打で際限なくヒープを食う。
     static constexpr size_t kMaxParams = 32;
