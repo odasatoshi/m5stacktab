@@ -82,6 +82,24 @@ python tools/serial_log.py --seconds 20      # ログ採取
 - `CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM` は有効にしない。TX mempool の 1600B ストライドが
   128B キャッシュラインと合わず CMD53 がアライメント検査で弾かれる
 
+## SSH の鍵
+
+秘密鍵は `sshkey` パーティションに置く（NVS の blob 長制限と base64 経由を避けるため）。
+
+```sh
+ssh-keygen -t rsa -b 2048 -m PEM -N '' -f ~/.ssh/id_rsa_tab5
+cat ~/.ssh/id_rsa_tab5.pub >> ~/.ssh/authorized_keys   # 接続先で
+python $IDF_PATH/components/partition_table/parttool.py --port /dev/cu.usbmodem101 \
+    write_partition --partition-name sshkey --input ~/.ssh/id_rsa_tab5
+```
+
+**鍵の形式に制約がある**（libssh2 の mbedTLS バックエンド）:
+
+- **ed25519 は使えない**（`LIBSSH2_ED25519 = 0`）
+- **OpenSSH 形式 (`-----BEGIN OPENSSH PRIVATE KEY-----`) は使えない**。mbedTLS は PKCS#1 / SEC1 の
+  PEM しか解釈しないので `ssh-keygen -m PEM` が必須
+- **RSA (PEM) は動作確認済み**。ECDSA (PEM) は `mbedtls_pk_parse_key` が通らなかった（→ #17）
+
 ## コード方針
 
 - 過剰な抽象化を作らない。実装が 1 つしかない interface、使われない config は書かない

@@ -268,6 +268,17 @@ int cmd_conv(int argc, char** argv)
     return 0;
 }
 
+// スクロールバックの確認用（タッチのスワイプは #7 の UI で繋ぐ）。
+int cmd_scroll(int argc, char** argv)
+{
+    const int delta = (argc > 1) ? atoi(argv[1]) : 3;
+    const int moved = term->scroll_view(delta);
+    renderer->render(*term, /*force=*/true);
+    std::printf("moved %d (offset %d / %d lines held)\n", moved, term->view_offset(),
+                term->scrollback_lines());
+    return 0;
+}
+
 int cmd_ssh(int argc, char** argv)
 {
     SshConfig cfg;
@@ -275,6 +286,13 @@ int cmd_ssh(int argc, char** argv)
         if (ssh_config_load(cfg) != ESP_OK || cfg.host.empty()) {
             std::printf("no saved connection. usage: ssh <user> <host> <password> [port]\n");
             return 1;
+        }
+    } else if (argc == 3) {
+        // 秘密鍵 (sshkey パーティション) で認証する。パスワードは保存しない。
+        cfg.user = argv[1];
+        cfg.host = argv[2];
+        if (esp_err_t err = ssh_config_save(cfg); err != ESP_OK) {
+            std::printf("warning: could not save connection: %s\n", esp_err_to_name(err));
         }
     } else if (argc == 4 || argc == 5) {
         cfg.user     = argv[1];
@@ -285,7 +303,9 @@ int cmd_ssh(int argc, char** argv)
             std::printf("warning: could not save connection: %s\n", esp_err_to_name(err));
         }
     } else {
-        std::printf("usage: ssh [<user> <host> <password> [port]]\n");
+        std::printf("usage: ssh <user> <host>                    # 秘密鍵で認証\n");
+        std::printf("       ssh <user> <host> <password> [port]  # パスワードで認証\n");
+        std::printf("       ssh                                  # 保存済み設定で再接続\n");
         return 1;
     }
 
@@ -345,6 +365,8 @@ void register_term_commands()
         {"sshclose", "SSH セッションを閉じる", nullptr, &cmd_sshclose, nullptr, nullptr, nullptr},
         {"key", "SSH にキー入力を送る", "<text>", &cmd_key, nullptr, nullptr, nullptr},
         {"conv", "ローマ字→かな→漢字を試す", "<romaji>", &cmd_conv, nullptr, nullptr, nullptr},
+        {"scroll", "スクロールバックを動かす (正=過去へ)", "[lines]", &cmd_scroll, nullptr, nullptr,
+         nullptr},
     };
     for (const auto& c : cmds) ESP_ERROR_CHECK_WITHOUT_ABORT(esp_console_cmd_register(&c));
 }
@@ -381,6 +403,19 @@ extern "C" void app_main(void)
         return;
     }
     term = std::make_unique<vt::Terminal>(renderer->cols(), renderer->rows());
+
+    // スクロールバックは PSRAM に置く。1 行 = cols * sizeof(Cell) なので 1000 行で約 1.3MB。
+    // コア側で確保させずにここで渡すのは、アロケータ (PSRAM) を選ぶため。
+    constexpr int kScrollbackLines = 1000;
+    auto* sb = static_cast<vt::Cell*>(heap_caps_malloc(
+        sizeof(vt::Cell) * renderer->cols() * kScrollbackLines, MALLOC_CAP_SPIRAM));
+    if (sb) {
+        term->set_scrollback(sb, kScrollbackLines);
+        ESP_LOGI(TAG, "scrollback: %d lines (%u KB in PSRAM)", kScrollbackLines,
+                 (unsigned)(sizeof(vt::Cell) * renderer->cols() * kScrollbackLines / 1024));
+    } else {
+        ESP_LOGW(TAG, "scrollback disabled (PSRAM alloc failed)");
+    }
     term->write("m5stacktab\r\n");
     char line[128];
     std::snprintf(line, sizeof(line), "grid %dx%d  cell %dx%d  panel %dx%d\r\n", renderer->cols(),

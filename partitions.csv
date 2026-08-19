@@ -5,3 +5,7 @@ nvs,      data, nvs,     0x9000,   0x6000,
 phy_init, data, phy,     0xf000,   0x1000,
 factory,  app,  factory, 0x10000,  6M,
 dict,     data, spiffs,  ,         8M,
+# SSH の秘密鍵。NVS ではなく専用領域にするのは、長さ制限と base64 経由を避けるため。
+# 書き込み: python $IDF_PATH/components/partition_table/parttool.py --port PORT \
+#             write_partition --partition-name sshkey --input ~/.ssh/id_ecdsa
+sshkey,   data, 0x40,    ,         64K,

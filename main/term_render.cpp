@@ -94,14 +94,16 @@ void TermRenderer::draw_row(vt::Terminal& term, int y)
     const int64_t t_draw = esp_timer_get_time();
     row_.fillSprite(pal_[vt::kDefaultBg]);
 
-    const bool cursor_here = term.cursor_visible() && y == term.cursor_y();
-    const int  cursor_x    = term.cursor_x();
+    // 履歴を見ている間はカーソルを描かない（過去の行の上に出ると紛らわしい）。
+    const bool cursor_here =
+        term.cursor_visible() && term.view_offset() == 0 && y == term.cursor_y();
+    const int cursor_x = term.cursor_x();
 
     // 同じ見た目が続く区間をまとめて 1 回の drawString で描く。
     // drawChar は指定した座標に描いてくれない (advance は正しいが位置が効かない) ので使わない。
     int x = 0;
     while (x < cols_) {
-        const vt::Cell& head = term.cell(x, y);
+        const vt::Cell& head = term.view_cell(x, y);
         if (head.width == 0) {  // 孤立した右半分（通常ここには来ない）
             ++x;
             continue;
@@ -126,7 +128,7 @@ void TermRenderer::draw_row(vt::Terminal& term, int y)
         const int start_x = x;
         std::string run;
         while (x < cols_) {
-            const vt::Cell& c = term.cell(x, y);
+            const vt::Cell& c = term.view_cell(x, y);
             if (c.width == 0) {
                 ++x;
                 continue;

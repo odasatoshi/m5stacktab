@@ -14,6 +14,7 @@
 #include <mbedtls/sha256.h>
 #include <errno.h>
 #include <esp_check.h>
+#include <esp_partition.h>
 #include <nvs.h>
 
 #include <libssh2.h>
@@ -88,6 +89,73 @@ bool verify_host_key(LIBSSH2_SESSION* session, const char* host)
     return ok;
 }
 
+// 秘密鍵は専用パーティションから読む。NVS の blob 長制限も base64 変換も要らない。
+std::string load_private_key()
+{
+    const esp_partition_t* part = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, static_cast<esp_partition_subtype_t>(0x40), "sshkey");
+    if (!part) return {};
+
+    std::string buf(std::min<size_t>(part->size, 8192), '\0');
+    if (esp_partition_read(part, 0, buf.data(), buf.size()) != ESP_OK) return {};
+
+    // 未書き込み領域は 0xFF。そこから先は捨てる。
+    const size_t end = buf.find('\xFF');
+    if (end != std::string::npos) buf.resize(end);
+    while (!buf.empty() && (buf.back() == '\0' || buf.back() == '\n' || buf.back() == '\r')) {
+        buf.pop_back();
+    }
+    if (buf.find("PRIVATE KEY") == std::string::npos) {
+        ESP_LOGW(TAG, "sshkey partition has no PEM key (%d bytes read)", (int)buf.size());
+        return {};
+    }
+    buf += '\n';  // PEM は最終行の改行を期待する実装があるので付けておく
+    // 先頭行は鍵の種類が分かるだけで秘密ではないので、切り分けのために出す。
+    const size_t nl = buf.find('\n');
+    ESP_LOGI(TAG, "private key: %d bytes, header=%.*s", (int)buf.size(),
+             (int)(nl == std::string::npos ? 0 : nl), buf.c_str());
+    return buf;
+}
+
+// 鍵があれば公開鍵認証、なければ (または失敗したら) パスワード認証。
+bool authenticate(LIBSSH2_SESSION* session, const SshConfig& cfg)
+{
+    const std::string key = load_private_key();
+    if (!key.empty()) {
+        // 公開鍵は渡さない。OpenSSH 形式の秘密鍵には公開鍵が含まれているため libssh2 が導出する。
+        // パスフレーズ付きの鍵なら cfg.password をパスフレーズとして使う。
+        const int rc = libssh2_userauth_publickey_frommemory(
+            session, cfg.user.c_str(), cfg.user.size(), nullptr, 0, key.data(), key.size(),
+            cfg.password.empty() ? nullptr : cfg.password.c_str());
+        if (rc == 0) {
+            ESP_LOGI(TAG, "authenticated with private key (%d bytes)", (int)key.size());
+            return true;
+        }
+        char* msg = nullptr;
+        int   msg_len = 0;
+        const int last = libssh2_session_last_error(session, &msg, &msg_len, 0);
+        ESP_LOGW(TAG, "publickey auth failed: rc=%d last=%d msg=%.*s", rc, last, msg_len,
+                 msg ? msg : "");
+        // mbedTLS バックエンドは ed25519 非対応 (LIBSSH2_ED25519=0)。ECDSA か RSA の鍵が必要。
+        if (key.find("OPENSSH PRIVATE KEY") != std::string::npos) {
+            ESP_LOGW(TAG, "note: ed25519 keys are not supported by the mbedTLS backend; "
+                          "use ecdsa or rsa");
+        }
+    }
+    if (!cfg.password.empty()) {
+        const int rc =
+            libssh2_userauth_password(session, cfg.user.c_str(), cfg.password.c_str());
+        if (rc == 0) {
+            ESP_LOGI(TAG, "authenticated with password");
+            return true;
+        }
+        set_error("authentication failed: %d", rc);
+        return false;
+    }
+    if (key.empty()) set_error("no private key in the sshkey partition and no password given");
+    return false;
+}
+
 int tcp_connect(const char* host, uint16_t port)
 {
     char port_str[8];
@@ -155,12 +223,7 @@ void ssh_task(void*)
         }
         if (!verify_host_key(session, s_cfg.host.c_str())) break;
 
-        if (int rc = libssh2_userauth_password(session, s_cfg.user.c_str(),
-                                              s_cfg.password.c_str());
-            rc) {
-            set_error("authentication failed: %d", rc);
-            break;
-        }
+        if (!authenticate(session, s_cfg)) break;
         channel = libssh2_channel_open_session(session);
         if (!channel) {
             set_error("channel open failed");
