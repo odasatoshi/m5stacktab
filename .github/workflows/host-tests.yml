@@ -66,6 +66,16 @@ jobs:
               -lmbedcrypto
           /tmp/test_disco
 
+      - name: disco responder
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \
+              -I components/wg -I components/ts -o /tmp/test_dr \
+              components/ts/test_disco_responder.cpp components/ts/disco_responder.cpp \
+              components/ts/disco.cpp components/wg/salsa20.cpp \
+              components/wg/crypto_mbedtls.cpp components/wg/noise.cpp components/wg/blake2s.cpp \
+              -lmbedcrypto
+          /tmp/test_dr
+
       - name: tailscale ts2021 noise
         run: |
           c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \

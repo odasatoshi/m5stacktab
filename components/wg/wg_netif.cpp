@@ -52,6 +52,7 @@ struct State {
     int64_t           last_tx_us           = 0;
     uint32_t          keepalive_sec        = 25;
     NetifStats*       stats                = nullptr;
+    Netif::ForeignPacketHandler foreign     = nullptr;
     Netif::TimestampStore ts_store         = nullptr;
     uint64_t          ts_seconds           = 0;  // 最後に送った TAI64N の秒部分
 };
@@ -294,6 +295,18 @@ void rx_task(void*)
             } else {
                 ESP_LOGW(TAG, "handshake response rejected");
             }
+        } else if (type != kMsgResponse && type != kMsgTransport && type != kMsgInitiation &&
+                   type != kMsgCookie) {
+            // WireGuard のメッセージ型ではない。DISCO や STUN の応答が同じポートに来る。
+            // ロックを持ったまま外に出さない（応答の送信で時間がかかる）。
+            auto handler = g_state.foreign;
+            xSemaphoreGive(g_state.lock);
+            if (handler) {
+                handler(buf, static_cast<size_t>(n), from.sin_addr.s_addr, ntohs(from.sin_port));
+            } else if (g_state.stats) {
+                ++g_state.stats->rx_dropped;
+            }
+            continue;
         } else if (type == kMsgInitiation) {
             // 相手からの再ハンドシェイク要求。応答側の役はまだ実装していないので、
             // 自分から作り直して経路を復活させる。
@@ -480,6 +493,20 @@ esp_err_t Netif::set_peer(const PeerConfig& peer)
         return ESP_FAIL;
     }
     return ESP_OK;
+}
+
+void Netif::set_foreign_handler(ForeignPacketHandler fn) { g_state.foreign = fn; }
+
+bool Netif::send_raw(const uint8_t* data, size_t len, uint32_t dst_ip, uint16_t dst_port)
+{
+    if (g_state.sock < 0) return false;
+    sockaddr_in dst{};
+    dst.sin_family      = AF_INET;
+    dst.sin_port        = htons(dst_port);
+    dst.sin_addr.s_addr = dst_ip;
+    const ssize_t n = sendto(g_state.sock, data, len, 0, reinterpret_cast<sockaddr*>(&dst),
+                             sizeof(dst));
+    return n == static_cast<ssize_t>(len);
 }
 
 bool Netif::handshake_done() const

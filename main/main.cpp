@@ -26,6 +26,7 @@
 #include "skk_dict.hpp"
 #include "ssh.hpp"
 #include "ts_client.hpp"
+#include "disco_responder.hpp"
 #include "wg_netif.hpp"
 #include "blake2s.hpp"
 #include "kbd_ui.hpp"
@@ -568,6 +569,20 @@ int cmd_ts(int argc, char** argv)
     return ok ? 0 : 1;
 }
 
+// DISCO レスポンダ。WireGuard と同じ UDP ポートに来るので、netif の
+// 「WireGuard 以外のパケット」ハンドラから呼ぶ。
+ts::DiscoResponder s_disco;
+
+void on_foreign_packet(const uint8_t* pkt, size_t len, uint32_t src_ip, uint16_t src_port)
+{
+    static uint8_t out[256];  // このハンドラは受信タスクからのみ呼ばれる
+    const size_t   n = s_disco.handle(pkt, len, src_ip, src_port, out, sizeof(out));
+    if (n > 0) {
+        // 応答は同じソケットから返す。別ソケットだと NAT のマッピングがずれる。
+        wg::netif_instance().send_raw(out, n, src_ip, src_port);
+    }
+}
+
 // WireGuard のトンネル netif を上げる。ピア指定は任意（無ければ netif だけ作る）。
 int cmd_wg(int argc, char** argv)
 {
@@ -576,6 +591,15 @@ int cmd_wg(int argc, char** argv)
     if (argc >= 2 && std::string(argv[1]) == "down") {
         nif.down();
         std::printf("netif down\n");
+        return 0;
+    }
+    if (argc >= 2 && std::string(argv[1]) == "disco") {
+        // 自分の disco 公開鍵とピア登録状況を見る。
+        std::printf("disco pub: ");
+        for (int i = 0; i < 32; ++i) std::printf("%02x", s_disco.public_key()[i]);
+        std::printf("\n  peers=%u pings=%u pongs=%u unknown=%u\n", (unsigned)s_disco.peer_count(),
+                    (unsigned)s_disco.pings_received(), (unsigned)s_disco.pongs_sent(),
+                    (unsigned)s_disco.unknown_peers());
         return 0;
     }
     if (argc >= 2 && std::string(argv[1]) == "stat") {
@@ -649,6 +673,23 @@ int cmd_wg(int argc, char** argv)
         nvs_close(h);
         return ok;
     });
+
+    // DISCO の鍵は ts コマンドと同じ NVS の "dkey" を使う（netmap に載る鍵と一致させる）。
+    {
+        uint8_t      dkey[32];
+        nvs_handle_t h;
+        bool         ok = false;
+        if (nvs_open("ts", NVS_READONLY, &h) == ESP_OK) {
+            size_t len = 32;
+            ok = (nvs_get_blob(h, "dkey", dkey, &len) == ESP_OK && len == 32);
+            nvs_close(h);
+        }
+        if (ok && s_disco.set_key(dkey)) {
+            nif.set_foreign_handler(&on_foreign_packet);
+        } else {
+            std::printf("warning: no disco key yet (run `ts` first) - DISCO disabled\n");
+        }
+    }
 
     if (!nif.is_up()) {
         const esp_err_t err = nif.up(priv, addr, mask);
