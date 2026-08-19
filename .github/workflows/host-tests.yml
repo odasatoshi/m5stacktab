@@ -57,6 +57,12 @@ jobs:
               components/wg/crypto_mbedtls.cpp -lmbedcrypto
           /tmp/test_ts
 
+      - name: http/2 minimal client
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \
+              -I components/ts -o /tmp/test_h2 components/ts/test_h2.cpp components/ts/h2.cpp
+          /tmp/test_h2
+
       # 辞書ビルドスクリプトが壊れていないかを小さい辞書で確認する（ネットワークは使わない）。
       - name: dictionary builder
         run: |
