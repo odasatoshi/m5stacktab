@@ -48,6 +48,15 @@ jobs:
               components/wg/crypto_mbedtls.cpp components/wg/transport.cpp -lmbedcrypto
           /tmp/test_noise
 
+      - name: tailscale ts2021 noise
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \
+              -I components/wg -I components/ts -o /tmp/test_ts \
+              components/ts/test_ts_noise.cpp components/ts/ts_noise.cpp \
+              components/wg/noise.cpp components/wg/blake2s.cpp \
+              components/wg/crypto_mbedtls.cpp -lmbedcrypto
+          /tmp/test_ts
+
       # 辞書ビルドスクリプトが壊れていないかを小さい辞書で確認する（ネットワークは使わない）。
       - name: dictionary builder
         run: |

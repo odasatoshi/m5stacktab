@@ -27,12 +27,21 @@ struct Crypto {
     bool (*dh)(uint8_t out[kKeyLen], const uint8_t priv[kKeyLen], const uint8_t pub[kKeyLen]);
     // 公開鍵の導出。
     bool (*dh_pubkey)(uint8_t out[kKeyLen], const uint8_t priv[kKeyLen]);
-    // ChaCha20-Poly1305 AEAD (nonce は 12 バイト、counter を little endian で下位に置く)。
+    // ChaCha20-Poly1305 AEAD。nonce は 12 バイトで、先頭 4 バイトは 0、
+    // 残り 8 バイトに counter を置く。**WireGuard はリトルエンディアン**。
     bool (*aead_encrypt)(uint8_t* out, const uint8_t key[kKeyLen], uint64_t counter,
                          const uint8_t* plain, size_t plain_len, const uint8_t* ad, size_t ad_len);
     bool (*aead_decrypt)(uint8_t* out, const uint8_t key[kKeyLen], uint64_t counter,
                          const uint8_t* cipher, size_t cipher_len, const uint8_t* ad,
                          size_t ad_len);
+    // 同じだが counter を **ビッグエンディアン**で置く版。Tailscale の ts2021 が使う。
+    // 間違えると「暗号化はできるのに復号だけ通らない」という分かりにくい壊れ方をする。
+    bool (*aead_encrypt_be)(uint8_t* out, const uint8_t key[kKeyLen], uint64_t counter,
+                            const uint8_t* plain, size_t plain_len, const uint8_t* ad,
+                            size_t ad_len);
+    bool (*aead_decrypt_be)(uint8_t* out, const uint8_t key[kKeyLen], uint64_t counter,
+                            const uint8_t* cipher, size_t cipher_len, const uint8_t* ad,
+                            size_t ad_len);
     // 乱数。失敗したら false。全ゼロを返して続行してはいけない（予測可能な鍵になる）。
     bool (*random_bytes)(uint8_t* out, size_t len);
 };
