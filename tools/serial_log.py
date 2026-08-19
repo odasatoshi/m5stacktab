@@ -5,8 +5,12 @@ idf.py monitor は TTY を要求するので、非対話環境（CI やエージ
 Reality Check のログ採取はこれを使う。
 
   python tools/serial_log.py [--port PORT] [--seconds N] [--no-reset]
+
+1 バイトも受信できなかったときは終了コード 1 を返す（ポート違いや起動失敗を
+「採取成功」と誤認しないため）。
 """
 import argparse
+import codecs
 import sys
 import time
 
@@ -22,20 +26,32 @@ def main() -> int:
     args = p.parse_args()
 
     with serial.Serial(args.port, args.baud, timeout=0.2) as s:
-        if not args.no_reset:
-            # USB-Serial-JTAG の hard reset は RTS。esptool と同じ手順。
-            s.dtr = False
-            s.rts = True
-            time.sleep(0.1)
+        # pyserial は open 時に DTR/RTS を両方 assert する。USB-Serial-JTAG では
+        # RTS assert = EN LOW なので、放置するとチップがリセットに保持されて何も出てこない。
+        if args.no_reset:
             s.rts = False
-            time.sleep(0.05)
-            s.reset_input_buffer()
+            s.dtr = False
+        else:
+            # esptool の USB-JTAG リセット手順: (DTR,RTS) = (1,1) -> (0,1) -> (0,0)
+            s.dtr = False           # EN LOW
+            time.sleep(0.1)
+            s.reset_input_buffer()  # EN を放す前に捨てる。起動ログを取り逃さない
+            s.rts = False           # EN 解放 -> ブート開始
+
+        # チャンク境界でマルチバイト文字が割れるので逐次デコーダを使う。
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        total = 0
         deadline = time.time() + args.seconds
         while time.time() < deadline:
             data = s.read(4096)
             if data:
-                sys.stdout.write(data.decode("utf-8", "replace"))
+                total += len(data)
+                sys.stdout.write(decoder.decode(data))
                 sys.stdout.flush()
+
+    if total == 0:
+        print(f"no data received from {args.port}", file=sys.stderr)
+        return 1
     return 0
 
 

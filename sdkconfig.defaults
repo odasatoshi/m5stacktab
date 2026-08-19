@@ -12,10 +12,11 @@ CONFIG_IDF_EXPERIMENTAL_FEATURES=y
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_SPEED_200M=y
 CONFIG_SPIRAM_USE_MALLOC=y
-CONFIG_SPIRAM_MEMTEST=n
 
-# PSRAM からの読み出し効率を上げる（DPI の underrun 対策）
-CONFIG_CACHE_L2_CACHE_512KB=y
+# L2 キャッシュは既定の 128KB のまま。ESP32-P4 は SRAM_HIGH_SIZE = 0x80000 - L2 キャッシュサイズ
+# なので、512KB にすると内蔵 SRAM の上半分 (384KB) が丸ごと消える。DPI のフレームバッファは
+# DSI の DMA が PSRAM を直読みするためキャッシュを増やしても効果は間接的で、実測でも
+# 200MHz 化だけで underrun は解消した。
 CONFIG_CACHE_L2_CACHE_LINE_128B=y
 
 CONFIG_FREERTOS_HZ=1000

@@ -55,6 +55,9 @@ python tools/serial_log.py --seconds 20      # ログ採取
   フレームバッファを PSRAM から読み切れず `lcd.dsi.dpi: ... underrun happens` が出続ける。
   `CONFIG_SPIRAM_SPEED_200M` は `CONFIG_IDF_EXPERIMENTAL_FEATURES` に依存するので、
   依存も一緒に有効にしないと黙って 20MHz に落ちる
+- **L2 キャッシュを増やしてはいけない**。`SRAM_HIGH_SIZE = 0x80000 - CONFIG_CACHE_L2_CACHE_SIZE`
+  なので、512KB にすると内蔵 SRAM の上半分 384KB が消える（内蔵ヒープ 567KB → 178KB）。
+  underrun 対策には効かない（DPI は DMA で PSRAM を直読みする）。既定の 128KB のままにする
 - パネルはネイティブ縦 (720x1280)。横で使うなら `setRotation(1)`
 - P4 に WiFi は無い。ESP32-C6 を esp-hosted (SDIO) 経由で使う
 
