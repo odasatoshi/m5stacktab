@@ -25,7 +25,8 @@ struct Panel {
 // M5GFX の setRotation(1) と同じ向きにする（そうしないと今までの画面と上下左右が変わる）。
 void landscape_to_native(const Panel& p, int lx, int ly, int* nx, int* ny);
 
-// 逆変換。タッチはネイティブ座標で来るので、これで横向きに直す。
+// 逆変換。今のところ往復テストと、将来 rotation 0 で生のタッチを扱う場合のために置いてある
+// （現状の実装は M5GFX の rotation 1 のまま getTouch を使うので、タッチは既に横向き座標で来る）。
 void native_to_landscape(const Panel& p, int nx, int ny, int* lx, int* ly);
 
 // 横向きの矩形 (lx, ly, lw, lh) を PPA の出力先ブロック (nx, ny, nw, nh) に変換する。

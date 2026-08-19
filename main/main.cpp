@@ -58,9 +58,18 @@ SemaphoreHandle_t s_term_lock = nullptr;
 
 class TermGuard {
 public:
-    TermGuard() { if (s_term_lock) taken_ = xSemaphoreTake(s_term_lock, pdMS_TO_TICKS(2000)) == pdTRUE; }
+    TermGuard()
+    {
+        if (!s_term_lock) return;
+        taken_ = xSemaphoreTake(s_term_lock, pdMS_TO_TICKS(2000)) == pdTRUE;
+        if (!taken_) {
+            // 黙って通すと、ロックを入れた目的（画面の破壊と計測値の混入）がそのまま再発する。
+            // 呼び出し側は ok() を見て中断する。
+            ESP_LOGE(TAG, "terminal lock timeout - skipping this operation");
+        }
+    }
     ~TermGuard() { if (taken_) xSemaphoreGive(s_term_lock); }
-    bool ok() const { return taken_ || !s_term_lock; }
+    bool ok() const { return taken_; }
 
 private:
     bool taken_ = false;
@@ -137,11 +146,14 @@ int cmd_term(int argc, char** argv)
         if (i > 1) s += ' ';
         s += unescape(argv[i]);
     }
-    {
-        TermGuard guard;
-        term->write(s);
-        renderer->render(*term);
+    TermGuard guard;
+    if (!guard.ok()) {
+        std::printf("busy\n");
+        return 1;
     }
+    term->write(s);
+    renderer->render(*term);
+    // 計測値もロックの中で読む。外に出すとメインループの render に上書きされる。
     std::printf("wrote %d bytes, redrew %d rows in %u us (draw %u / push %u)\n", (int)s.size(),
                 renderer->last_rows_drawn(), (unsigned)renderer->last_render_us(),
                 (unsigned)renderer->last_draw_us(), (unsigned)renderer->last_push_us());
@@ -197,15 +209,17 @@ int cmd_termtest(int, char**)
 
 int cmd_termscroll(int, char**)
 {
-    {
-        TermGuard guard;
-        for (int i = 0; i < 40; ++i) {
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "scroll line %d あいう\r\n", i);
-            term->write(buf);
-        }
-        renderer->render(*term);
+    TermGuard guard;
+    if (!guard.ok()) {
+        std::printf("busy\n");
+        return 1;
     }
+    for (int i = 0; i < 40; ++i) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "scroll line %d あいう\r\n", i);
+        term->write(buf);
+    }
+    renderer->render(*term);
     std::printf("redrew %d rows in %u us (draw %u / push %u)\n", renderer->last_rows_drawn(),
                 (unsigned)renderer->last_render_us(), (unsigned)renderer->last_draw_us(),
                 (unsigned)renderer->last_push_us());
@@ -884,6 +898,12 @@ int cmd_keytest(int, char**)
 // Panel_DSI は config_detail().buffer でフレームバッファを公開している。
 int cmd_ppatest(int, char**)
 {
+    // フレームバッファに直接書くので、他のタスクの描画と重ならないようにする。
+    TermGuard guard;
+    if (!guard.ok()) {
+        std::printf("busy\n");
+        return 1;
+    }
     auto* panel = static_cast<lgfx::Panel_DSI*>(display.getPanel());
     if (!panel) {
         std::printf("panel is not Panel_DSI\n");
@@ -981,6 +1001,13 @@ int cmd_ppatest(int, char**)
 // 2 つが重なれば変換が正しい。
 int cmd_rottest(int, char**)
 {
+    // rotation を一時的に変えるので、他のタスクが描画しないよう押さえる。
+    // 変えている最中に render されると、スプライトのストライドとタッチ座標がずれる。
+    TermGuard guard;
+    if (!guard.ok()) {
+        std::printf("busy\n");
+        return 1;
+    }
     rot::Panel panel;
     panel.native_w = 720;
     panel.native_h = 1280;
@@ -1013,6 +1040,7 @@ int cmd_rottest(int, char**)
     display.setRotation(1);
     display.drawString("white dots inside circles = ok", 300, 340);
     std::printf("check the screen: white dots must be inside the colored circles\n");
+    std::printf("run `termtest` or type to restore the terminal\n");
     return 0;
 }
 
@@ -1165,17 +1193,22 @@ extern "C" void app_main(void)
         // リモートからの出力を端末に流す。コンソールタスクも term を触るのでロックする。
         {
             TermGuard guard;
-            uint8_t   rx[1024];
-            for (;;) {
-                size_t n = ssh_receive(rx, sizeof(rx));
-                if (n == 0) break;
-                term->write(rx, n);
+            if (guard.ok()) {
+                uint8_t rx[1024];
+                for (;;) {
+                    size_t n = ssh_receive(rx, sizeof(rx));
+                    if (n == 0) break;
+                    term->write(rx, n);
+                }
+                if (term->any_dirty()) renderer->render(*term);
             }
-            if (term->any_dirty()) renderer->render(*term);
         }
 
+        // キーボードの描画も同じロックで守る。PPA は転送のたびにフレームバッファの
+        // キャッシュを無効化するので、M5GFX がキャッシュ経由で描いた内容と競合する。
+        TermGuard touch_guard;
         lgfx::touch_point_t tp;
-        if (display.getTouch(&tp, 1)) {
+        if (touch_guard.ok() && display.getTouch(&tp, 1)) {
             if (!touching) {
                 touching = true;
                 last_x   = tp.x;
@@ -1190,7 +1223,7 @@ extern "C" void app_main(void)
                 last_x = tp.x;
                 last_y = tp.y;
             }
-        } else if (touching) {
+        } else if (touching && touch_guard.ok()) {
             touching = false;
             if (!keyboard->touch_up(last_x, last_y)) {
                 ESP_LOGI(TAG, "touch up");

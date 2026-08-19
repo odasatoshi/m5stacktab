@@ -63,7 +63,11 @@ bool TermRenderer::begin()
 
     // 行スプライトは内蔵 RAM に置く (1280x24x2 = 60KB)。PSRAM に置くと転送が遅くなる。
     row_.setPsram(false);
-    row_.setColorDepth(16);
+    // **rgb565_nonswapped を明示する。** 16 を渡すと M5GFX では swap565
+    // (メモリ上 byte0 = RRRRRGGG) になり、PPA に memcpy で渡すと色が入れ替わる
+    // （赤 0xF800 が暗い青に見える。白と黒はスワップ不変なので気づきにくい）。
+    // パネルも PPA もネイティブのリトルエンディアン RGB565 を期待している。
+    row_.setColorDepth(lgfx::v1::color_depth_t::rgb565_nonswapped);
     row_.setFont(&fonts::efontJA_24);
     row_.setTextDatum(textdatum_t::top_left);
     if (!row_.createSprite(gfx_.width(), cell_h_)) {
@@ -106,12 +110,18 @@ bool TermRenderer::enable_ppa()
     const auto& cfg = panel->config_detail();
     if (!cfg.buffer) return false;
 
-    // フレームバッファはネイティブ向き (720x1280)。M5GFX の rotation とは無関係に
-    // 物理的な並びで置かれている。
-    rot::Panel rp;
+    // フレームバッファはネイティブ向きで、M5GFX の rotation とは無関係に物理的な並びで置かれる。
+    // サイズは決め打ちにせずパネル定義から取る（buffer_length は 0 なので使えない）。
+    // 決め打ちだと、パネル定義が変わったときに PPA が FB の外へ書く。
+    const auto& pcfg = panel->config();
     fb_   = static_cast<uint16_t*>(cfg.buffer);
-    fb_w_ = rp.native_w;
-    fb_h_ = rp.native_h;
+    fb_w_ = pcfg.panel_width;
+    fb_h_ = pcfg.panel_height;
+    if (fb_w_ <= 0 || fb_h_ <= 0) {
+        ESP_LOGW(TAG, "ppa: panel size unavailable (%dx%d)", fb_w_, fb_h_);
+        fb_ = nullptr;
+        return false;
+    }
 
     // PPA の入力は DMA するので 64B 境界の内蔵 RAM に置く。
     row_dma_ = static_cast<uint16_t*>(heap_caps_aligned_alloc(
@@ -145,13 +155,17 @@ bool TermRenderer::push_row_ppa(int y, int x_from, int x_to)
     // スプライトの該当矩形を DMA バッファに詰める（行ごとにストライドが違うのでコピーが必要）。
     const auto* src = static_cast<const uint16_t*>(row_.getBuffer());
     if (!src) return false;
-    const int sprite_w = gfx_.width();
+    // ストライドはスプライト自身の幅から取る。gfx_.width() を使うと、
+    // 誰かが rotation を変えた瞬間にストライドがずれて行が崩れる。
+    const int sprite_w = row_.width();
     for (int r = 0; r < cell_h_; ++r) {
         std::memcpy(row_dma_ + static_cast<size_t>(r) * pw, src + static_cast<size_t>(r) * sprite_w + px,
                     static_cast<size_t>(pw) * 2);
     }
 
     rot::Panel rp;
+    rp.native_w = fb_w_;
+    rp.native_h = fb_h_;
     int nx = 0, ny = 0, nw = 0, nh = 0;
     rot::landscape_rect_to_native(rp, px, py, pw, cell_h_, &nx, &ny, &nw, &nh);
 

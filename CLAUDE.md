@@ -66,6 +66,13 @@ python tools/serial_log.py --seconds 20      # ログ採取
 - **`Panel_DSI::config_detail().buffer_length` は 0 が入っている**（M5GFX が埋めていない）。
   PPA に渡す `out.buffer_size` は自分で計算する（0 だと `ESP_ERR_INVALID_ARG`）
 - PPA の入力は DMA するので **64B 境界の内蔵 RAM** に置く（`heap_caps_aligned_alloc`）
+- **スプライトの色深度に `16` を渡すと M5GFX では swap565 になる**（メモリ上 byte0 = `RRRRRGGG`）。
+  PPA やパネルはネイティブ LE の RGB565 を期待するので、生バイトを渡すと色が入れ替わる
+  （赤が暗い青になる。**白と黒はスワップ不変なので通常のテキストでは気づけない**）。
+  `lgfx::v1::color_depth_t::rgb565_nonswapped` を明示する
+- **PPA は転送のたびに出力側のキャッシュを無効化する**（範囲は `pic_w * block_h * 2` で、
+  フル行だとフレームバッファ全体）。M5GFX がキャッシュ経由で描いた内容と競合するので、
+  **画面に触る経路は全部同じロックで守る**（端末の描画とキーボードの描画を別々に走らせてはいけない）
 - `Panel_DSI` はフレームバッファを `config_detail().buffer` で公開している（`Panel_FrameBufferBase` 派生）
 - **M5GFX の `drawChar(uniCode, x, y)` は使えない**。送り幅は正しく返すが、指定した座標に描かない
   （実機で確認: 別の行に重なって出る）。`drawString` は正常なので、セル描画は
