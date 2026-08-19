@@ -63,6 +63,14 @@ python tools/serial_log.py --seconds 20      # ログ採取
   （実測: 1280x24 の転送が pushSprite 4247us、PPA 924us）。
   そのため座標変換は `components/rotate` で自分で持ち、PPA でフレームバッファへ直接書く。
   実機の `rottest` で M5GFX の rotation 1 と向きが一致することを照合できる
+  （ピクセルを読み戻して自動判定する。目視の「白点が円の中にあれば ok」では
+  **180 度ずれに気づけなかった**。四隅が対角の色を読んでいても円の中には見える）
+- **`rot` の変換と PPA の `rotation_angle` は必ず対で直す**。PPA の角度は反時計回りなので、
+  `landscape_to_native` の時計回り 90 度に対応するのは `PPA_SRM_ROTATION_ANGLE_270`。
+  片方だけ変えるとブロックの位置は合うのに中身が 180 度回る。
+  そして端末は PPA、キーボードは M5GFX の rotation 1 で描くので、食い違うと
+  「端末とキーボードの天地が逆」になる（実機で発生）。
+  M5GFX の `getTouch` も rotation 1 の座標で返すため、端末領域のタッチも一緒にずれる
 - **`Panel_DSI::config_detail().buffer_length` は 0 が入っている**（M5GFX が埋めていない）。
   PPA に渡す `out.buffer_size` は自分で計算する（0 だと `ESP_ERR_INVALID_ARG`）
 - PPA の入力は DMA するので **64B 境界の内蔵 RAM** に置く（`heap_caps_aligned_alloc`）

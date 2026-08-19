@@ -1377,6 +1377,27 @@ int cmd_ppatest(int, char**)
     return err == ESP_OK ? 0 : 1;
 }
 
+// 横向き座標の画素を読む。PPA でフレームバッファに直接書いた内容が
+// 正しい位置・正しい向きに出ているかを、目視なしで確かめるために使う。
+int cmd_pix(int argc, char** argv)
+{
+    if (argc < 3) {
+        std::printf("usage: pix <lx> <ly> [<lx> <ly> ...]   横向き座標の色を読む\n");
+        return 1;
+    }
+    TermGuard guard;
+    if (!guard.ok()) {
+        std::printf("busy\n");
+        return 1;
+    }
+    for (int i = 1; i + 1 < argc; i += 2) {
+        const int lx = atoi(argv[i]);
+        const int ly = atoi(argv[i + 1]);
+        std::printf("  (%4d,%4d) = %04x\n", lx, ly, (unsigned)display.readPixel(lx, ly));
+    }
+    return 0;
+}
+
 // 座標変換が M5GFX の setRotation(1) と同じ向きかを実機で照合する。
 // 横向きの座標に印を描き、rotation 0 に切り替えて計算した位置に別の色で印を描く。
 // 2 つが重なれば変換が正しい。
@@ -1418,11 +1439,45 @@ int cmd_rottest(int, char**)
         std::printf("  %-13s landscape(%4d,%3d) -> native(%3d,%4d)\n", pt.name, pt.lx, pt.ly, nx,
                     ny);
     }
+    // 目視に頼らず、描いたピクセルを読み戻して判定する。
+    // rotation 1 で置いた色が、変換したネイティブ座標にあるかを確かめる。
+    // ここが合っていないと、端末 (PPA + rot) とキーボード (M5GFX rotation 1) の
+    // 向きが 180 度食い違う。見た目では「天地が逆」になる。
     display.setRotation(1);
-    display.drawString("white dots inside circles = ok", 300, 340);
-    std::printf("check the screen: white dots must be inside the colored circles\n");
+    display.fillScreen(TFT_BLACK);
+    for (const auto& pt : pts) display.fillCircle(pt.lx, pt.ly, 18, pt.color);
+    display.setRotation(0);
+    int bad = 0;
+    for (const auto& pt : pts) {
+        int nx = 0, ny = 0;
+        rot::landscape_to_native(panel, pt.lx, pt.ly, &nx, &ny);
+        const uint16_t got = display.readPixel(nx, ny);
+        const bool     ok  = (got == pt.color);
+        if (!ok) ++bad;
+        std::printf("  %-13s landscape(%4d,%3d) -> native(%3d,%4d) want %04x got %04x %s\n",
+                    pt.name, pt.lx, pt.ly, nx, ny, pt.color, got, ok ? "ok" : "MISMATCH");
+    }
+    display.setRotation(1);
+    if (bad == 0) {
+        std::printf("rotation matches setRotation(1): ok\n");
+    } else {
+        // どの向きなら合うのかも出す。原因を当てる手間が要らなくなる。
+        std::printf("rotation MISMATCH (%d/4). 逆向き (nx = native_w-1-ly, ny = lx) を試す:\n", bad);
+        display.setRotation(0);
+        int alt_bad = 0;
+        for (const auto& pt : pts) {
+            const int nx2 = panel.native_w - 1 - pt.ly;
+            const int ny2 = pt.lx;
+            const uint16_t got = display.readPixel(nx2, ny2);
+            if (got != pt.color) ++alt_bad;
+            std::printf("  %-13s native(%3d,%4d) want %04x got %04x\n", pt.name, nx2, ny2,
+                        pt.color, got);
+        }
+        display.setRotation(1);
+        std::printf("  逆向きなら %d/4 一致\n", 4 - alt_bad);
+    }
     std::printf("run `termtest` or type to restore the terminal\n");
-    return 0;
+    return bad == 0 ? 0 : 1;
 }
 
 void register_term_commands()
@@ -1450,6 +1505,7 @@ void register_term_commands()
          &cmd_discoloop, nullptr, nullptr, nullptr},
         {"keytest", "sshkey パーティションの鍵を mbedTLS で直接パースする", nullptr, &cmd_keytest,
          nullptr, nullptr, nullptr},
+        {"pix", "横向き座標の画素の色を読む", "<lx> <ly> ...", &cmd_pix, nullptr, nullptr, nullptr},
         {"rottest", "座標変換が setRotation(1) と一致するか実機で照合", nullptr, &cmd_rottest,
          nullptr, nullptr, nullptr},
         {"ppatest", "PPA でフレームバッファに直接回転転送してみる", nullptr, &cmd_ppatest, nullptr,

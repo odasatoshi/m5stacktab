@@ -32,25 +32,25 @@ void test_corners()
     rot::Panel p;
     int nx = 0, ny = 0;
 
-    // 横向きの左上 → ネイティブの左下側
+    // 横向きの左上 → ネイティブの右上側
     rot::landscape_to_native(p, 0, 0, &nx, &ny);
-    CHECK(nx == 0);
-    CHECK(ny == 1279);
+    CHECK(nx == 719);
+    CHECK(ny == 0);
 
     // 横向きの右上
     rot::landscape_to_native(p, 1279, 0, &nx, &ny);
-    CHECK(nx == 0);
-    CHECK(ny == 0);
-
-    // 横向きの左下
-    rot::landscape_to_native(p, 0, 719, &nx, &ny);
     CHECK(nx == 719);
     CHECK(ny == 1279);
 
+    // 横向きの左下
+    rot::landscape_to_native(p, 0, 719, &nx, &ny);
+    CHECK(nx == 0);
+    CHECK(ny == 0);
+
     // 横向きの右下
     rot::landscape_to_native(p, 1279, 719, &nx, &ny);
-    CHECK(nx == 719);
-    CHECK(ny == 0);
+    CHECK(nx == 0);
+    CHECK(ny == 1279);
 }
 
 void test_round_trip()
@@ -80,12 +80,13 @@ void test_rect()
     rot::landscape_rect_to_native(p, 0, 0, 1280, 24, &nx, &ny, &nw, &nh);
     CHECK(nw == 24);
     CHECK(nh == 1280);
-    CHECK(nx == 0);
+    // 1 行目は右端の縦帯（native x = 720-24 .. 719）
+    CHECK(nx == 720 - 24);
     CHECK(ny == 0);
 
-    // 2 行目（ly = 24）は x が 24 ずれる
+    // 2 行目（ly = 24）は x が 24 手前にずれる
     rot::landscape_rect_to_native(p, 0, 24, 1280, 24, &nx, &ny, &nw, &nh);
-    CHECK(nx == 24);
+    CHECK(nx == 720 - 48);
     CHECK(ny == 0);
     CHECK(nw == 24);
     CHECK(nh == 1280);
@@ -94,9 +95,9 @@ void test_rect()
     rot::landscape_rect_to_native(p, 120, 48, 60, 24, &nx, &ny, &nw, &nh);
     CHECK(nw == 24);
     CHECK(nh == 60);
-    CHECK(nx == 48);
-    // 横向きの x=120..179 は、ネイティブでは y = 1280-1-179 .. 1280-1-120
-    CHECK(ny == 1280 - 1 - 179);
+    // 横向きの y=48..71 は、ネイティブでは x = 720-1-71 .. 720-1-48
+    CHECK(nx == 720 - 1 - 71);
+    CHECK(ny == 120);
 
     // 変換した矩形がネイティブの範囲に収まること
     CHECK(nx >= 0 && nx + nw <= p.native_w);

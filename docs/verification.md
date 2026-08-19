@@ -144,3 +144,36 @@ PR に貼るログは次で採取する。`idf.py monitor` は標準入力が TT
 python tools/serial_log.py --seconds 30 > /tmp/log.txt          # リセットしてから採取
 python tools/serial_log.py --no-reset --seconds 30 > /tmp/l.txt # 動作中の様子を採取
 ```
+
+## 画面の向き
+
+`rottest` はピクセルを読み戻して自動判定するので、目視は要らない。
+
+```sh
+printf 'rottest\r\n' > /dev/cu.usbmodem101
+```
+
+```
+  top-left      landscape(  40, 40) -> native(679,  40) want f800 got f800 ok
+  top-right     landscape(1240, 40) -> native(679,1240) want 07e0 got 07e0 ok
+  bottom-left   landscape(  40,680) -> native( 39,  40) want 001f got 001f ok
+  bottom-right  landscape(1240,680) -> native( 39,1240) want ffe0 got ffe0 ok
+rotation matches setRotation(1): ok
+```
+
+MISMATCH が出たら、逆向きで何個一致するかも出るので原因がすぐ分かる。
+
+端末 (PPA 経路) の位置と向きは `pix` で確かめる。
+
+```sh
+printf 'term \\e[2J\\e[H\\e[41m \\e[42m \\e[mT\r\n' > /dev/cu.usbmodem101
+printf 'pix 6 12 18 12 6 40 26 6 26 18\r\n' > /dev/cu.usbmodem101
+```
+
+```
+  (   6,  12) = c800   セル(0,0) が赤
+  (  18,  12) = 0660   セル(1,0) が緑（赤の右）
+  (   6,  40) = 0000   行 1 は空（行 0 が上）
+  (  26,   6) = e73c   T の横棒はセル上部
+  (  26,  18) = 0000   その下は空
+```

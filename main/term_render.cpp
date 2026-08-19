@@ -184,7 +184,9 @@ bool TermRenderer::push_row_ppa(int y, int x_from, int x_to)
     op.out.block_offset_x  = nx;
     op.out.block_offset_y  = ny;
     op.out.srm_cm          = PPA_SRM_COLOR_MODE_RGB565;
-    op.rotation_angle      = PPA_SRM_ROTATION_ANGLE_90;
+    // PPA の角度は反時計回り。rot の対応は時計回り 90 度なので 270 を渡す。
+    // ここと rotate.cpp は必ず対で直す（片方だけ変えると内容が 180 度回る）。
+    op.rotation_angle      = PPA_SRM_ROTATION_ANGLE_270;
     op.scale_x             = 1.0f;
     op.scale_y             = 1.0f;
     op.mode                = PPA_TRANS_MODE_BLOCKING;
