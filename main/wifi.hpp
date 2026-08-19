@@ -1,12 +1,12 @@
 #pragma once
 #include <esp_err.h>
 
-// ESP32-C6 の電源を入れる。Tab5 では C6 の電源が P4 の GPIO ではなく
-// I2C の IO エクスパンダ (PI4IOE5V6408 @0x44) の pin0 に繋がっている。
-// これを esp_wifi_init() より先にやらないと SDIO の列挙が必ず失敗する。
-esp_err_t tab5_c6_power_on(void);
-
 // NVS に保存済みの SSID / パスワードで STA 接続を開始する。
+//
+// **前提: display.init() (M5GFX の Tab5 初期化) を先に呼んでいること。**
+// Tab5 の C6 電源は P4 の GPIO ではなく I2C の IO エクスパンダ (PI4IOE5V6408 @0x44) の
+// pin0 にあり、M5GFX の Tab5 初期化がそこを出力 High にしている (実機で確認済み)。
+// 電源が入る前に SDIO を叩くと列挙が失敗し、以後リセットもかからず永久に失敗する。
 // 未設定なら接続せずに戻り、シリアルコンソールの `wifi` コマンドを待つ。
 esp_err_t wifi_start(void);
 

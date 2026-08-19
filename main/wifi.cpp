@@ -2,12 +2,13 @@
 
 #include <cstring>
 
-#include <driver/i2c_master.h>
 #include <esp_console.h>
 #include <esp_event.h>
 #include <esp_hosted.h>
 #include <esp_log.h>
+#include <algorithm>
 #include <esp_netif.h>
+#include <esp_timer.h>
 #include <esp_wifi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
@@ -19,19 +20,39 @@ namespace {
 
 const char* TAG = "wifi";
 
-// Tab5 の内部 I2C。BSP の BSP_I2C_SDA / BSP_I2C_SCL と同じ。
-constexpr gpio_num_t kI2cSda = GPIO_NUM_31;
-constexpr gpio_num_t kI2cScl = GPIO_NUM_32;
-
 constexpr const char* kNvsNamespace = "wifi";
 constexpr const char* kNvsKeySsid   = "ssid";
 constexpr const char* kNvsKeyPass   = "pass";
 
-EventGroupHandle_t s_events    = nullptr;
-constexpr int      kConnected  = BIT0;
-bool               s_started   = false;
-int                s_retry     = 0;
-constexpr int      kMaxRetry   = 5;
+EventGroupHandle_t  s_events   = nullptr;
+constexpr int       kConnected = BIT0;
+bool                s_started  = false;
+int                 s_retry    = 0;
+// 自分で切ったときの切断イベントで再接続を走らせないための印。
+bool                s_reconfiguring = false;
+esp_timer_handle_t  s_retry_timer   = nullptr;
+
+// AP の再起動などで一時的に落ちても必ず戻ってくるように、諦めずに指数バックオフで粘る。
+// ネットワーク端末が「5 回失敗したら電源を入れ直すまで永久にオフライン」では使えない。
+void schedule_reconnect()
+{
+    const int shift = std::min(s_retry, 5);
+    const uint32_t delay_ms = std::min<uint32_t>(30000, 500u << shift);
+    if (s_retry_timer) {
+        esp_timer_stop(s_retry_timer);
+        esp_timer_start_once(s_retry_timer, static_cast<uint64_t>(delay_ms) * 1000);
+    }
+    ESP_LOGW(TAG, "reconnect in %u ms (attempt %d)", (unsigned)delay_ms, s_retry);
+}
+
+void retry_timer_cb(void*)
+{
+    esp_err_t err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(err));
+        schedule_reconnect();
+    }
+}
 
 void on_wifi_event(void*, esp_event_base_t base, int32_t id, void* data)
 {
@@ -39,14 +60,15 @@ void on_wifi_event(void*, esp_event_base_t base, int32_t id, void* data)
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         auto* e = static_cast<wifi_event_sta_disconnected_t*>(data);
-        xEventGroupClearBits(s_events, kConnected);
-        if (s_retry < kMaxRetry) {
-            ++s_retry;
-            ESP_LOGW(TAG, "disconnected (reason=%d), retry %d/%d", e->reason, s_retry, kMaxRetry);
-            esp_wifi_connect();
-        } else {
-            ESP_LOGE(TAG, "disconnected (reason=%d), giving up after %d retries", e->reason, kMaxRetry);
+        if (s_events) xEventGroupClearBits(s_events, kConnected);
+        if (s_reconfiguring) {
+            // 設定変更で自分から切ったぶん。次の connect は呼び出し側が出している。
+            s_reconfiguring = false;
+            return;
         }
+        ESP_LOGW(TAG, "disconnected (reason=%d)", e->reason);
+        ++s_retry;
+        schedule_reconnect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         auto* e = static_cast<ip_event_got_ip_t*>(data);
         s_retry = 0;
@@ -86,18 +108,28 @@ esp_err_t save_credentials(const char* ssid, const char* pass)
 
 esp_err_t connect_with(const char* ssid, const char* pass)
 {
+    // ssid[32] / password[64] は最大長では NUL 終端されない仕様なので、配列いっぱいまで入れる。
+    // strncpy に sizeof-1 を渡すと 32 文字 SSID や 64 桁の PSK が 1 バイト切れて必ず失敗する。
     wifi_config_t cfg = {};
-    std::strncpy(reinterpret_cast<char*>(cfg.sta.ssid), ssid, sizeof(cfg.sta.ssid) - 1);
-    std::strncpy(reinterpret_cast<char*>(cfg.sta.password), pass, sizeof(cfg.sta.password) - 1);
-    cfg.sta.threshold.authmode = pass[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    std::memcpy(cfg.sta.ssid, ssid, std::min(std::strlen(ssid), sizeof(cfg.sta.ssid)));
+    std::memcpy(cfg.sta.password, pass, std::min(std::strlen(pass), sizeof(cfg.sta.password)));
+    // 閾値は下限なので WPA2 を指定すると WPA/TKIP のみの AP がスキャン結果から外れる。
+    cfg.sta.threshold.authmode = pass[0] ? WIFI_AUTH_WPA_PSK : WIFI_AUTH_OPEN;
 
     s_retry = 0;
+    if (s_retry_timer) esp_timer_stop(s_retry_timer);
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &cfg), TAG, "set_config");
     if (!s_started) {
         ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi_start");  // STA_START で connect する
         s_started = true;
     } else {
-        esp_wifi_disconnect();
+        // 自分で切った切断イベントで再接続ハンドラが動くと、この connect を潰してしまう。
+        s_reconfiguring = true;
+        esp_err_t err   = esp_wifi_disconnect();
+        if (err != ESP_OK) {
+            s_reconfiguring = false;
+            ESP_LOGW(TAG, "esp_wifi_disconnect: %s", esp_err_to_name(err));
+        }
         ESP_RETURN_ON_ERROR(esp_wifi_connect(), TAG, "connect");
     }
     ESP_LOGI(TAG, "connecting to \"%s\"", ssid);
@@ -118,7 +150,12 @@ int cmd_wifi(int argc, char** argv)
         return 1;
     }
     err = connect_with(ssid, pass);
-    return err == ESP_OK ? 0 : 1;
+    if (err != ESP_OK) {
+        // WiFi 未初期化 (C6 が上がっていない等) はここに来る。黙って 1 を返すと理由が分からない。
+        std::printf("connect failed: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+    return 0;
 }
 
 int cmd_wifi_status(int, char**)
@@ -138,68 +175,21 @@ int cmd_wifi_status(int, char**)
 
 }  // namespace
 
-esp_err_t tab5_c6_power_on(void)
-{
-    // PI4IOE5V6408 @0x44 の pin0 が WLAN_PWR_EN。
-    // 専用ドライバ (esp_io_expander_pi4ioe5v6408) は使わない:
-    //   - set_dir が Hi-Z レジスタ (0x07) を解除しないので、出力方向にしても電流が出ない
-    //     (このチップは既定で全ピン Hi-Z)
-    //   - 初期化でチップリセットを撃つので、他のピン (USB 5V など) の設定も飛ぶ
-    // 触るのは 3 レジスタの bit0 だけなので read-modify-write で済ませる。
-    constexpr uint8_t kAddr     = 0x44;
-    constexpr uint8_t kRegIoDir = 0x03;  // 1 = 出力
-    constexpr uint8_t kRegOut   = 0x05;  // 出力レベル
-    constexpr uint8_t kRegHiZ   = 0x07;  // 1 = Hi-Z (出力を切り離す)
-    constexpr uint8_t kWlanBit  = 1 << 0;
-
-    i2c_master_bus_config_t bus_cfg = {};
-    bus_cfg.i2c_port                     = I2C_NUM_0;
-    bus_cfg.sda_io_num                   = kI2cSda;
-    bus_cfg.scl_io_num                   = kI2cScl;
-    bus_cfg.clk_source                   = I2C_CLK_SRC_DEFAULT;
-    bus_cfg.glitch_ignore_cnt            = 7;
-    bus_cfg.flags.enable_internal_pullup = true;
-
-    i2c_master_bus_handle_t bus = nullptr;
-    ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bus_cfg, &bus), TAG, "i2c_new_master_bus");
-
-    i2c_device_config_t dev_cfg = {};
-    dev_cfg.dev_addr_length     = I2C_ADDR_BIT_LEN_7;
-    dev_cfg.device_address      = kAddr;
-    dev_cfg.scl_speed_hz        = 100000;
-
-    i2c_master_dev_handle_t dev = nullptr;
-    esp_err_t err = i2c_master_bus_add_device(bus, &dev_cfg, &dev);
-
-    auto update = [&](uint8_t reg, uint8_t set_mask, uint8_t clear_mask) -> esp_err_t {
-        uint8_t v = 0;
-        ESP_RETURN_ON_ERROR(i2c_master_transmit_receive(dev, &reg, 1, &v, 1, 100), TAG,
-                            "read reg 0x%02x", reg);
-        uint8_t next[2] = {reg, static_cast<uint8_t>((v | set_mask) & ~clear_mask)};
-        return i2c_master_transmit(dev, next, sizeof(next), 100);
-    };
-
-    if (err == ESP_OK) err = update(kRegIoDir, kWlanBit, 0);         // 出力にする
-    if (err == ESP_OK) err = update(kRegHiZ, 0, kWlanBit);           // Hi-Z を解除する
-    if (err == ESP_OK) err = update(kRegOut, kWlanBit, 0);           // High = 電源 ON
-
-    if (dev) i2c_master_bus_rm_device(dev);
-    // M5GFX がタッチ IC のために同じ I2C を自前で扱うので、バスは掴んだままにしない。
-    i2c_del_master_bus(bus);
-
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "C6 power on failed: %s", esp_err_to_name(err));
-        return err;
-    }
-    ESP_LOGI(TAG, "C6 power enabled (PI4IOE5V6408@0x44 pin0, Hi-Z cleared)");
-    // C6 のブートを待つ。esp-hosted が SDIO を叩く前に立ち上がっている必要がある。
-    vTaskDelay(pdMS_TO_TICKS(500));
-    return ESP_OK;
-}
-
 esp_err_t wifi_start(void)
 {
-    if (!s_events) s_events = xEventGroupCreate();
+    if (!s_events) {
+        s_events = xEventGroupCreate();
+        if (!s_events) {
+            ESP_LOGE(TAG, "xEventGroupCreate failed");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (!s_retry_timer) {
+        const esp_timer_create_args_t args = {
+            .callback = &retry_timer_cb, .arg = nullptr,
+            .dispatch_method = ESP_TIMER_TASK, .name = "wifi_retry", .skip_unhandled_events = true};
+        ESP_RETURN_ON_ERROR(esp_timer_create(&args, &s_retry_timer), TAG, "timer_create");
+    }
 
     // 自動初期化を切っているので、C6 の電源が入ったこの時点で明示的に立ち上げる。
     int rc = esp_hosted_init();
@@ -263,6 +253,8 @@ esp_err_t console_start(void)
         .hint     = "<ssid> [password]",
         .func     = &cmd_wifi,
         .argtable = nullptr,
+        .func_w_context = nullptr,
+        .context = nullptr,
     };
     ESP_RETURN_ON_ERROR(esp_console_cmd_register(&wifi_cmd), TAG, "reg wifi cmd");
 
@@ -272,6 +264,8 @@ esp_err_t console_start(void)
         .hint     = nullptr,
         .func     = &cmd_wifi_status,
         .argtable = nullptr,
+        .func_w_context = nullptr,
+        .context = nullptr,
     };
     ESP_RETURN_ON_ERROR(esp_console_cmd_register(&status_cmd), TAG, "reg status cmd");
 

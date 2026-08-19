@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <string>
 
 #include <M5GFX.h>
 #include <esp_chip_info.h>
@@ -142,12 +143,63 @@ int cmd_termscroll(int, char**)
     return 0;
 }
 
+// フォント描画の切り分け用。どの経路でグリフが壊れるかを画面で見る。
+int cmd_fonttest(int, char**)
+{
+    display.fillScreen(TFT_BLACK);
+    display.setFont(&fonts::efontJA_24);
+    display.setTextColor(TFT_WHITE, TFT_BLACK);
+
+    const char* sample = "ABCあいう漢字123";
+
+    display.drawString("1 drawString(gfx)", 10, 10);
+    display.drawString(sample, 320, 10);
+
+    // drawChar を直接。戻り値は送り幅なので、それも表示する。
+    display.drawString("2 drawChar(gfx)", 10, 40);
+    int      x   = 320;
+    uint32_t cps[] = {'A', 'B', 'C', 0x3042, 0x3044, 0x3046, 0x6F22, 0x5B57, '1', '2', '3'};
+    std::string widths;
+    for (uint32_t cp : cps) {
+        size_t w = display.drawChar(static_cast<uint16_t>(cp), x, 40);
+        x += (int)w;
+        widths += std::to_string((int)w) + " ";
+    }
+    display.drawString(("3 advance: " + widths).c_str(), 10, 70);
+
+    display.drawString("4 print(gfx)", 10, 100);
+    display.setCursor(320, 100);
+    display.print(sample);
+
+    // スプライト経由 (renderer と同じ経路)
+    M5Canvas sp(&display);
+    sp.setPsram(false);
+    sp.setColorDepth(16);
+    sp.setFont(&fonts::efontJA_24);
+    if (sp.createSprite(900, 30)) {
+        sp.fillSprite(TFT_NAVY);
+        sp.setTextColor(TFT_WHITE, TFT_NAVY);
+        sp.drawString(sample, 0, 0);
+        int sx = 300;
+        for (uint32_t cp : cps) sx += (int)sp.drawChar(static_cast<uint16_t>(cp), sx, 0);
+        sp.pushSprite(320, 130);
+        sp.deleteSprite();
+    }
+    display.drawString("5 sprite drawString+drawChar", 10, 130);
+
+    std::printf("fontWidth=%d fontHeight=%d textWidth(A)=%d textWidth(sample)=%d\n",
+                (int)display.fontWidth(), (int)display.fontHeight(), (int)display.textWidth("A"),
+                (int)display.textWidth(sample));
+    return 0;
+}
+
 void register_term_commands()
 {
     const esp_console_cmd_t cmds[] = {
-        {"term", "端末に文字列を流し込む (\\e で ESC)", "<text>", &cmd_term, nullptr},
-        {"termtest", "色・全角・装飾のテストパターンを描画する", nullptr, &cmd_termtest, nullptr},
-        {"termscroll", "40 行流してスクロールを見る", nullptr, &cmd_termscroll, nullptr},
+        {"term", "端末に文字列を流し込む (\\e で ESC)", "<text>", &cmd_term, nullptr, nullptr, nullptr},
+        {"termtest", "色・全角・装飾のテストパターンを描画する", nullptr, &cmd_termtest, nullptr, nullptr, nullptr},
+        {"termscroll", "40 行流してスクロールを見る", nullptr, &cmd_termscroll, nullptr, nullptr, nullptr},
+        {"fonttest", "フォント描画経路の切り分け", nullptr, &cmd_fonttest, nullptr, nullptr, nullptr},
     };
     for (const auto& c : cmds) ESP_ERROR_CHECK_WITHOUT_ABORT(esp_console_cmd_register(&c));
 }
@@ -196,10 +248,9 @@ extern "C" void app_main(void)
              renderer->last_rows_drawn(), (unsigned)renderer->last_render_us(),
              (unsigned)renderer->last_draw_us(), (unsigned)renderer->last_push_us());
 
-    // WiFi。C6 の電源投入は esp_wifi_init() より前でなければならない。
-    if (tab5_c6_power_on() == ESP_OK) {
-        esp_err_t err = wifi_start();
-        if (err != ESP_OK) ESP_LOGE(TAG, "wifi_start failed: %s", esp_err_to_name(err));
+    // WiFi。display.init() が C6 の電源 (IO エクスパンダ経由) を入れているので、必ずこの後。
+    if (esp_err_t err = wifi_start(); err != ESP_OK) {
+        ESP_LOGE(TAG, "wifi_start failed: %s", esp_err_to_name(err));
     }
     ESP_ERROR_CHECK_WITHOUT_ABORT(console_start());
     register_term_commands();

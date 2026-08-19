@@ -64,13 +64,21 @@ python tools/serial_log.py --seconds 20      # ログ採取
   全画面書き換えは 111ms（≒9fps）。差分更新なら 1 行 4ms で足りる。
   横向きのまま速くするには ESP32-P4 の PPA (Pixel Processing Accelerator) で回転させる必要がある → #16
 - `Panel_DSI` はフレームバッファを `config_detail().buffer` で公開している（`Panel_FrameBufferBase` 派生）
-- P4 に WiFi は無い。ESP32-C6 を esp-hosted (SDIO) 経由で使う。ここに罠が 2 つある:
-  - **C6 の電源は I2C の IO エクスパンダ (PI4IOE5V6408 @0x44) の pin0**。しかもこのチップは
-    既定で全ピン Hi-Z なので、方向を出力にするだけでは電流が出ない。**Hi-Z レジスタ (0x07) の
-    該当ビットを 0 にする**必要がある（`esp_io_expander_pi4ioe5v6408` ドライバはこれをやらない）
+- **M5GFX の `drawChar(uniCode, x, y)` は使えない**。送り幅は正しく返すが、指定した座標に描かない
+  （実機で確認: 別の行に重なって出る）。`drawString` は正常なので、セル描画は
+  「同じ見た目が続く区間を UTF-8 文字列にまとめて `drawString`」でやる。まとめる分だけ速くもなる
+- P4 に WiFi は無い。ESP32-C6 を esp-hosted (SDIO) 経由で使う。**順序が決定的に重要**:
+  - C6 の電源は P4 の GPIO ではなく I2C の IO エクスパンダ (PI4IOE5V6408 @0x44) の pin0 にある。
+    ここは **`display.init()` (M5GFX の Tab5 初期化) が出力 High にしている**（実機で確認）。
+    つまり自分で叩く必要はないが、**必ず display.init() を先に呼ぶ**こと
   - esp_hosted は既定で `__attribute__((constructor))` により **app_main より前に** SDIO を
-    叩き始める。C6 の電源が入る前に列挙が失敗し、以後リセットもかからず永久に失敗する。
-    `CONFIG_ESP_HOSTED_AUTO_CALL_INIT_BEFORE_APP_MAIN=n` にして順序を自分で作る
+    叩き始める。C6 の電源が入る前に列挙が失敗し (`send_op_cond returned 0x107`)、
+    以後リセットもかからず永久に失敗する。
+    `CONFIG_ESP_HOSTED_AUTO_CALL_INIT_BEFORE_APP_MAIN=n` にして、
+    「display.init() → esp_hosted_init() → connect_to_slave() → esp_wifi_init()」の順を自分で作る
+  - GPIO31/32 の I2C は M5GFX が `I2C_NUM_1` で握っている。別のポートで同じピンに
+    `i2c_new_master_bus` すると GPIO マトリクスの出力選択を奪い合うので、
+    このピンを触りたいときは M5GFX 側の I2C を使う
 - `CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM` は有効にしない。TX mempool の 1600B ストライドが
   128B キャッシュラインと合わず CMD53 がアライメント検査で弾かれる
 

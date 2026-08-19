@@ -1,6 +1,7 @@
 #include "term_render.hpp"
 
 #include <algorithm>
+#include <string>
 
 #include <esp_log.h>
 #include <esp_timer.h>
@@ -56,6 +57,7 @@ bool TermRenderer::begin()
     row_.setPsram(false);
     row_.setColorDepth(16);
     row_.setFont(&fonts::efontJA_24);
+    row_.setTextDatum(textdatum_t::top_left);
     if (!row_.createSprite(gfx_.width(), cell_h_)) {
         ESP_LOGE(TAG, "row sprite alloc failed (%dx%d)", (int)gfx_.width(), cell_h_);
         return false;
@@ -66,6 +68,27 @@ bool TermRenderer::begin()
     return true;
 }
 
+namespace {
+
+void append_utf8(std::string& out, uint32_t cp)
+{
+    if (cp < 0x80) {
+        out += static_cast<char>(cp);
+    } else if (cp < 0x800) {
+        out += static_cast<char>(0xC0 | (cp >> 6));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        out += static_cast<char>(0xE0 | (cp >> 12));
+        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else {
+        // efont は BMP までなので下駄記号にする。
+        append_utf8(out, 0x3013);
+    }
+}
+
+}  // namespace
+
 void TermRenderer::draw_row(vt::Terminal& term, int y)
 {
     const int64_t t_draw = esp_timer_get_time();
@@ -74,44 +97,67 @@ void TermRenderer::draw_row(vt::Terminal& term, int y)
     const bool cursor_here = term.cursor_visible() && y == term.cursor_y();
     const int  cursor_x    = term.cursor_x();
 
-    for (int x = 0; x < cols_; ++x) {
-        const vt::Cell& c = term.cell(x, y);
-        if (c.width == 0) continue;  // 全角の右半分は左半分が描いている
+    // 同じ見た目が続く区間をまとめて 1 回の drawString で描く。
+    // drawChar は指定した座標に描いてくれない (advance は正しいが位置が効かない) ので使わない。
+    int x = 0;
+    while (x < cols_) {
+        const vt::Cell& head = term.cell(x, y);
+        if (head.width == 0) {  // 孤立した右半分（通常ここには来ない）
+            ++x;
+            continue;
+        }
 
-        uint16_t fg = pal_[c.attr.fg];
-        uint16_t bg = pal_[c.attr.bg];
+        auto effective = [&](int cx, const vt::Cell& c, uint16_t& fg, uint16_t& bg) {
+            fg = pal_[c.attr.fg];
+            bg = pal_[c.attr.bg];
+            // 太字は明色化する (専用のボールドフォントは無い)。xterm 系と同じ扱い。
+            if ((c.attr.flags & vt::kBold) && c.attr.fg < 8) fg = pal_[c.attr.fg + 8];
+            const bool reverse = (c.attr.flags & vt::kReverse) != 0;
+            // カーソルは反転ブロック。反転属性と重なったら二重反転で元に戻る。
+            const bool on_cursor =
+                cursor_here && (cx == cursor_x || (c.width == 2 && cx + 1 == cursor_x));
+            if (reverse != on_cursor) std::swap(fg, bg);
+        };
 
-        // 太字は明色化する (専用のボールドフォントは無い)。xterm 系と同じ扱い。
-        if ((c.attr.flags & vt::kBold) && c.attr.fg < 8) fg = pal_[c.attr.fg + 8];
+        uint16_t fg = 0, bg = 0;
+        effective(x, head, fg, bg);
+        const uint16_t flags = head.attr.flags & (vt::kUnderline | vt::kStrike | vt::kInvisible);
 
-        const bool reverse = (c.attr.flags & vt::kReverse) != 0;
-        // カーソルは反転ブロック。反転属性と重なったら二重反転で元に戻る。
-        const bool on_cursor = cursor_here && (x == cursor_x || (c.width == 2 && x + 1 == cursor_x));
-        if (reverse != on_cursor) std::swap(fg, bg);
+        const int start_x = x;
+        std::string run;
+        while (x < cols_) {
+            const vt::Cell& c = term.cell(x, y);
+            if (c.width == 0) {
+                ++x;
+                continue;
+            }
+            uint16_t cfg = 0, cbg = 0;
+            effective(x, c, cfg, cbg);
+            if (cfg != fg || cbg != bg ||
+                (c.attr.flags & (vt::kUnderline | vt::kStrike | vt::kInvisible)) != flags) {
+                break;
+            }
+            append_utf8(run, (c.ch == 0) ? ' ' : c.ch);
+            x += c.width;
+        }
+        if (run.empty()) continue;
 
-        const int px = x * cell_w_;
+        const int px    = start_x * cell_w_;
+        const int width = (x - start_x) * cell_w_;
 
-        // 既定背景のまま・空白・装飾なしなら fillSprite の結果で足りる。
-        const bool plain_blank = (c.ch == ' ' || c.ch == 0) &&
-                                 bg == pal_[vt::kDefaultBg] &&
-                                 (c.attr.flags & (vt::kUnderline | vt::kStrike)) == 0;
-        if (plain_blank) continue;
+        // 既定背景のまま・空白だけ・装飾なしなら fillSprite の結果で足りる。
+        const bool all_blank = run.find_first_not_of(' ') == std::string::npos;
+        if (all_blank && bg == pal_[vt::kDefaultBg] && flags == 0) continue;
 
-        row_.fillRect(px, 0, cell_w_ * c.width, cell_h_, bg);
-
-        if ((c.attr.flags & vt::kInvisible) == 0 && c.ch != ' ' && c.ch != 0) {
+        row_.fillRect(px, 0, width, cell_h_, bg);
+        if (!all_blank && (flags & vt::kInvisible) == 0) {
             row_.setTextColor(fg, bg);
-            // drawChar は BMP (16bit) までなので、それ以外は下駄にする。
-            uint16_t glyph = (c.ch <= 0xFFFF) ? static_cast<uint16_t>(c.ch) : 0x3013;
-            row_.drawChar(glyph, px, 0);
+            row_.drawString(run.c_str(), px, 0);
         }
-        if (c.attr.flags & vt::kUnderline) {
-            row_.drawFastHLine(px, cell_h_ - 2, cell_w_ * c.width, fg);
-        }
-        if (c.attr.flags & vt::kStrike) {
-            row_.drawFastHLine(px, cell_h_ / 2, cell_w_ * c.width, fg);
-        }
+        if (flags & vt::kUnderline) row_.drawFastHLine(px, cell_h_ - 2, width, fg);
+        if (flags & vt::kStrike) row_.drawFastHLine(px, cell_h_ / 2, width, fg);
     }
+
     const int64_t t_push = esp_timer_get_time();
     last_draw_us_ += static_cast<uint32_t>(t_push - t_draw);
     row_.pushSprite(0, y * cell_h_);
