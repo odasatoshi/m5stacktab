@@ -33,8 +33,30 @@ ESP32-P4 搭載 M5Stack Tab5 用ファームウェア。ESP-IDF (C/C++)。
 
 ## 環境
 
+- ESP-IDF v5.5.1 (esp32p4)
 - 実機: `/dev/cu.usbmodem101`（Espressif USB JTAG serial debug unit）
 - ホスト: macOS (Apple Silicon)
+
+## ビルドと実機確認
+
+```sh
+source ~/esp/esp-idf/export.sh
+idf.py build
+idf.py -p /dev/cu.usbmodem101 flash
+python tools/serial_log.py --seconds 20      # ログ採取
+```
+
+`idf.py monitor` は標準入力が TTY でないと動かないので、非対話環境では
+`tools/serial_log.py` を使う（RTS でリセットしてから指定秒数だけ拾う）。
+
+## ハード由来のハマりどころ
+
+- **PSRAM は 200MHz が必須**。ESP32-P4 のデフォルトは 20MHz で、1280x720 の MIPI-DSI が
+  フレームバッファを PSRAM から読み切れず `lcd.dsi.dpi: ... underrun happens` が出続ける。
+  `CONFIG_SPIRAM_SPEED_200M` は `CONFIG_IDF_EXPERIMENTAL_FEATURES` に依存するので、
+  依存も一緒に有効にしないと黙って 20MHz に落ちる
+- パネルはネイティブ縦 (720x1280)。横で使うなら `setRotation(1)`
+- P4 に WiFi は無い。ESP32-C6 を esp-hosted (SDIO) 経由で使う
 
 ## コード方針
 
