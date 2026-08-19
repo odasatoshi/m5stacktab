@@ -28,7 +28,7 @@ void KeyboardUi::begin(int height)
     // 空いた右側は候補表示に使う。
     constexpr int kMaxKeyW = 160;
     ime::FlickLayout l;
-    l.width  = std::min(gfx_.width(), kMaxKeyW * 4);
+    l.width  = std::min<int>(gfx_.width(), kMaxKeyW * 4);
     l.x      = (gfx_.width() - l.width) / 2;
     l.y      = gfx_.height() - height_ + status_h_;
     l.height = height_ - status_h_;
