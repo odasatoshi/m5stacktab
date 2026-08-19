@@ -13,10 +13,10 @@ jobs:
       - uses: actions/checkout@v4
 
       # WireGuard の暗号テストは mbedTLS 3.x を使う（4.x では ChaCha20-Poly1305 が private API）。
-      - name: install mbedtls
+      - name: install mbedtls and cjson
         run: |
           sudo apt-get update
-          sudo apt-get install -y libmbedtls-dev
+          sudo apt-get install -y libmbedtls-dev libcjson-dev
           dpkg -s libmbedtls-dev | grep -i version
 
       # Linux では AddressSanitizer も併用する（macOS の開発機では起動時に固まるため外している）。
@@ -47,6 +47,35 @@ jobs:
               components/wg/noise.cpp components/wg/blake2s.cpp \
               components/wg/crypto_mbedtls.cpp components/wg/transport.cpp -lmbedcrypto
           /tmp/test_noise
+
+      - name: tailscale ts2021 noise
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \
+              -I components/wg -I components/ts -o /tmp/test_ts \
+              components/ts/test_ts_noise.cpp components/ts/ts_noise.cpp \
+              components/wg/noise.cpp components/wg/blake2s.cpp \
+              components/wg/crypto_mbedtls.cpp -lmbedcrypto
+          /tmp/test_ts
+
+      - name: http/2 minimal client
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \
+              -I components/ts -o /tmp/test_h2 components/ts/test_h2.cpp components/ts/h2.cpp
+          /tmp/test_h2
+
+      - name: ts2021 control plane helpers
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \
+              -I components/ts -o /tmp/test_ctrl components/ts/test_ts_control.cpp \
+              components/ts/ts_control.cpp -lmbedcrypto
+          /tmp/test_ctrl
+
+      - name: netmap parser
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \
+              -I components/ts -I/usr/include/cjson -o /tmp/test_nm \
+              components/ts/test_netmap.cpp components/ts/netmap.cpp -lcjson
+          /tmp/test_nm
 
       # 辞書ビルドスクリプトが壊れていないかを小さい辞書で確認する（ネットワークは使わない）。
       - name: dictionary builder

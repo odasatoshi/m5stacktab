@@ -18,11 +18,14 @@
 #include <freertos/task.h>
 #include <nvs_flash.h>
 
+#include <esp_netif.h>
 #include <esp_partition.h>
+#include <nvs.h>
 
 #include "romaji.hpp"
 #include "skk_dict.hpp"
 #include "ssh.hpp"
+#include "ts_client.hpp"
 #include "blake2s.hpp"
 #include "kbd_ui.hpp"
 #include "noise.hpp"
@@ -472,6 +475,98 @@ int cmd_wgtest(int, char**)
     return 0;
 }
 
+// Tailscale / Headscale の制御プレーンに繋いでみる。
+// 鍵は NVS に保存して再利用する（毎回新しい鍵だとノードが増え続ける）。
+int cmd_ts(int argc, char** argv)
+{
+    if (argc < 3) {
+        std::printf("usage: ts <host> <authkey> [port] [capver]\n");
+        return 1;
+    }
+    // machine / node / disco の 3 つは別の鍵にする（役割ごとに分離する）。
+    static uint8_t machine_priv[32], node_priv[32], disco_priv[32];
+    nvs_handle_t   nvs;
+    bool           have_keys = false;
+    if (nvs_open("ts", NVS_READWRITE, &nvs) == ESP_OK) {
+        auto load = [&](const char* key, uint8_t* out) {
+            size_t len = 32;
+            return nvs_get_blob(nvs, key, out, &len) == ESP_OK && len == 32;
+        };
+        have_keys = load("mkey", machine_priv) && load("nkey", node_priv) &&
+                    load("dkey", disco_priv);
+        if (!have_keys) {
+            const auto& c = wg::default_crypto();
+            if (!c.random_bytes(machine_priv, 32) || !c.random_bytes(node_priv, 32) ||
+                !c.random_bytes(disco_priv, 32)) {
+                std::printf("key generation failed (no entropy)\n");
+                nvs_close(nvs);
+                return 1;
+            }
+            // 保存に失敗したら黙って続けない。毎回新しい鍵で登録するとノードが増え続ける。
+            esp_err_t err = nvs_set_blob(nvs, "mkey", machine_priv, 32);
+            if (err == ESP_OK) err = nvs_set_blob(nvs, "nkey", node_priv, 32);
+            if (err == ESP_OK) err = nvs_set_blob(nvs, "dkey", disco_priv, 32);
+            if (err == ESP_OK) err = nvs_commit(nvs);
+            if (err != ESP_OK) {
+                std::printf("could not save keys: %s (refusing to register with throwaway keys)\n",
+                            esp_err_to_name(err));
+                nvs_close(nvs);
+                return 1;
+            }
+            std::printf("generated and saved new machine/node/disco keys\n");
+            have_keys = true;
+        }
+        nvs_close(nvs);
+    }
+    if (!have_keys) {
+        std::printf("could not load or create keys\n");
+        return 1;
+    }
+
+    static ts::Client client;
+    ts::ClientConfig  cfg;
+    cfg.host     = argv[1];
+    cfg.auth_key = argv[2];
+    cfg.port     = (argc > 3) ? static_cast<uint16_t>(atoi(argv[3])) : 80;
+    cfg.capability_version = (argc > 4) ? static_cast<uint16_t>(atoi(argv[4])) : 131;
+    cfg.hostname = "m5stack-tab5";
+    // 自分のエンドポイント（STUN を実装していないので LAN アドレスのみ申告する）
+    esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif) {
+        esp_netif_ip_info_t ip{};
+        if (esp_netif_get_ip_info(netif, &ip) == ESP_OK) {
+            char ep[32];
+            std::snprintf(ep, sizeof(ep), IPSTR ":41641", IP2STR(&ip.ip));
+            cfg.endpoints.push_back(ep);
+        }
+    }
+    if (!client.set_keys(machine_priv, node_priv, disco_priv)) {
+        std::printf("public key derivation failed\n");
+        return 1;
+    }
+    client.set_config(cfg);
+
+    std::printf("connecting to %s:%u (capver %u)...\n", cfg.host.c_str(), cfg.port,
+                cfg.capability_version);
+    const int64_t t0 = esp_timer_get_time();
+    const bool    ok = client.run_once();
+    const auto&   st = client.status();
+    std::printf("result: %s (%lld ms)\n", ok ? "ok" : "failed", (esp_timer_get_time() - t0) / 1000);
+    // REPL タスクのスタックがどこまで減ったか（X25519 と HTTP/2 のバッファが重なる経路）。
+    std::printf("  console task stack headroom: %u bytes\n",
+                (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+    std::printf("  state=%d registered=%d map_messages=%u keepalives=%u\n", (int)st.state,
+                st.registered ? 1 : 0, (unsigned)st.map_messages, (unsigned)st.keepalives);
+    if (!st.assigned_address.empty()) {
+        std::printf("  >>> assigned address: %s\n", st.assigned_address.c_str());
+        std::string line = "\r\n\033[32mtailscale: " + st.assigned_address + "\033[m\r\n";
+        term->write(line);
+        renderer->render(*term);
+    }
+    if (!st.error.empty()) std::printf("  error: %s\n", st.error.c_str());
+    return ok ? 0 : 1;
+}
+
 void register_term_commands()
 {
     const esp_console_cmd_t cmds[] = {
@@ -491,6 +586,8 @@ void register_term_commands()
         {"kbd", "画面キーボードの表示切り替え", "[off]", &cmd_kbd, nullptr, nullptr, nullptr},
         {"wgtest", "WireGuard の暗号とハンドシェイクを実機で検証", nullptr, &cmd_wgtest, nullptr,
          nullptr, nullptr},
+        {"ts", "Tailscale/Headscale の制御プレーンに接続", "<host> <authkey> [port] [capver]",
+         &cmd_ts, nullptr, nullptr, nullptr},
     };
     for (const auto& c : cmds) ESP_ERROR_CHECK_WITHOUT_ABORT(esp_console_cmd_register(&c));
 }

@@ -1,11 +1,10 @@
-// Noise IK が使う暗号プリミティブを mbedTLS で実装する。
-// ホストでも実機でも同じコードを使う（ホストでは Homebrew の mbedtls をリンクする）。
+// Noise が使う暗号プリミティブを mbedTLS で実装する。
+// ホストでも実機でも同じコードを使う（ホストは brew の mbedtls@3、実機は ESP-IDF 同梱）。
 #include <cstdint>
 #include <cstring>
 
 #include <mbedtls/chachapoly.h>
 #include <mbedtls/ctr_drbg.h>
-#include <mbedtls/ecdh.h>
 #include <mbedtls/ecp.h>
 #include <mbedtls/entropy.h>
 
@@ -16,7 +15,7 @@ namespace {
 
 mbedtls_ctr_drbg_context& drbg();
 
-// X25519 の秘密鍵は 32 バイトのスカラー。mbedTLS の ECP を使う。
+// X25519。mbedTLS の公開 API だけを使う（構造体の内部メンバには触らない）。
 bool x25519(uint8_t out[kKeyLen], const uint8_t priv[kKeyLen], const uint8_t pub[kKeyLen])
 {
     mbedtls_ecp_group grp;
@@ -31,15 +30,14 @@ bool x25519(uint8_t out[kKeyLen], const uint8_t priv[kKeyLen], const uint8_t pub
     do {
         if (mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_CURVE25519) != 0) break;
 
-        // X25519 のスカラークランプ (RFC 7748 5)。mbedtls_ecp_mul はこれをやらない。
+        // スカラークランプ (RFC 7748 5)。mbedtls_ecp_mul はこれをやらない。
         uint8_t k[kKeyLen];
         std::memcpy(k, priv, kKeyLen);
         k[0] &= 248;
         k[31] &= 127;
         k[31] |= 64;
 
-        // Curve25519 のスカラーと座標はリトルエンディアン。専用 API を使えば
-        // 構造体の内部メンバ (MBEDTLS_PRIVATE) に触らずに済む。
+        // Curve25519 のスカラーと座標はリトルエンディアン。
         if (mbedtls_mpi_read_binary_le(&d, k, kKeyLen) != 0) break;
         if (mbedtls_ecp_point_read_binary(&grp, &Q, pub, kKeyLen) != 0) break;
 
@@ -73,41 +71,69 @@ bool x25519_pubkey(uint8_t out[kKeyLen], const uint8_t priv[kKeyLen])
     return x25519(out, priv, base);
 }
 
-// nonce は 4 バイトのゼロ + 8 バイトのカウンタ (little endian)。WireGuard の定義。
-void make_nonce(uint8_t nonce[12], uint64_t counter)
+// nonce は 4 バイトのゼロ + 8 バイトのカウンタ。
+// WireGuard はリトルエンディアン、Tailscale の ts2021 はビッグエンディアン。
+void make_nonce(uint8_t nonce[12], uint64_t counter, bool big_endian)
 {
     std::memset(nonce, 0, 4);
-    for (int i = 0; i < 8; ++i) nonce[4 + i] = static_cast<uint8_t>(counter >> (8 * i));
+    for (int i = 0; i < 8; ++i) {
+        const int shift = big_endian ? (8 * (7 - i)) : (8 * i);
+        nonce[4 + i]    = static_cast<uint8_t>(counter >> shift);
+    }
+}
+
+bool aead_seal(uint8_t* out, const uint8_t key[kKeyLen], uint64_t counter, bool be,
+               const uint8_t* plain, size_t plain_len, const uint8_t* ad, size_t ad_len)
+{
+    uint8_t nonce[12];
+    make_nonce(nonce, counter, be);
+    mbedtls_chachapoly_context ctx;
+    mbedtls_chachapoly_init(&ctx);
+    const bool ok = mbedtls_chachapoly_setkey(&ctx, key) == 0 &&
+                    mbedtls_chachapoly_encrypt_and_tag(&ctx, plain_len, nonce, ad, ad_len, plain,
+                                                       out, out + plain_len) == 0;
+    mbedtls_chachapoly_free(&ctx);
+    return ok;
+}
+
+bool aead_open(uint8_t* out, const uint8_t key[kKeyLen], uint64_t counter, bool be,
+               const uint8_t* cipher, size_t cipher_len, const uint8_t* ad, size_t ad_len)
+{
+    if (cipher_len < kTagLen) return false;
+    const size_t plain_len = cipher_len - kTagLen;
+    uint8_t      nonce[12];
+    make_nonce(nonce, counter, be);
+    mbedtls_chachapoly_context ctx;
+    mbedtls_chachapoly_init(&ctx);
+    const bool ok = mbedtls_chachapoly_setkey(&ctx, key) == 0 &&
+                    mbedtls_chachapoly_auth_decrypt(&ctx, plain_len, nonce, ad, ad_len,
+                                                    cipher + plain_len, cipher, out) == 0;
+    mbedtls_chachapoly_free(&ctx);
+    return ok;
 }
 
 bool aead_encrypt(uint8_t* out, const uint8_t key[kKeyLen], uint64_t counter,
                   const uint8_t* plain, size_t plain_len, const uint8_t* ad, size_t ad_len)
 {
-    uint8_t nonce[12];
-    make_nonce(nonce, counter);
-    mbedtls_chachapoly_context ctx;
-    mbedtls_chachapoly_init(&ctx);
-    bool ok = mbedtls_chachapoly_setkey(&ctx, key) == 0 &&
-              mbedtls_chachapoly_encrypt_and_tag(&ctx, plain_len, nonce, ad, ad_len, plain, out,
-                                                 out + plain_len) == 0;
-    mbedtls_chachapoly_free(&ctx);
-    return ok;
+    return aead_seal(out, key, counter, /*be=*/false, plain, plain_len, ad, ad_len);
 }
 
 bool aead_decrypt(uint8_t* out, const uint8_t key[kKeyLen], uint64_t counter,
                   const uint8_t* cipher, size_t cipher_len, const uint8_t* ad, size_t ad_len)
 {
-    if (cipher_len < kTagLen) return false;
-    const size_t plain_len = cipher_len - kTagLen;
-    uint8_t      nonce[12];
-    make_nonce(nonce, counter);
-    mbedtls_chachapoly_context ctx;
-    mbedtls_chachapoly_init(&ctx);
-    bool ok = mbedtls_chachapoly_setkey(&ctx, key) == 0 &&
-              mbedtls_chachapoly_auth_decrypt(&ctx, plain_len, nonce, ad, ad_len,
-                                              cipher + plain_len, cipher, out) == 0;
-    mbedtls_chachapoly_free(&ctx);
-    return ok;
+    return aead_open(out, key, counter, /*be=*/false, cipher, cipher_len, ad, ad_len);
+}
+
+bool aead_encrypt_be(uint8_t* out, const uint8_t key[kKeyLen], uint64_t counter,
+                     const uint8_t* plain, size_t plain_len, const uint8_t* ad, size_t ad_len)
+{
+    return aead_seal(out, key, counter, /*be=*/true, plain, plain_len, ad, ad_len);
+}
+
+bool aead_decrypt_be(uint8_t* out, const uint8_t key[kKeyLen], uint64_t counter,
+                     const uint8_t* cipher, size_t cipher_len, const uint8_t* ad, size_t ad_len)
+{
+    return aead_open(out, key, counter, /*be=*/true, cipher, cipher_len, ad, ad_len);
 }
 
 mbedtls_ctr_drbg_context& drbg()
@@ -119,8 +145,7 @@ mbedtls_ctr_drbg_context& drbg()
         mbedtls_ctr_drbg_init(&ctr);
         mbedtls_entropy_init(&entropy);
         static const char* pers = "wg-noise";
-        // シードに失敗したら inited を立てない。立ててしまうと以後ずっと無言で
-        // 使えない DRBG を返し続けることになる。
+        // シードに失敗したら inited を立てない。立てると以後ずっと無言で壊れた DRBG を返す。
         if (mbedtls_ctr_drbg_seed(&ctr, mbedtls_entropy_func, &entropy,
                                   reinterpret_cast<const unsigned char*>(pers),
                                   std::strlen(pers)) == 0) {
@@ -142,7 +167,8 @@ bool random_bytes(uint8_t* out, size_t len)
 }
 
 const Crypto kCrypto = {
-    &x25519, &x25519_pubkey, &aead_encrypt, &aead_decrypt, &random_bytes,
+    &x25519, &x25519_pubkey, &aead_encrypt, &aead_decrypt, &aead_encrypt_be, &aead_decrypt_be,
+    &random_bytes,
 };
 
 }  // namespace
