@@ -260,6 +260,25 @@ bool json_find_bool(const std::string& json, const char* key, bool* out)
     return false;
 }
 
+bool json_find_first_in_array(const std::string& json, const char* key, std::string* out)
+{
+    const std::string pattern = std::string("\"") + key + "\":";
+    size_t            pos     = json.find(pattern);
+    if (pos == std::string::npos) return false;
+    pos += pattern.size();
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) ++pos;
+    if (pos >= json.size() || json[pos] != '[') return false;
+    ++pos;
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) ++pos;
+    if (pos >= json.size() || json[pos] != '"') return false;
+    ++pos;
+    const size_t start = pos;
+    while (pos < json.size() && json[pos] != '"') ++pos;
+    if (pos >= json.size()) return false;
+    if (out) *out = json.substr(start, pos - start);
+    return true;
+}
+
 RegisterResult parse_register_response(const std::string& json)
 {
     RegisterResult r;

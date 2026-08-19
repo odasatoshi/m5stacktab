@@ -69,6 +69,10 @@ std::string build_map_request(const MapParams& p);
 bool json_find_string(const std::string& json, const char* key, std::string* out);
 bool json_find_bool(const std::string& json, const char* key, bool* out);
 
+// ネストした配列から最初の文字列を取り出す（"Addresses":["100.64.0.1/32", ...] 用）。
+// cJSON を入れる前の最小実装。オブジェクトの入れ子は追わない。
+bool json_find_first_in_array(const std::string& json, const char* key, std::string* out);
+
 struct RegisterResult {
     bool        machine_authorized = false;
     bool        node_key_expired   = false;
