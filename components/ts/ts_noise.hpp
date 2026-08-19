@@ -103,7 +103,16 @@ private:
 
 // EarlyNoise（Noise 確立直後、HTTP/2 の前に来ることがある）。
 // 先頭が "\xff\xff\xffTS" + uint32 BE 長 なら EarlyNoise、そうでなければ HTTP/2 の開始。
-// 戻り値: EarlyNoise だったら true。json に中身を入れ、consumed に消費バイト数を返す。
-bool parse_early_noise(const uint8_t* in, size_t len, std::string* json, size_t* consumed);
+//
+// 「EarlyNoise ではない」と「EarlyNoise だがまだ届いていない」を区別する。
+// 混同すると、分割して届いたときに HTTP/2 を先に送ってしまい、
+// \xff\xff\xff... が HTTP/2 のフレーム長として読まれて永久にストールする。
+enum class EarlyNoiseResult {
+    kNotPresent,   // HTTP/2 が始まっている
+    kIncomplete,   // マジックは一致したが本体がまだ来ていない
+    kFound,
+};
+EarlyNoiseResult parse_early_noise(const uint8_t* in, size_t len, std::string* json,
+                                   size_t* consumed);
 
 }  // namespace ts

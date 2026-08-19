@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstring>
 
+#include <cerrno>
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -35,8 +36,13 @@ int connect_tcp(const char* host, uint16_t port, int timeout_sec)
     addrinfo* res     = nullptr;
     if (getaddrinfo(host, port_str, &hints, &res) != 0 || !res) return -1;
 
-    int fd = socket(res->ai_family, res->ai_socktype, 0);
-    if (fd >= 0 && connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
+    // 候補を順に試す。最初の 1 件で諦めると、AAAA が先に返る環境で
+    // IPv6 の経路が無いだけで失敗してしまう。
+    int fd = -1;
+    for (addrinfo* ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, 0);
+        if (fd < 0) continue;
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
         close(fd);
         fd = -1;
     }
@@ -46,6 +52,9 @@ int connect_tcp(const char* host, uint16_t port, int timeout_sec)
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         timeval tv{timeout_sec, 0};
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        // 送信側にも期限を入れる。入れないと相手が読まないときに永久にブロックする。
+        timeval snd{15, 0};
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd, sizeof(snd));
     }
     return fd;
 }
@@ -64,11 +73,22 @@ bool send_all(int fd, const void* p, size_t len)
 
 }  // namespace
 
-void Client::set_keys(const uint8_t machine_priv[32], const uint8_t node_priv[32])
+bool Client::set_keys(const uint8_t machine_priv[32], const uint8_t node_priv[32],
+                      const uint8_t disco_priv[32])
 {
+    const auto& c = wg::default_crypto();
     std::memcpy(machine_priv_, machine_priv, 32);
     std::memcpy(node_priv_, node_priv, 32);
-    wg::default_crypto().dh_pubkey(node_pub_, node_priv_);
+    if (!c.dh_pubkey(node_pub_, node_priv_)) return false;
+
+    // disco key は node key とは別にする。同じにすると disco の秘密鍵が
+    // WireGuard の秘密鍵と一致してしまい、鍵分離が失われる。
+    uint8_t tmp[32];
+    if (!disco_priv) {
+        if (!c.random_bytes(tmp, 32)) return false;
+        disco_priv = tmp;
+    }
+    return c.dh_pubkey(disco_pub_, disco_priv);
 }
 
 // /key?v=<capver> から Noise 公開鍵を取る。平文 HTTP で良い（鍵は公開情報）。
@@ -187,7 +207,24 @@ bool Client::run_once()
     // ヘッダの後ろに msg2 が続いていることが多いので捨てない。
     in.erase(in.begin(), in.begin() + static_cast<long>(up.header_len));
 
-    while (in.size() < kResponseLen) {
+    // エラーレコード (type 3) は 51 バイトより短い。先に判定しないと
+    // 「51 バイト待つ → 切断」でサーバの説明を捨ててしまう。
+    for (;;) {
+        if (in.size() >= 3 && in[0] == kMsgError) {
+            const size_t elen = static_cast<size_t>((in[1] << 8) | in[2]);
+            while (in.size() < 3 + elen) {
+                uint8_t       buf[512];
+                const ssize_t r = recv(fd, buf, sizeof(buf), 0);
+                if (r <= 0) break;
+                in.insert(in.end(), buf, buf + r);
+            }
+            const size_t avail = (in.size() > 3) ? std::min(elen, in.size() - 3) : 0;
+            st_.error = "server rejected the handshake: " +
+                        std::string(reinterpret_cast<const char*>(in.data() + 3), avail);
+            st_.state = ClientStatus::State::kFailed;
+            return false;
+        }
+        if (in.size() >= kResponseLen) break;
         uint8_t       buf[2048];
         const ssize_t r = recv(fd, buf, sizeof(buf), 0);
         if (r <= 0) {
@@ -196,13 +233,6 @@ bool Client::run_once()
             return false;
         }
         in.insert(in.end(), buf, buf + r);
-    }
-    if (in[0] == kMsgError) {
-        const size_t len = static_cast<size_t>((in[1] << 8) | in[2]);
-        st_.error = "server error: " + std::string(reinterpret_cast<const char*>(in.data() + 3),
-                                                  std::min(len, in.size() - 3));
-        st_.state = ClientStatus::State::kFailed;
-        return false;
     }
     Session sess{};
     if (!hs.consume_response(in.data(), sess)) {
@@ -215,22 +245,59 @@ bool Client::run_once()
     Record rec(c);
     rec.set_session(sess);
 
+    // 受信バッファには上限を設ける。設けないとサーバが送るだけでヒープが枯渇する。
+    constexpr size_t kMaxBuffered = 256 * 1024;
+
     std::vector<uint8_t> plain;
     auto pump = [&](int timeout_ms) -> bool {
+        // まず溜まっている分を処理する。recv を先に呼ぶと、既にバッファにある
+        // レコードを扱う前にタイムアウト分だけ待ってしまう。
+        bool progressed = false;
+        for (;;) {
+            uint8_t      out[kMaxPlaintextLen];
+            size_t       consumed = 0;
+            const size_t got = rec.open(out, sizeof(out), in.data(), in.size(), &consumed);
+            if (consumed == SIZE_MAX) {
+                st_.error = "record decrypt failed";
+                return false;
+            }
+            if (consumed == 0) break;
+            in.erase(in.begin(), in.begin() + static_cast<long>(consumed));
+            plain.insert(plain.end(), out, out + got);
+            progressed = true;
+        }
+        if (progressed) return true;
+
         timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         uint8_t       buf[2048];
         const ssize_t r = recv(fd, buf, sizeof(buf), 0);
-        if (r > 0) {
-            in.insert(in.end(), buf, buf + r);
-        } else if (r == 0) {
-            return false;  // 切断
+        if (r == 0) {
+            st_.error = "connection closed by peer";
+            return false;
+        }
+        if (r < 0) {
+            // タイムアウトだけを続行扱いにする。他のエラーで回し続けると
+            // 死んだソケットで CPU を焼き、しかも「稼働中」と誤認する。
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                st_.error = std::string("recv failed: ") + std::strerror(errno);
+                return false;
+            }
+            return true;
+        }
+        in.insert(in.end(), buf, buf + r);
+        if (in.size() > kMaxBuffered || plain.size() > kMaxBuffered) {
+            st_.error = "receive buffer limit exceeded";
+            return false;
         }
         for (;;) {
             uint8_t      out[kMaxPlaintextLen];
             size_t       consumed = 0;
             const size_t got = rec.open(out, sizeof(out), in.data(), in.size(), &consumed);
-            if (consumed == SIZE_MAX) return false;
+            if (consumed == SIZE_MAX) {
+                st_.error = "record decrypt failed";
+                return false;
+            }
             if (consumed == 0) break;
             in.erase(in.begin(), in.begin() + static_cast<long>(consumed));
             plain.insert(plain.end(), out, out + got);
@@ -250,17 +317,23 @@ bool Client::run_once()
         return true;
     };
 
-    // EarlyNoise（来ないこともある）
-    if (!pump(3000)) {
-        st_.error = "closed after noise handshake";
-        st_.state = ClientStatus::State::kFailed;
-        return false;
-    }
-    {
-        std::string json;
-        size_t      consumed = 0;
-        if (parse_early_noise(plain.data(), plain.size(), &json, &consumed)) {
+    // EarlyNoise（来ないこともある）。「来ない」と「まだ届いていない」を区別して、
+    // 途中まで届いている場合は残りを待つ。混同すると HTTP/2 を先に送ってしまい、
+    // \xff\xff\xff... がフレーム長として読まれて永久にストールする。
+    for (int i = 0; i < 5; ++i) {
+        const auto r = parse_early_noise(plain.data(), plain.size(), nullptr, nullptr);
+        if (r == EarlyNoiseResult::kFound) {
+            std::string json;
+            size_t      consumed = 0;
+            parse_early_noise(plain.data(), plain.size(), &json, &consumed);
             plain.erase(plain.begin(), plain.begin() + static_cast<long>(consumed));
+            break;
+        }
+        if (r == EarlyNoiseResult::kNotPresent && !plain.empty()) break;  // HTTP/2 が始まっている
+        if (!pump(1000)) {
+            st_.error = st_.error.empty() ? "closed after noise handshake" : st_.error;
+            st_.state = ClientStatus::State::kFailed;
+            return false;
         }
     }
 
@@ -276,9 +349,10 @@ bool Client::run_once()
     }
 
     // 受信フレームを処理しながら、必要な ACK を返す。
-    std::string body_register, framed_map_owner;
+    std::string          body_register;
     std::vector<uint8_t> map_stream;
     bool                 sent_register = false, sent_map = false;
+    bool                 register_done = false;   // stream 1 に END_STREAM が来たか
 
     auto handle_frames = [&]() -> bool {
         size_t off = 0;
@@ -307,8 +381,17 @@ bool Client::run_once()
                     if (f.stream_id == kStreamRegister) {
                         body_register.append(reinterpret_cast<const char*>(f.payload),
                                              f.payload_len);
+                        if (f.flags & kFlagEndStream) register_done = true;
+                        if (body_register.size() > kMaxBuffered) {
+                            st_.error = "register response too large";
+                            return false;
+                        }
                     } else if (f.stream_id == kStreamMap) {
                         map_stream.insert(map_stream.end(), f.payload, f.payload + f.payload_len);
+                        if (map_stream.size() > kMaxBuffered) {
+                            st_.error = "netmap buffer limit exceeded";
+                            return false;
+                        }
                     }
                     // 受信ウィンドウを返す。これを送らないと 64KB で止まる。
                     if (f.payload_len > 0) {
@@ -322,11 +405,27 @@ bool Client::run_once()
                     }
                     break;
                 }
+                case H2Type::kHeaders:
+                    // 応答ステータスを見る。404/500 を素通りさせると、本文が JSON でないために
+                    // 「machine not authorized」のような誤ったエラーになる。
+                    if (!h2_headers_is_status_200(f.payload, f.payload_len)) {
+                        st_.error = "control plane returned a non-200 status";
+                        return false;
+                    }
+                    if ((f.flags & kFlagEndStream) && f.stream_id == kStreamRegister) {
+                        register_done = true;
+                    }
+                    break;
+                case H2Type::kRstStream:
+                    // long-poll のストリームを切られたら再接続が必要。放置すると
+                    // 何も受け取らないまま「稼働中」を続けてしまう。
+                    st_.error = "server reset the stream";
+                    return false;
                 case H2Type::kGoaway:
                     st_.error = "server sent GOAWAY";
                     return false;
                 default:
-                    break;  // HEADERS / WINDOW_UPDATE / RST_STREAM は読み捨てて良い
+                    break;  // WINDOW_UPDATE などは読み捨てて良い
             }
         }
         plain.erase(plain.begin(), plain.begin() + static_cast<long>(off));
@@ -368,7 +467,9 @@ bool Client::run_once()
             continue;
         }
 
-        if (!st_.registered && !body_register.empty()) {
+        // 本文が複数の DATA に分かれることがあるので END_STREAM を待つ。
+        // 途中の JSON を解析すると必ず失敗する。
+        if (!st_.registered && register_done && !body_register.empty()) {
             const auto rr = parse_register_response(body_register);
             if (!rr.error.empty()) {
                 st_.error = "register rejected: " + rr.error;
@@ -393,7 +494,7 @@ bool Client::run_once()
             MapParams mp;
             mp.capability_version = cfg_.capability_version;
             mp.node_key           = key_to_string("nodekey:", node_pub_);
-            mp.disco_key          = key_to_string("discokey:", node_pub_);
+            mp.disco_key          = key_to_string("discokey:", disco_pub_);
             mp.hostname           = cfg_.hostname;
             mp.endpoints          = cfg_.endpoints;
             mp.stream             = true;

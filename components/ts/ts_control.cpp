@@ -130,12 +130,27 @@ UpgradeResult parse_upgrade_response(const char* in, size_t len)
     r.header_len            = static_cast<size_t>(end - in);
     const size_t header_len = r.header_len;
 
-    // "HTTP/1.1 101 ..." を読む
+    // "HTTP/1.1 101 ..." を読む。
+    // atoi をそのまま使うと、数字が無いステータス行で len を越えて読み進む
+    // （ネットワークから来るバイト列なので範囲外読み込みになる）。
     if (header_len < 12 || std::memcmp(in, "HTTP/1.", 7) != 0) {
         r.status = UpgradeResult::Status::kBadStatus;
         return r;
     }
-    r.http_status = std::atoi(in + 9);
+    {
+        char digits[8] = {};
+        size_t n = 0;
+        size_t i = 9;
+        while (i < header_len && in[i] == ' ') ++i;
+        while (i < header_len && in[i] >= '0' && in[i] <= '9' && n + 1 < sizeof(digits)) {
+            digits[n++] = in[i++];
+        }
+        if (n == 0) {
+            r.status = UpgradeResult::Status::kBadStatus;
+            return r;
+        }
+        r.http_status = std::atoi(digits);
+    }
     if (r.http_status != 101) {
         r.status = UpgradeResult::Status::kBadStatus;
         return r;

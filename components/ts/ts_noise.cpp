@@ -262,21 +262,23 @@ size_t Record::open(uint8_t* out, size_t out_cap, const uint8_t* in, size_t len,
     return plain_len;  // 0 バイトのレコードも合法
 }
 
-bool parse_early_noise(const uint8_t* in, size_t len, std::string* json, size_t* consumed)
+EarlyNoiseResult parse_early_noise(const uint8_t* in, size_t len, std::string* json,
+                                   size_t* consumed)
 {
     if (consumed) *consumed = 0;
     // "\xff\xff\xffTS" + uint32 BE 長
     static const uint8_t kMagic[5] = {0xff, 0xff, 0xff, 'T', 'S'};
-    if (len < sizeof(kMagic)) return false;
-    if (std::memcmp(in, kMagic, sizeof(kMagic)) != 0) return false;  // HTTP/2 の開始
-    if (len < 9) return false;  // 長さがまだ来ていない（呼び出し側がもっと読む）
+    const size_t         cmp_len   = (len < sizeof(kMagic)) ? len : sizeof(kMagic);
+    if (std::memcmp(in, kMagic, cmp_len) != 0) return EarlyNoiseResult::kNotPresent;
+    // ここまで一致していて長さが足りないなら、続きを待つ必要がある。
+    if (len < 9) return EarlyNoiseResult::kIncomplete;
 
     const uint32_t json_len = load_be32(in + 5);
-    if (json_len > kMaxPlaintextLen) return false;
-    if (len < 9 + json_len) return false;
+    if (json_len > kMaxPlaintextLen) return EarlyNoiseResult::kNotPresent;  // 壊れている
+    if (len < 9 + json_len) return EarlyNoiseResult::kIncomplete;
     if (json) json->assign(reinterpret_cast<const char*>(in + 9), json_len);
     if (consumed) *consumed = 9 + json_len;
-    return true;
+    return EarlyNoiseResult::kFound;
 }
 
 }  // namespace ts

@@ -280,17 +280,31 @@ void test_early_noise()
 
     std::string got;
     size_t      consumed = 0;
-    CHECK(ts::parse_early_noise(buf.data(), buf.size(), &got, &consumed));
+    CHECK(ts::parse_early_noise(buf.data(), buf.size(), &got, &consumed) ==
+          ts::EarlyNoiseResult::kFound);
     CHECK(got == json);
     CHECK(consumed == buf.size());
 
-    // 途中までしか来ていなければ false（もっと読む必要がある）
-    CHECK(!ts::parse_early_noise(buf.data(), 7, &got, &consumed));
+    // 「まだ届いていない」と「EarlyNoise ではない」は区別する。
+    // 混同すると HTTP/2 を先に送ってしまい、\xff\xff\xff... がフレーム長として読まれる。
+    CHECK(ts::parse_early_noise(buf.data(), 7, &got, &consumed) ==
+          ts::EarlyNoiseResult::kIncomplete);
     CHECK(consumed == 0);
+    // マジックの途中まで（3 バイト）でも「まだ判断できない」
+    CHECK(ts::parse_early_noise(buf.data(), 3, &got, &consumed) ==
+          ts::EarlyNoiseResult::kIncomplete);
+    // 本体が途中まで
+    CHECK(ts::parse_early_noise(buf.data(), buf.size() - 5, &got, &consumed) ==
+          ts::EarlyNoiseResult::kIncomplete);
 
     // HTTP/2 の SETTINGS フレームは EarlyNoise ではない
     const uint8_t h2[9] = {0, 0, 0, 0x04, 0, 0, 0, 0, 0};
-    CHECK(!ts::parse_early_noise(h2, sizeof(h2), &got, &consumed));
+    CHECK(ts::parse_early_noise(h2, sizeof(h2), &got, &consumed) ==
+          ts::EarlyNoiseResult::kNotPresent);
+    // 長さが異常な値なら壊れているとみなす（待ち続けない）
+    std::vector<uint8_t> bad = {0xff, 0xff, 0xff, 'T', 'S', 0xff, 0xff, 0xff, 0xff};
+    CHECK(ts::parse_early_noise(bad.data(), bad.size(), &got, &consumed) ==
+          ts::EarlyNoiseResult::kNotPresent);
 }
 
 }  // namespace

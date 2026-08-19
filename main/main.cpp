@@ -483,26 +483,37 @@ int cmd_ts(int argc, char** argv)
         std::printf("usage: ts <host> <authkey> [port] [capver]\n");
         return 1;
     }
-    static uint8_t machine_priv[32], node_priv[32];
+    // machine / node / disco の 3 つは別の鍵にする（役割ごとに分離する）。
+    static uint8_t machine_priv[32], node_priv[32], disco_priv[32];
     nvs_handle_t   nvs;
     bool           have_keys = false;
     if (nvs_open("ts", NVS_READWRITE, &nvs) == ESP_OK) {
-        size_t len = 32;
-        if (nvs_get_blob(nvs, "mkey", machine_priv, &len) == ESP_OK && len == 32) {
-            len = 32;
-            have_keys = (nvs_get_blob(nvs, "nkey", node_priv, &len) == ESP_OK && len == 32);
-        }
+        auto load = [&](const char* key, uint8_t* out) {
+            size_t len = 32;
+            return nvs_get_blob(nvs, key, out, &len) == ESP_OK && len == 32;
+        };
+        have_keys = load("mkey", machine_priv) && load("nkey", node_priv) &&
+                    load("dkey", disco_priv);
         if (!have_keys) {
             const auto& c = wg::default_crypto();
-            if (!c.random_bytes(machine_priv, 32) || !c.random_bytes(node_priv, 32)) {
+            if (!c.random_bytes(machine_priv, 32) || !c.random_bytes(node_priv, 32) ||
+                !c.random_bytes(disco_priv, 32)) {
                 std::printf("key generation failed (no entropy)\n");
                 nvs_close(nvs);
                 return 1;
             }
-            nvs_set_blob(nvs, "mkey", machine_priv, 32);
-            nvs_set_blob(nvs, "nkey", node_priv, 32);
-            nvs_commit(nvs);
-            std::printf("generated new machine/node keys\n");
+            // 保存に失敗したら黙って続けない。毎回新しい鍵で登録するとノードが増え続ける。
+            esp_err_t err = nvs_set_blob(nvs, "mkey", machine_priv, 32);
+            if (err == ESP_OK) err = nvs_set_blob(nvs, "nkey", node_priv, 32);
+            if (err == ESP_OK) err = nvs_set_blob(nvs, "dkey", disco_priv, 32);
+            if (err == ESP_OK) err = nvs_commit(nvs);
+            if (err != ESP_OK) {
+                std::printf("could not save keys: %s (refusing to register with throwaway keys)\n",
+                            esp_err_to_name(err));
+                nvs_close(nvs);
+                return 1;
+            }
+            std::printf("generated and saved new machine/node/disco keys\n");
             have_keys = true;
         }
         nvs_close(nvs);
@@ -529,7 +540,10 @@ int cmd_ts(int argc, char** argv)
             cfg.endpoints.push_back(ep);
         }
     }
-    client.set_keys(machine_priv, node_priv);
+    if (!client.set_keys(machine_priv, node_priv, disco_priv)) {
+        std::printf("public key derivation failed\n");
+        return 1;
+    }
     client.set_config(cfg);
 
     std::printf("connecting to %s:%u (capver %u)...\n", cfg.host.c_str(), cfg.port,
@@ -538,6 +552,9 @@ int cmd_ts(int argc, char** argv)
     const bool    ok = client.run_once();
     const auto&   st = client.status();
     std::printf("result: %s (%lld ms)\n", ok ? "ok" : "failed", (esp_timer_get_time() - t0) / 1000);
+    // REPL タスクのスタックがどこまで減ったか（X25519 と HTTP/2 のバッファが重なる経路）。
+    std::printf("  console task stack headroom: %u bytes\n",
+                (unsigned)uxTaskGetStackHighWaterMark(nullptr));
     std::printf("  state=%d registered=%d map_messages=%u keepalives=%u\n", (int)st.state,
                 st.registered ? 1 : 0, (unsigned)st.map_messages, (unsigned)st.keepalives);
     if (!st.assigned_address.empty()) {

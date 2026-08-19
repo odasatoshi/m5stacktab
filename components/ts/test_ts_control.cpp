@@ -263,6 +263,39 @@ void test_json_extract()
     CHECK(!ts::json_find_string("{\"a\":\"unterminated", "a", &out));
 }
 
+// レビュー指摘の回帰テスト。
+void test_review_regressions()
+{
+    // ステータス行に数字が無い応答で、バッファ外を読まないこと。
+    // 以前は atoi(in + 9) が len を越えて数字を探しに行き、ガードページで落ちた。
+    {
+        const char kNoDigits[] = "HTTP/1.1\r\n\r\n";
+        // 意図的に NUL 終端に頼らない長さを渡す
+        auto r = ts::parse_upgrade_response(kNoDigits, sizeof(kNoDigits) - 1);
+        CHECK(r.status == ts::UpgradeResult::Status::kBadStatus);
+    }
+    // 数字が途中で切れていても範囲内で止まる
+    {
+        const char kPartial[] = "HTTP/1.1 10";
+        auto r = ts::parse_upgrade_response(kPartial, sizeof(kPartial) - 1);
+        // ヘッダ終端が無いので kIncomplete
+        CHECK(r.status == ts::UpgradeResult::Status::kIncomplete);
+    }
+    // 3 桁を超える値でも溢れない
+    {
+        const std::string weird = "HTTP/1.1 1010101010101010 X\r\n\r\n";
+        auto r = ts::parse_upgrade_response(weird.c_str(), weird.size());
+        CHECK(r.status == ts::UpgradeResult::Status::kBadStatus);
+    }
+    // 余分な空白があっても読める
+    {
+        const std::string sp = "HTTP/1.1   101 Switching\r\nUpgrade: tailscale-control-protocol\r\n\r\n";
+        auto r = ts::parse_upgrade_response(sp.c_str(), sp.size());
+        CHECK(r.http_status == 101);
+        CHECK(r.status == ts::UpgradeResult::Status::kOk);
+    }
+}
+
 }  // namespace
 
 int main()
@@ -274,6 +307,7 @@ int main()
     test_register_request();
     test_map_request();
     test_json_extract();
+    test_review_regressions();
     std::printf("ok: %d checks passed\n", g_checks);
     return 0;
 }

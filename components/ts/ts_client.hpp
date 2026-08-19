@@ -44,8 +44,12 @@ struct ClientStatus {
 
 class Client {
 public:
-    // machine key と node key は呼び出し側が持つ（NVS に保存して再利用する）。
-    void set_keys(const uint8_t machine_priv[32], const uint8_t node_priv[32]);
+    // machine key / node key / disco key は呼び出し側が持つ（NVS に保存して再利用する）。
+    // **3 つは別の鍵にする**。同じ鍵を複数の役割に使うと鍵分離が失われる。
+    // disco key を省略（nullptr）すると起動ごとの一時鍵を作る。
+    // 公開鍵の導出に失敗したら false（そのまま進むと nodekey:0000... で登録してしまう）。
+    bool set_keys(const uint8_t machine_priv[32], const uint8_t node_priv[32],
+                  const uint8_t disco_priv[32] = nullptr);
     void set_config(const ClientConfig& cfg) { cfg_ = cfg; }
 
     // netmap を受け取ったときに呼ばれる（生の JSON）。ピア情報の解析は呼び出し側。
@@ -68,6 +72,7 @@ private:
     uint8_t      machine_priv_[32] = {};
     uint8_t      node_priv_[32]    = {};
     uint8_t      node_pub_[32]     = {};
+    uint8_t      disco_pub_[32]    = {};
     volatile bool stop_            = false;
     std::function<void(const std::string&)> on_map_;
 };
