@@ -34,74 +34,91 @@ uint32_t load_le32(const uint8_t* p)
 
 }  // namespace
 
-void Transport::set_keypair(const Keypair& kp)
+void Transport::set_keypair(const Keypair& kp, bool confirmed)
 {
-    kp_           = kp;
-    ready_        = true;
-    send_counter_ = 0;
-    recv_max_     = 0;
-    replay_drops_ = 0;
-    std::memset(window_, 0, sizeof(window_));
+    // 今の世代を 1 つ前に降格する。捨ててしまうと、相手がまだ古い鍵で送っている間の
+    // パケットが全部復号できなくなる（rekey が交差すると数秒間そうなる）。
+    if (cur_.valid) prev_ = cur_;
+
+    cur_              = SessionState{};
+    cur_.kp           = kp;
+    cur_.valid        = true;
+    cur_.confirmed    = confirmed;
+    cur_.send_counter = 0;
+    cur_.recv_max     = 0;
+    std::memset(cur_.window, 0, sizeof(cur_.window));
+}
+
+SessionState* Transport::sending_session()
+{
+    // 現世代の確認が取れていて有効ならそれで送る。
+    if (cur_.valid && cur_.confirmed) return &cur_;
+    // 応答側で確認前なら、相手が知っている 1 つ前の鍵で送る。
+    if (prev_.valid) return &prev_;
+    if (cur_.valid) return &cur_;
+    return nullptr;
 }
 
 size_t Transport::encrypt(uint8_t* out, size_t out_cap, const uint8_t* plain, size_t len)
 {
-    if (!ready_) return 0;
+    SessionState* s = sending_session();
+    if (!s) return 0;
     const size_t need = kTransportHeader + len + kTagLen;
     if (out_cap < need) return 0;
     // カウンタは 2^64-1 まで。ここに達したら鍵を作り直すべきなので送らない。
-    if (send_counter_ == UINT64_MAX) return 0;
+    if (s->send_counter == UINT64_MAX) return 0;
 
     std::memset(out, 0, kTransportHeader);
     out[0] = kMsgTransport;
-    store_le32(out + 4, kp_.remote_index);
-    store_le64(out + 8, send_counter_);
+    store_le32(out + 4, s->kp.remote_index);
+    store_le64(out + 8, s->send_counter);
 
-    if (!c_.aead_encrypt(out + kTransportHeader, kp_.send, send_counter_, plain, len, nullptr, 0)) {
+    if (!c_.aead_encrypt(out + kTransportHeader, s->kp.send, s->send_counter, plain, len, nullptr,
+                        0)) {
         return 0;
     }
-    ++send_counter_;
+    ++s->send_counter;
     return need;
 }
 
-bool Transport::check_replay(uint64_t counter)
+bool Transport::check_replay(SessionState& s, uint64_t counter)
 {
-    if (counter >= recv_max_ + kReplayWindow) {
+    if (counter >= s.recv_max + kReplayWindow) {
         // 遥か先のカウンタ: ウィンドウを丸ごと進める。
-        std::memset(window_, 0, sizeof(window_));
-        recv_max_ = counter;
-        window_[0] |= 1;  // bit0 = recv_max_ 自身
+        std::memset(s.window, 0, sizeof(s.window));
+        s.recv_max = counter;
+        s.window[0] |= 1;  // bit0 = recv_max 自身
         return true;
     }
-    if (counter > recv_max_) {
+    if (counter > s.recv_max) {
         // ウィンドウを差分だけシフトする。
-        const uint64_t shift = counter - recv_max_;
+        const uint64_t shift = counter - s.recv_max;
         const size_t   words = static_cast<size_t>(shift / 64);
         const unsigned bits  = static_cast<unsigned>(shift % 64);
         constexpr size_t n   = kReplayWindow / 64;
         if (words >= n) {
-            std::memset(window_, 0, sizeof(window_));
+            std::memset(s.window, 0, sizeof(s.window));
         } else {
             for (size_t i = n; i-- > 0;) {
-                uint64_t v = (i >= words) ? window_[i - words] : 0;
+                uint64_t v = (i >= words) ? s.window[i - words] : 0;
                 if (bits && i >= words) {
-                    const uint64_t lower = (i > words) ? window_[i - words - 1] : 0;
+                    const uint64_t lower = (i > words) ? s.window[i - words - 1] : 0;
                     v = (v << bits) | (bits ? (lower >> (64 - bits)) : 0);
                 }
-                window_[i] = v;
+                s.window[i] = v;
             }
         }
-        recv_max_ = counter;
-        window_[0] |= 1;
+        s.recv_max = counter;
+        s.window[0] |= 1;
         return true;
     }
-    // counter <= recv_max_: ウィンドウ内なら重複チェック、外なら古すぎるので捨てる。
-    const uint64_t back = recv_max_ - counter;
+    // counter <= recv_max: ウィンドウ内なら重複チェック、外なら古すぎるので捨てる。
+    const uint64_t back = s.recv_max - counter;
     if (back >= kReplayWindow) return false;
     const size_t   idx = static_cast<size_t>(back / 64);
     const uint64_t bit = 1ull << (back % 64);
-    if (window_[idx] & bit) return false;  // 既に受信済み
-    window_[idx] |= bit;
+    if (s.window[idx] & bit) return false;  // 既に受信済み
+    s.window[idx] |= bit;
     return true;
 }
 
@@ -109,23 +126,37 @@ size_t Transport::decrypt(uint8_t* out, size_t out_cap, const uint8_t* in, size_
                           bool* is_valid)
 {
     if (is_valid) *is_valid = false;
-    if (!ready_ || len < kTransportHeader + kTagLen) return 0;
+    if (len < kTransportHeader + kTagLen) return 0;
     if (in[0] != kMsgTransport) return 0;
-    if (load_le32(in + 4) != kp_.local_index) return 0;  // 自分宛でない
 
-    const uint64_t counter   = load_le64(in + 8);
+    // 宛先インデックスで世代を選ぶ。ハンドシェイクごとに違う値なので、
+    // これで「新しい鍵で来たか、1 つ前の鍵で来たか」が分かる。
+    const uint32_t receiver = load_le32(in + 4);
+    SessionState*  s        = nullptr;
+    bool           is_cur   = false;
+    if (cur_.valid && receiver == cur_.kp.local_index) {
+        s      = &cur_;
+        is_cur = true;
+    } else if (prev_.valid && receiver == prev_.kp.local_index) {
+        s = &prev_;
+    }
+    if (!s) return 0;
+
+    const uint64_t counter    = load_le64(in + 8);
     const size_t   cipher_len = len - kTransportHeader;
     const size_t   plain_len  = cipher_len - kTagLen;
     if (out_cap < plain_len) return 0;
 
-    // 復号が通ってから初めてリプレイウィンドウを更新する（偽パケットでウィンドウを汚させない）。
-    if (!c_.aead_decrypt(out, kp_.recv, counter, in + kTransportHeader, cipher_len, nullptr, 0)) {
+    // 復号が通ってから初めてリプレイウィンドウを更新する（偽パケットで汚させない）。
+    if (!c_.aead_decrypt(out, s->kp.recv, counter, in + kTransportHeader, cipher_len, nullptr, 0)) {
         return 0;
     }
-    if (!check_replay(counter)) {
+    if (!check_replay(*s, counter)) {
         ++replay_drops_;
         return 0;
     }
+    // 新しい鍵でデータが来た = 相手も新しい鍵を知った。以後はこちらも新しい鍵で送る。
+    if (is_cur && !cur_.confirmed) cur_.confirmed = true;
     if (is_valid) *is_valid = true;
     return plain_len;  // 0 なら keepalive
 }

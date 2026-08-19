@@ -350,6 +350,115 @@ void test_replay_window()
     CHECK(rx.recv_max() == 9);
 }
 
+// transport パケットの宛先インデックス（どの鍵世代で送られたか）。
+uint32_t recv_index(const uint8_t* pkt)
+{
+    return static_cast<uint32_t>(pkt[4]) | (static_cast<uint32_t>(pkt[5]) << 8) |
+           (static_cast<uint32_t>(pkt[6]) << 16) | (static_cast<uint32_t>(pkt[7]) << 24);
+}
+
+// #29: rekey が交差したときに通信が切れないこと。
+// 本家 wg と同じく「1 つ前の鍵を残す」「応答側は相手のデータを受けるまで
+// 新しい鍵で送らない」の二点が満たされていれば、断は発生しない。
+void test_rekey_crossover()
+{
+    const auto& c = wg::default_crypto();
+    auto        mk = [](uint8_t seed, uint32_t idx) {
+        wg::Keypair kp;
+        for (int i = 0; i < 32; ++i) {
+            kp.send[i] = static_cast<uint8_t>(seed + i);
+            kp.recv[i] = static_cast<uint8_t>(seed + i);
+        }
+        kp.local_index  = idx;
+        kp.remote_index = idx;
+        return kp;
+    };
+
+    const wg::Keypair gen1 = mk(0x10, 1001);
+    const wg::Keypair gen2 = mk(0x40, 2002);
+
+    wg::Transport a(c), b(c);
+    a.set_keypair(gen1);
+    b.set_keypair(gen1);
+
+    uint8_t pkt[128], got[128];
+    bool    valid = false;
+
+    // 世代 1 で普通に通る。
+    size_t n = a.encrypt(pkt, sizeof(pkt), reinterpret_cast<const uint8_t*>("old"), 3);
+    CHECK(n > 0);
+    CHECK(b.decrypt(got, sizeof(got), pkt, n, &valid) == 3);
+    CHECK(valid);
+
+    // a が世代 1 で送ったパケットが飛んでいる最中に rekey が起きる状況。
+    const size_t inflight_len = a.encrypt(pkt, sizeof(pkt), reinterpret_cast<const uint8_t*>("fly"), 3);
+    CHECK(inflight_len > 0);
+    uint8_t inflight[128];
+    std::memcpy(inflight, pkt, inflight_len);
+
+    // b は応答側として世代 2 を受け取る（未確認）。
+    b.set_keypair(gen2, false);
+    CHECK(b.has_previous());
+    CHECK(!b.current_confirmed());
+
+    // 1 つ前を残しているので、飛んでいた世代 1 のパケットもまだ復号できる。
+    // ここが #29 の本体で、以前は捨てていたので数秒間ぶんが落ちていた。
+    CHECK(b.decrypt(got, sizeof(got), inflight, inflight_len, &valid) == 3);
+    CHECK(valid);
+    CHECK(std::memcmp(got, "fly", 3) == 0);
+
+    // 未確認のうちは b は**古い鍵で**送る。a はまだ世代 2 を知らないので、
+    // 新しい鍵で送ってしまうと a 側で全部落ちる。
+    n = b.encrypt(pkt, sizeof(pkt), reinterpret_cast<const uint8_t*>("rev"), 3);
+    CHECK(n > 0);
+    CHECK(recv_index(pkt) == gen1.remote_index);
+    CHECK(a.decrypt(got, sizeof(got), pkt, n, &valid) == 3);
+    CHECK(valid);
+
+    // a が世代 2 に切り替えて（開始側なので確認済み）データを送ると、
+    // b はそれを受けて世代 2 を確認済みに昇格させる。
+    a.set_keypair(gen2);
+    n = a.encrypt(pkt, sizeof(pkt), reinterpret_cast<const uint8_t*>("new"), 3);
+    CHECK(n > 0);
+    CHECK(b.decrypt(got, sizeof(got), pkt, n, &valid) == 3);
+    CHECK(valid);
+    CHECK(b.current_confirmed());
+
+    // 以後 b は世代 2 で送る。
+    n = b.encrypt(pkt, sizeof(pkt), reinterpret_cast<const uint8_t*>("ok!"), 3);
+    CHECK(n > 0);
+    CHECK(recv_index(pkt) == gen2.remote_index);
+    CHECK(a.decrypt(got, sizeof(got), pkt, n, &valid) == 3);
+    CHECK(valid);
+
+    // 世代ごとにリプレイウィンドウが独立していること。
+    // 共有していると、世代 2 のカウンタ 0 が世代 1 の受信済みと衝突して落ちる。
+    wg::Transport d(c);
+    d.set_keypair(gen1);
+    wg::Transport s1(c), s2(c);
+    s1.set_keypair(gen1);
+    s2.set_keypair(gen2);
+    for (int i = 0; i < 5; ++i) {
+        n = s1.encrypt(pkt, sizeof(pkt), reinterpret_cast<const uint8_t*>("x"), 1);
+        CHECK(d.decrypt(got, sizeof(got), pkt, n, &valid) == 1);
+        CHECK(valid);
+    }
+    d.set_keypair(gen2, false);
+    for (int i = 0; i < 5; ++i) {
+        n = s2.encrypt(pkt, sizeof(pkt), reinterpret_cast<const uint8_t*>("y"), 1);
+        CHECK(d.decrypt(got, sizeof(got), pkt, n, &valid) == 1);  // カウンタ 0..4 が再び通る
+        CHECK(valid);
+    }
+    CHECK(d.replay_drops() == 0);
+
+    // さらに世代 3 が来たら、世代 1 は落ちる（保持は 1 つ前まで）。
+    const wg::Keypair gen3 = mk(0x70, 3003);
+    d.set_keypair(gen3, false);
+    n = s1.encrypt(pkt, sizeof(pkt), reinterpret_cast<const uint8_t*>("z"), 1);
+    CHECK(d.decrypt(got, sizeof(got), pkt, n, &valid) == 0);
+    CHECK(!valid);
+}
+
 // レビュー指摘の回帰テスト。
 void test_review_regressions()
 {
@@ -423,6 +532,7 @@ int main()
     test_psk();
     test_transport();
     test_replay_window();
+    test_rekey_crossover();
     test_review_regressions();
     std::printf("ok: %d checks passed\n", g_checks);
     return 0;

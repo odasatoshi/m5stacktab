@@ -919,10 +919,79 @@ int cmd_wgloop(int, char**)
     }
     std::printf("reverse direction: %s\n", rev_ok ? "ok" : "FAILED");
 
+    // rekey が交差したときに断が出ないこと（#29）。
+    // 世代 2 の鍵はハンドシェイクをもう一度回さずに作る（ハンドシェイク自体は上で確認済み。
+    // ここで見たいのは「古い鍵で飛んでいたパケットを取りこぼさないか」だけ）。
+    // 両側の send/recv を同じ値で XOR するので、鍵の対応関係は保たれる。
+    wg::Keypair ka2 = ka, kb2 = kb;
+    for (int i = 0; i < 32; ++i) {
+        ka2.send[i] ^= 0x5a;
+        ka2.recv[i] ^= 0x5a;
+        kb2.send[i] ^= 0x5a;
+        kb2.recv[i] ^= 0x5a;
+    }
+    ka2.local_index  = 0xa2a2a2a2;
+    ka2.remote_index = 0xb2b2b2b2;
+    kb2.local_index  = 0xb2b2b2b2;
+    kb2.remote_index = 0xa2a2a2a2;
+
+    bool rekey_ok = false;
+    // (1) A が世代 1 で送ったパケットが飛んでいる最中に、B が世代 2 に張り替える。
+    const size_t ilen = ta.encrypt(buf, sizeof(buf), reinterpret_cast<const uint8_t*>("inflight"), 8);
+    if (ilen == 0) {
+        std::printf("rekey: inflight encrypt failed\n");
+    } else {
+        sendto(sa, buf, ilen, 0, reinterpret_cast<sockaddr*>(&addr_b), sizeof(addr_b));
+        tb.set_keypair(kb2, false);  // 応答側なので未確認で入れる
+        n = recvfrom(sb, buf, sizeof(buf), 0, nullptr, nullptr);
+        const size_t g1 =
+            (n > 0) ? tb.decrypt(out, sizeof(out), buf, static_cast<size_t>(n), &valid) : 0;
+        const bool inflight_ok = valid && g1 == 8 && std::memcmp(out, "inflight", 8) == 0;
+        std::printf("  old-key packet after rekey: %s\n", inflight_ok ? "ok" : "LOST");
+
+        // (2) 未確認のうちは B は古い鍵で送る。新しい鍵で送ると A 側で全部落ちる。
+        const size_t olen = tb.encrypt(buf, sizeof(buf), reinterpret_cast<const uint8_t*>("pre"), 3);
+        bool         pre_ok = false;
+        if (olen > 0) {
+            sendto(sb, buf, olen, 0, reinterpret_cast<sockaddr*>(&addr_a), sizeof(addr_a));
+            n = recvfrom(sa, buf, sizeof(buf), 0, nullptr, nullptr);
+            const size_t g2 =
+                (n > 0) ? ta.decrypt(out, sizeof(out), buf, static_cast<size_t>(n), &valid) : 0;
+            pre_ok = valid && g2 == 3;
+        }
+        std::printf("  unconfirmed sends on old key: %s\n", pre_ok ? "ok" : "FAILED");
+
+        // (3) A も世代 2 に移ってデータを送ると、B は世代 2 を確認済みに昇格させる。
+        ta.set_keypair(ka2);  // 開始側は確認済み
+        bool         post_ok = false;
+        const size_t nlen = ta.encrypt(buf, sizeof(buf), reinterpret_cast<const uint8_t*>("new"), 3);
+        if (nlen > 0) {
+            sendto(sa, buf, nlen, 0, reinterpret_cast<sockaddr*>(&addr_b), sizeof(addr_b));
+            n = recvfrom(sb, buf, sizeof(buf), 0, nullptr, nullptr);
+            const size_t g3 =
+                (n > 0) ? tb.decrypt(out, sizeof(out), buf, static_cast<size_t>(n), &valid) : 0;
+            post_ok = valid && g3 == 3 && tb.current_confirmed();
+        }
+        // (4) 昇格後は B も世代 2 で送る。
+        bool         final_ok = false;
+        const size_t flen = tb.encrypt(buf, sizeof(buf), reinterpret_cast<const uint8_t*>("fin"), 3);
+        if (flen > 0) {
+            sendto(sb, buf, flen, 0, reinterpret_cast<sockaddr*>(&addr_a), sizeof(addr_a));
+            n = recvfrom(sa, buf, sizeof(buf), 0, nullptr, nullptr);
+            const size_t g4 =
+                (n > 0) ? ta.decrypt(out, sizeof(out), buf, static_cast<size_t>(n), &valid) : 0;
+            final_ok = valid && g4 == 3;
+        }
+        std::printf("  after confirmation both on new key: %s\n",
+                    (post_ok && final_ok) ? "ok" : "FAILED");
+        rekey_ok = inflight_ok && pre_ok && post_ok && final_ok;
+    }
+    std::printf("rekey crossover (no drop): %s\n", rekey_ok ? "ok" : "FAILED");
+
     close(sa);
     close(sb);
-    // 3 つ全部が通って初めて成功。検証手順から戻り値で判定できるようにする。
-    return (keys_match && data_ok && rev_ok) ? 0 : 1;
+    // 全部が通って初めて成功。検証手順から戻り値で判定できるようにする。
+    return (keys_match && data_ok && rev_ok && rekey_ok) ? 0 : 1;
 }
 
 // DISCO レスポンダ。WireGuard と同じ UDP ポートに来るので、netif の
