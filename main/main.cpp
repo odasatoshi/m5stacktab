@@ -19,6 +19,10 @@
 #include <nvs_flash.h>
 
 #include <esp_netif.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/error.h>
+#include <mbedtls/pk.h>
 #include <esp_partition.h>
 #include <nvs.h>
 
@@ -41,6 +45,23 @@
 namespace {
 
 const char* TAG = "boot";
+
+// mbedtls_pk_parse_key は EC 鍵で RNG を要求する（座標ブラインディング）。
+mbedtls_ctr_drbg_context* ts_drbg()
+{
+    static mbedtls_ctr_drbg_context ctr;
+    static mbedtls_entropy_context  ent;
+    static bool                     ready = false;
+    if (!ready) {
+        mbedtls_ctr_drbg_init(&ctr);
+        mbedtls_entropy_init(&ent);
+        static const char* pers = "keytest";
+        ready = (mbedtls_ctr_drbg_seed(&ctr, mbedtls_entropy_func, &ent,
+                                       reinterpret_cast<const unsigned char*>(pers),
+                                       std::strlen(pers)) == 0);
+    }
+    return ready ? &ctr : nullptr;
+}
 
 // cmd_ts から呼ぶので前方宣言する（定義は DISCO のセクション）。
 void register_disco_peers(const ts::NetMap& map);
@@ -779,6 +800,49 @@ int cmd_wg(int argc, char** argv)
     return 0;
 }
 
+// sshkey パーティションの鍵を mbedTLS で直接パースして、失敗理由を表示する。
+// libssh2 経由だと LIBSSH2_ERROR_FILE (-16) しか分からないため（#17）。
+int cmd_keytest(int, char**)
+{
+    const esp_partition_t* part = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, static_cast<esp_partition_subtype_t>(0x40), "sshkey");
+    if (!part) {
+        std::printf("sshkey partition not found\n");
+        return 1;
+    }
+    static char buf[8192];
+    if (esp_partition_read(part, 0, buf, sizeof(buf)) != ESP_OK) {
+        std::printf("partition read failed\n");
+        return 1;
+    }
+    // 未書き込み領域は 0xFF。そこまでを鍵とみなす。
+    size_t len = 0;
+    while (len < sizeof(buf) - 1 && static_cast<uint8_t>(buf[len]) != 0xFF) ++len;
+    buf[len] = '\0';
+    if (len == 0) {
+        std::printf("sshkey partition is empty\n");
+        return 1;
+    }
+    const char* nl = std::strchr(buf, '\n');
+    std::printf("key: %d bytes, header=%.*s\n", (int)len, (int)(nl ? nl - buf : 0), buf);
+
+    mbedtls_pk_context pk;
+    mbedtls_pk_init(&pk);
+    // mbedTLS は鍵データの末尾が NUL であることを要求する（pkparse.c の実装）。
+    const int rc = mbedtls_pk_parse_key(&pk, reinterpret_cast<const unsigned char*>(buf), len + 1,
+                                        nullptr, 0, mbedtls_ctr_drbg_random, ts_drbg());
+    if (rc == 0) {
+        std::printf("parse ok: type=%s bits=%u\n", mbedtls_pk_get_name(&pk),
+                    (unsigned)mbedtls_pk_get_bitlen(&pk));
+    } else {
+        char err[128] = {};
+        mbedtls_strerror(rc, err, sizeof(err));
+        std::printf("parse failed: -0x%04x (%s)\n", (unsigned)(-rc), err);
+    }
+    mbedtls_pk_free(&pk);
+    return rc == 0 ? 0 : 1;
+}
+
 void register_term_commands()
 {
     const esp_console_cmd_t cmds[] = {
@@ -798,6 +862,8 @@ void register_term_commands()
         {"kbd", "画面キーボードの表示切り替え", "[off]", &cmd_kbd, nullptr, nullptr, nullptr},
         {"wgtest", "WireGuard の暗号とハンドシェイクを実機で検証", nullptr, &cmd_wgtest, nullptr,
          nullptr, nullptr},
+        {"keytest", "sshkey パーティションの鍵を mbedTLS で直接パースする", nullptr, &cmd_keytest,
+         nullptr, nullptr, nullptr},
         {"ts", "Tailscale/Headscale の制御プレーンに接続", "<host> <authkey> [port] [capver]",
          &cmd_ts, nullptr, nullptr, nullptr},
         {"wg", "WireGuard トンネルの netif を操作", "<tunnel-ip> [pubkey] [endpoint] | stat | down",

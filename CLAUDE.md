@@ -112,7 +112,19 @@ python $IDF_PATH/components/partition_table/parttool.py --port /dev/cu.usbmodem1
 - **ed25519 は使えない**（`LIBSSH2_ED25519 = 0`）
 - **OpenSSH 形式 (`-----BEGIN OPENSSH PRIVATE KEY-----`) は使えない**。mbedTLS は PKCS#1 / SEC1 の
   PEM しか解釈しないので `ssh-keygen -m PEM` が必須
-- **RSA (PEM) は動作確認済み**。ECDSA (PEM) は `mbedtls_pk_parse_key` が通らなかった（→ #17）
+- **RSA (PEM) は動作確認済み**
+- **ECDSA は「named curve」形式でないと通らない**。`ssh-keygen -t ecdsa -m PEM` が作る鍵は
+  曲線パラメータを**明示的に展開**した形（ASN.1 に `prime-field` から全部入る）で、
+  mbedTLS は named curve（OID）しか解釈できず `-0x3d00 (PK - Invalid key tag or value)` になる。
+  openssl で作るか変換すれば通る:
+
+```sh
+openssl ecparam -name prime256v1 -genkey -noout -out key.pem          # 新規作成
+openssl ec -in ssh_key -out key.pem -param_enc named_curve            # 既存を変換
+```
+
+鍵のパースだけを確かめたいときは実機の `keytest` コマンドを使う。
+`CONFIG_MBEDTLS_ERROR_C=y` を入れてあるので、失敗理由が文字列で出る。
 
 ## ホストテストで使う mbedTLS
 

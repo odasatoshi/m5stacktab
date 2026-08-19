@@ -43,6 +43,8 @@ python $IDF_PATH/components/partition_table/parttool.py --port /dev/cu.usbmodem1
     write_partition --partition-name dict --input build/dict.bin
 
 ssh-keygen -t rsa -b 2048 -m PEM -N '' -f ~/.ssh/id_rsa_tab5   # ed25519 は使えない
+# ECDSA なら named curve 形式にする（ssh-keygen が作る形式は mbedTLS が読めない）
+# openssl ecparam -name prime256v1 -genkey -noout -out ~/.ssh/id_ecdsa_tab5.pem
 python $IDF_PATH/components/partition_table/parttool.py --port /dev/cu.usbmodem101 \
     write_partition --partition-name sshkey --input ~/.ssh/id_rsa_tab5
 ```
