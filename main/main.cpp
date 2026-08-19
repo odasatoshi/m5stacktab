@@ -22,7 +22,10 @@
 #include "romaji.hpp"
 #include "skk_dict.hpp"
 #include "ssh.hpp"
+#include "blake2s.hpp"
 #include "kbd_ui.hpp"
+#include "noise.hpp"
+#include "transport.hpp"
 #include "term_render.hpp"
 #include "vt100.hpp"
 #include "wifi.hpp"
@@ -388,6 +391,77 @@ int cmd_kbd(int argc, char** argv)
     return 0;
 }
 
+// WireGuard の暗号とハンドシェイクを実機で検証する（ホストテストと同じ流れ）。
+int cmd_wgtest(int, char**)
+{
+    const auto& c = wg::default_crypto();
+
+    // BLAKE2s の既知値
+    uint8_t h[32];
+    wg::blake2s(h, 32, reinterpret_cast<const uint8_t*>("abc"), 3);
+    const char* want = "508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982";
+    char        got[65] = {};
+    for (int i = 0; i < 32; ++i) std::snprintf(got + i * 2, 3, "%02x", h[i]);
+    std::printf("blake2s(abc): %s\n", std::strcmp(got, want) == 0 ? "ok" : got);
+
+    // X25519 (RFC 7748 のベクタ)
+    uint8_t priv[32] = {0x77, 0x07, 0x6d, 0x0a, 0x73, 0x18, 0xa5, 0x7d, 0x3c, 0x16, 0xc1,
+                        0x72, 0x51, 0xb2, 0x66, 0x45, 0xdf, 0x4c, 0x2f, 0x87, 0xeb, 0xc0,
+                        0x99, 0x2a, 0xb1, 0x77, 0xfb, 0xa5, 0x1d, 0xb9, 0x2c, 0x2a};
+    uint8_t pub[32];
+    int64_t t0 = esp_timer_get_time();
+    bool    ok = c.dh_pubkey(pub, priv);
+    int64_t dh_us = esp_timer_get_time() - t0;
+    for (int i = 0; i < 32; ++i) std::snprintf(got + i * 2, 3, "%02x", pub[i]);
+    const char* want_pub = "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a";
+    std::printf("x25519 pubkey: %s (%lld us)\n",
+                (ok && std::strcmp(got, want_pub) == 0) ? "ok" : got, dh_us);
+
+    // ハンドシェイクを自分同士で往復させる
+    uint8_t a_priv[32], b_priv[32], a_pub[32], b_pub[32];
+    c.random_bytes(a_priv, 32);
+    c.random_bytes(b_priv, 32);
+    c.dh_pubkey(a_pub, a_priv);
+    c.dh_pubkey(b_pub, b_priv);
+
+    wg::Handshake ini(c), res(c);
+    ini.set_keys(a_priv, b_pub);
+    res.set_keys(b_priv, a_pub);
+    const uint8_t ts[12] = {0x40};
+    uint8_t       m1[148], m2[92], st[32], tsout[12];
+    wg::Keypair   ik, rk;
+
+    t0 = esp_timer_get_time();
+    bool hs = ini.create_initiation(m1, 0x1234, ts) && res.consume_initiation(m1, st, tsout) &&
+              res.create_response(m2, 0x5678, rk) && ini.consume_response(m2, ik);
+    const int64_t hs_us = esp_timer_get_time() - t0;
+    const bool    match = hs && std::memcmp(ik.send, rk.recv, 32) == 0 &&
+                       std::memcmp(ik.recv, rk.send, 32) == 0;
+    std::printf("noise IK handshake: %s (%lld us for both sides)\n", match ? "ok" : "FAILED",
+                hs_us);
+
+    if (!match) return 1;
+
+    // トランスポートの往復とリプレイ拒否
+    wg::Transport tx(c), rx(c);
+    tx.set_keypair(ik);
+    rx.set_keypair(rk);
+    uint8_t      pkt[256], out[256];
+    const char*  msg = "wireguard on esp32-p4";
+    t0 = esp_timer_get_time();
+    const size_t n = tx.encrypt(pkt, sizeof(pkt), reinterpret_cast<const uint8_t*>(msg),
+                                std::strlen(msg));
+    bool         valid = false;
+    const size_t got_len = rx.decrypt(out, sizeof(out), pkt, n, &valid);
+    const int64_t rt_us = esp_timer_get_time() - t0;
+    const bool    replay_rejected = rx.decrypt(out, sizeof(out), pkt, n, &valid) == 0;
+    std::printf("transport: %s (%lld us round trip), replay rejected: %s\n",
+                (got_len == std::strlen(msg) && std::memcmp(out, msg, got_len) == 0) ? "ok"
+                                                                                     : "FAILED",
+                rt_us, replay_rejected ? "yes" : "NO");
+    return 0;
+}
+
 void register_term_commands()
 {
     const esp_console_cmd_t cmds[] = {
@@ -405,6 +479,8 @@ void register_term_commands()
         {"bench", "描画コストを測る (全画面 vs 1 文字)", nullptr, &cmd_bench, nullptr, nullptr,
          nullptr},
         {"kbd", "画面キーボードの表示切り替え", "[off]", &cmd_kbd, nullptr, nullptr, nullptr},
+        {"wgtest", "WireGuard の暗号とハンドシェイクを実機で検証", nullptr, &cmd_wgtest, nullptr,
+         nullptr, nullptr},
     };
     for (const auto& c : cmds) ESP_ERROR_CHECK_WITHOUT_ABORT(esp_console_cmd_register(&c));
 }
