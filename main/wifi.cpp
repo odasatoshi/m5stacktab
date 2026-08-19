@@ -243,7 +243,9 @@ esp_err_t console_start(void)
     repl_cfg.prompt                    = "tab5>";
     repl_cfg.max_cmdline_length        = 256;
     // 既定 4KB では mbedTLS の ECP (X25519) がスタック保護フォルトを起こす。
-    repl_cfg.task_stack_size           = 16384;
+    // X25519 は 1 回で 10KB 近く使うので、鍵導出と netif の初期化が重なる経路
+    // (wg コマンド) では 16KB でも足りなかった。
+    repl_cfg.task_stack_size           = 32768;
 
     esp_console_dev_usb_serial_jtag_config_t dev_cfg =
         ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
