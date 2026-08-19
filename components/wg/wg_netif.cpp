@@ -160,6 +160,9 @@ void handle_initiation_locked(const uint8_t* pkt, size_t len, const sockaddr_in&
 
     std::memcpy(g_state.peer_timestamp, timestamp, kTimestampLen);
     g_state.have_peer_timestamp = true;
+    // kp.initiator == false なので Transport は「未確認」として扱う。
+    // 相手はまだ msg2 を処理していない可能性があり、ここで新しい鍵に切り替えて
+    // 送ると相手側で復号できずに落ちる。相手から新しい鍵のデータが届いた時点で昇格する。
     g_state.transport->set_keypair(kp);
     g_state.last_handshake_us = esp_timer_get_time();
     // すぐ keepalive を送って、相手から見た経路を開ける。
