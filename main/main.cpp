@@ -26,6 +26,7 @@
 #include "skk_dict.hpp"
 #include "ssh.hpp"
 #include "ts_client.hpp"
+#include "wg_netif.hpp"
 #include "blake2s.hpp"
 #include "kbd_ui.hpp"
 #include "noise.hpp"
@@ -567,6 +568,100 @@ int cmd_ts(int argc, char** argv)
     return ok ? 0 : 1;
 }
 
+// WireGuard のトンネル netif を上げる。ピア指定は任意（無ければ netif だけ作る）。
+int cmd_wg(int argc, char** argv)
+{
+    auto& nif = wg::netif_instance();
+
+    if (argc >= 2 && std::string(argv[1]) == "down") {
+        nif.down();
+        std::printf("netif down\n");
+        return 0;
+    }
+    if (argc >= 2 && std::string(argv[1]) == "stat") {
+        const auto& st = nif.stats();
+        std::printf("up=%d handshake=%d tx=%u pkt/%u B (drop %u) rx=%u pkt/%u B (drop %u) hs=%u\n",
+                    nif.is_up() ? 1 : 0, nif.handshake_done() ? 1 : 0, (unsigned)st.tx_packets,
+                    (unsigned)st.tx_bytes, (unsigned)st.tx_dropped, (unsigned)st.rx_packets,
+                    (unsigned)st.rx_bytes, (unsigned)st.rx_dropped, (unsigned)st.handshakes);
+        return 0;
+    }
+    if (argc < 2) {
+        std::printf("usage: wg <tunnel-ip> [peer-pubkey-hex] [peer-endpoint]\n");
+        std::printf("       wg stat | wg down\n");
+        return 1;
+    }
+
+    // トンネルの鍵は NVS に保存して使い回す（相手に公開鍵を登録するため）。
+    static uint8_t priv[32], pub[32];
+    nvs_handle_t   nvs;
+    bool           have = false;
+    if (nvs_open("wg", NVS_READWRITE, &nvs) == ESP_OK) {
+        size_t len = 32;
+        have = (nvs_get_blob(nvs, "priv", priv, &len) == ESP_OK && len == 32);
+        if (!have) {
+            if (!wg::default_crypto().random_bytes(priv, 32)) {
+                std::printf("key generation failed\n");
+                nvs_close(nvs);
+                return 1;
+            }
+            esp_err_t err = nvs_set_blob(nvs, "priv", priv, 32);
+            if (err == ESP_OK) err = nvs_commit(nvs);
+            if (err != ESP_OK) {
+                std::printf("could not save key: %s\n", esp_err_to_name(err));
+                nvs_close(nvs);
+                return 1;
+            }
+            have = true;
+        }
+        nvs_close(nvs);
+    }
+    if (!have || !wg::default_crypto().dh_pubkey(pub, priv)) {
+        std::printf("no tunnel key\n");
+        return 1;
+    }
+    std::printf("tunnel public key (register this on the peer): ");
+    for (int i = 0; i < 32; ++i) std::printf("%02x", pub[i]);
+    std::printf("\n");
+
+    ip4_addr_t addr, mask;
+    if (!ip4addr_aton(argv[1], &addr)) {
+        std::printf("bad tunnel ip\n");
+        return 1;
+    }
+    // Tailscale のアドレスは 100.64.0.0/10 に収まる。マスクを /10 にすれば
+    // tailnet 宛だけがこの netif に向く（lwIP にポリシールーティングは無い）。
+    ip4addr_aton("255.192.0.0", &mask);
+
+    if (!nif.is_up()) {
+        const esp_err_t err = nif.up(priv, addr, mask);
+        if (err != ESP_OK) {
+            std::printf("netif up failed: %s (%s)\n", esp_err_to_name(err), nif.last_error());
+            return 1;
+        }
+    }
+
+    if (argc >= 4) {
+        wg::PeerConfig peer;
+        const std::string hex = argv[2];
+        if (hex.size() != 64) {
+            std::printf("peer pubkey must be 64 hex chars\n");
+            return 1;
+        }
+        for (int i = 0; i < 32; ++i) {
+            peer.public_key[i] = static_cast<uint8_t>(std::stoul(hex.substr(i * 2, 2), nullptr, 16));
+        }
+        peer.endpoint = argv[3];
+        const esp_err_t err = nif.set_peer(peer);
+        if (err != ESP_OK) {
+            std::printf("set_peer failed: %s (%s)\n", esp_err_to_name(err), nif.last_error());
+            return 1;
+        }
+        std::printf("handshake started with %s\n", peer.endpoint.c_str());
+    }
+    return 0;
+}
+
 void register_term_commands()
 {
     const esp_console_cmd_t cmds[] = {
@@ -588,6 +683,8 @@ void register_term_commands()
          nullptr, nullptr},
         {"ts", "Tailscale/Headscale の制御プレーンに接続", "<host> <authkey> [port] [capver]",
          &cmd_ts, nullptr, nullptr, nullptr},
+        {"wg", "WireGuard トンネルの netif を操作", "<tunnel-ip> [pubkey] [endpoint] | stat | down",
+         &cmd_wg, nullptr, nullptr, nullptr},
     };
     for (const auto& c : cmds) ESP_ERROR_CHECK_WITHOUT_ABORT(esp_console_cmd_register(&c));
 }

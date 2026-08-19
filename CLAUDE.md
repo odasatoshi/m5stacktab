@@ -119,7 +119,9 @@ c++ -std=c++17 -Wall -Wextra -Werror -O1 -I$M3/include -I components/wg \
 - **X25519 は mbedTLS の `mbedtls_ecp_mul` では自動でクランプされない**。RFC 7748 のとおり
   `k[0] &= 248; k[31] &= 127; k[31] |= 64` を自分でやる
 - **Montgomery カーブの `mbedtls_ecp_mul` は `f_rng` が必須**（座標ブラインディング）。NULL だと失敗する
-- **コンソールタスクのスタックは 16KB 必要**。既定 4KB では X25519 がスタック保護フォルトを起こす
+- **X25519 は 1 回で 10KB 近くスタックを使う**。既定 4KB では即スタック保護フォルト。
+  コンソールタスクは 32KB（鍵導出と netif 初期化が重なる経路があるため 16KB でも足りなかった）、
+  WireGuard の受信タスクも 16KB 必要。受信バッファは static にしてスタックから外す
 
 ## Tailscale / Headscale の開発環境
 
