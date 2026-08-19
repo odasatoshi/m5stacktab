@@ -14,11 +14,15 @@ jobs:
 
       # WireGuard の暗号テストは mbedTLS 3.x を使う（4.x では ChaCha20-Poly1305 が private API）。
       - name: install mbedtls and cjson
-        # apt が詰まることがあるので短いタイムアウトと 1 回のリトライを入れる。
-        timeout-minutes: 5
+        # `apt-get update` はミラーが詰まると 10 分以上かかることがある。ランナーは
+        # 既に apt リストを持っているので、まず update 抜きで install を試す。
+        timeout-minutes: 10
         run: |
-          sudo apt-get update -qq || sudo apt-get update -qq
-          sudo apt-get install -y -qq libmbedtls-dev libcjson-dev
+          if ! sudo apt-get install -y -qq libmbedtls-dev libcjson-dev; then
+            echo "install without update failed; refreshing lists"
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq libmbedtls-dev libcjson-dev
+          fi
           dpkg -s libmbedtls-dev | grep -i version
 
       # Linux では AddressSanitizer も併用する（macOS の開発機では起動時に固まるため外している）。
@@ -65,6 +69,16 @@ jobs:
               components/wg/crypto_mbedtls.cpp components/wg/noise.cpp components/wg/blake2s.cpp \
               -lmbedcrypto
           /tmp/test_disco
+
+      - name: disco responder
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \
+              -I components/wg -I components/ts -o /tmp/test_dr \
+              components/ts/test_disco_responder.cpp components/ts/disco_responder.cpp \
+              components/ts/disco.cpp components/wg/salsa20.cpp \
+              components/wg/crypto_mbedtls.cpp components/wg/noise.cpp components/wg/blake2s.cpp \
+              -lmbedcrypto
+          /tmp/test_dr
 
       - name: tailscale ts2021 noise
         run: |

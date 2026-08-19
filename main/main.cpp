@@ -26,6 +26,9 @@
 #include "skk_dict.hpp"
 #include "ssh.hpp"
 #include "ts_client.hpp"
+#include "disco_responder.hpp"
+#include "netmap.hpp"
+#include "ts_control.hpp"
 #include "wg_netif.hpp"
 #include "blake2s.hpp"
 #include "kbd_ui.hpp"
@@ -38,6 +41,9 @@
 namespace {
 
 const char* TAG = "boot";
+
+// cmd_ts から呼ぶので前方宣言する（定義は DISCO のセクション）。
+void register_disco_peers(const ts::NetMap& map);
 
 M5GFX                          display;
 std::unique_ptr<TermRenderer>  renderer;
@@ -546,6 +552,13 @@ int cmd_ts(int argc, char** argv)
         return 1;
     }
     client.set_config(cfg);
+    // netmap が来たらピアの disco 公開鍵を登録する。これが DISCO の前提。
+    client.set_map_handler([](const std::string& json) {
+        ts::NetMap map;
+        if (!ts::parse_netmap(json, &map)) return;
+        if (map.keepalive) return;
+        register_disco_peers(map);
+    });
 
     std::printf("connecting to %s:%u (capver %u)...\n", cfg.host.c_str(), cfg.port,
                 cfg.capability_version);
@@ -568,6 +581,43 @@ int cmd_ts(int argc, char** argv)
     return ok ? 0 : 1;
 }
 
+// DISCO レスポンダ。WireGuard と同じ UDP ポートに来るので、netif の
+// 「WireGuard 以外のパケット」ハンドラから呼ぶ。
+ts::DiscoResponder s_disco;
+
+void on_foreign_packet(const uint8_t* pkt, size_t len, uint32_t src_ip, uint16_t src_port)
+{
+    static uint8_t out[256];  // このハンドラは受信タスクからのみ呼ばれる
+    const size_t   n = s_disco.handle(pkt, len, src_ip, src_port, out, sizeof(out));
+    if (n > 0) {
+        // 応答は同じソケットから返す。別ソケットだと NAT のマッピングがずれる。
+        // 送れたかを伝える（送れていないのに送信済みと数えると誤診断につながる）。
+        s_disco.note_send_result(wg::netif_instance().send_raw(out, n, src_ip, src_port));
+    }
+}
+
+// netmap から得たピアの disco 公開鍵をレスポンダに登録する。
+// **これを繋がないと、Ping は全部 unknown として捨てられて Pong が一度も返らない。**
+void register_disco_peers(const ts::NetMap& map)
+{
+    auto add = [](const std::string& key_str) {
+        uint8_t pub[32];
+        if (!ts::key_from_string(key_str, "discokey:", pub)) return false;
+        return s_disco.add_peer(pub);
+    };
+    int added = 0;
+    for (const auto& p : map.peers) {
+        if (!p.disco_key.empty() && add(p.disco_key)) ++added;
+    }
+    for (const auto& p : map.peers_changed) {
+        if (!p.disco_key.empty() && add(p.disco_key)) ++added;
+    }
+    if (added > 0) {
+        ESP_LOGI(TAG, "registered %d disco peers (total %u)", added,
+                 (unsigned)s_disco.peer_count());
+    }
+}
+
 // WireGuard のトンネル netif を上げる。ピア指定は任意（無ければ netif だけ作る）。
 int cmd_wg(int argc, char** argv)
 {
@@ -576,6 +626,20 @@ int cmd_wg(int argc, char** argv)
     if (argc >= 2 && std::string(argv[1]) == "down") {
         nif.down();
         std::printf("netif down\n");
+        return 0;
+    }
+    if (argc >= 2 && std::string(argv[1]) == "disco") {
+        // 自分の disco 公開鍵とピア登録状況を見る。
+        if (!s_disco.has_key()) {
+            std::printf("disco: disabled (no key yet - run `ts` first)\n");
+            return 0;
+        }
+        std::printf("disco pub: ");
+        for (int i = 0; i < 32; ++i) std::printf("%02x", s_disco.public_key()[i]);
+        std::printf("\n  peers=%u pings=%u pongs=%u (failed %u) unknown=%u\n",
+                    (unsigned)s_disco.peer_count(), (unsigned)s_disco.pings_received(),
+                    (unsigned)s_disco.pongs_sent(), (unsigned)s_disco.pongs_failed(),
+                    (unsigned)s_disco.unknown_peers());
         return 0;
     }
     if (argc >= 2 && std::string(argv[1]) == "stat") {
@@ -649,6 +713,23 @@ int cmd_wg(int argc, char** argv)
         nvs_close(h);
         return ok;
     });
+
+    // DISCO の鍵は ts コマンドと同じ NVS の "dkey" を使う（netmap に載る鍵と一致させる）。
+    {
+        uint8_t      dkey[32];
+        nvs_handle_t h;
+        bool         ok = false;
+        if (nvs_open("ts", NVS_READONLY, &h) == ESP_OK) {
+            size_t len = 32;
+            ok = (nvs_get_blob(h, "dkey", dkey, &len) == ESP_OK && len == 32);
+            nvs_close(h);
+        }
+        if (ok && s_disco.set_key(dkey)) {
+            nif.set_foreign_handler(&on_foreign_packet);
+        } else {
+            std::printf("warning: no disco key yet (run `ts` first) - DISCO disabled\n");
+        }
+    }
 
     if (!nif.is_up()) {
         const esp_err_t err = nif.up(priv, addr, mask);
