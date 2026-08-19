@@ -58,11 +58,21 @@ python tools/serial_log.py --seconds 20      # ログ採取
 - **L2 キャッシュを増やしてはいけない**。`SRAM_HIGH_SIZE = 0x80000 - CONFIG_CACHE_L2_CACHE_SIZE`
   なので、512KB にすると内蔵 SRAM の上半分 384KB が消える（内蔵ヒープ 567KB → 178KB）。
   underrun 対策には効かない（DPI は DMA で PSRAM を直読みする）。既定の 128KB のままにする
-- パネルはネイティブ縦 (720x1280)。横で使うなら `setRotation(1)`。
-  **ただし回転すると転送が 3.3 倍遅くなる**（実測: 1280x24 の pushSprite が rot=0 で 1.21ms、
-  rot=1 で 3.96ms）。回転時は M5GFX がピクセル単位で座標変換するため。
-  全画面書き換えは 111ms（≒9fps）。差分更新なら 1 行 4ms で足りる。
-  横向きのまま速くするには ESP32-P4 の PPA (Pixel Processing Accelerator) で回転させる必要がある → #16
+- パネルはネイティブ縦 (720x1280)。**回転は PPA (ハードウェア) に任せる**。
+  M5GFX の `setRotation(1)` はピクセル単位で座標変換するので 4.6 倍遅い
+  （実測: 1280x24 の転送が pushSprite 4247us、PPA 924us）。
+  そのため座標変換は `components/rotate` で自分で持ち、PPA でフレームバッファへ直接書く。
+  実機の `rottest` で M5GFX の rotation 1 と向きが一致することを照合できる
+- **`Panel_DSI::config_detail().buffer_length` は 0 が入っている**（M5GFX が埋めていない）。
+  PPA に渡す `out.buffer_size` は自分で計算する（0 だと `ESP_ERR_INVALID_ARG`）
+- PPA の入力は DMA するので **64B 境界の内蔵 RAM** に置く（`heap_caps_aligned_alloc`）
+- **スプライトの色深度に `16` を渡すと M5GFX では swap565 になる**（メモリ上 byte0 = `RRRRRGGG`）。
+  PPA やパネルはネイティブ LE の RGB565 を期待するので、生バイトを渡すと色が入れ替わる
+  （赤が暗い青になる。**白と黒はスワップ不変なので通常のテキストでは気づけない**）。
+  `lgfx::v1::color_depth_t::rgb565_nonswapped` を明示する
+- **PPA は転送のたびに出力側のキャッシュを無効化する**（範囲は `pic_w * block_h * 2` で、
+  フル行だとフレームバッファ全体）。M5GFX がキャッシュ経由で描いた内容と競合するので、
+  **画面に触る経路は全部同じロックで守る**（端末の描画とキーボードの描画を別々に走らせてはいけない）
 - `Panel_DSI` はフレームバッファを `config_detail().buffer` で公開している（`Panel_FrameBufferBase` 派生）
 - **M5GFX の `drawChar(uniCode, x, y)` は使えない**。送り幅は正しく返すが、指定した座標に描かない
   （実機で確認: 別の行に重なって出る）。`drawString` は正常なので、セル描画は
