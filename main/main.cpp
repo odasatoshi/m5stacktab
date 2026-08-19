@@ -5,6 +5,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <M5GFX.h>
 #include <esp_chip_info.h>
@@ -16,6 +17,11 @@
 #include <freertos/task.h>
 #include <nvs_flash.h>
 
+#include <esp_partition.h>
+
+#include "romaji.hpp"
+#include "skk_dict.hpp"
+#include "ssh.hpp"
 #include "term_render.hpp"
 #include "vt100.hpp"
 #include "wifi.hpp"
@@ -193,6 +199,140 @@ int cmd_fonttest(int, char**)
     return 0;
 }
 
+ime::SkkDict                s_dict;
+esp_partition_mmap_handle_t s_dict_mmap = 0;
+
+// 辞書はフラッシュの dict パーティションを mmap してそのまま検索する（RAM に展開しない）。
+bool dict_open()
+{
+    if (s_dict.is_open()) return true;
+    const esp_partition_t* part = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "dict");
+    if (!part) {
+        std::printf("dict partition not found\n");
+        return false;
+    }
+    const void* ptr = nullptr;
+    esp_err_t   err = esp_partition_mmap(part, 0, part->size, ESP_PARTITION_MMAP_DATA, &ptr,
+                                         &s_dict_mmap);
+    if (err != ESP_OK) {
+        std::printf("mmap %u bytes failed: %s\n", (unsigned)part->size, esp_err_to_name(err));
+        return false;
+    }
+    if (!s_dict.open(ptr, part->size)) {
+        std::printf("dict not written yet or corrupt (mmap ok at %p)\n", ptr);
+        return false;
+    }
+    std::printf("dict: %u entries mmapped from partition (%u bytes)\n", s_dict.count(),
+                (unsigned)part->size);
+    return true;
+}
+
+// ローマ字 → かな → 漢字 を一気に試す。
+int cmd_conv(int argc, char** argv)
+{
+    if (argc < 2) {
+        std::printf("usage: conv <romaji>    例: conv nihongo\n");
+        return 1;
+    }
+    ime::Romaji r;
+    std::string kana;
+    for (const char* p = argv[1]; *p; ++p) r.input(*p, kana);
+    r.flush(kana);
+    std::printf("romaji: %s -> kana: %s\n", argv[1], kana.c_str());
+
+    if (!dict_open()) return 1;
+
+    std::vector<std::string> cands;
+    const int64_t            t0 = esp_timer_get_time();
+    const bool               hit = s_dict.lookup(kana, cands);
+    const int64_t            us  = esp_timer_get_time() - t0;
+    if (!hit) {
+        std::printf("no kanji candidates (%lld us). katakana: %s\n", us,
+                    ime::to_katakana(kana).c_str());
+        return 0;
+    }
+    std::printf("lookup %lld us, %d candidates:", us, (int)cands.size());
+    for (size_t i = 0; i < cands.size() && i < 8; ++i) std::printf(" %s", cands[i].c_str());
+    std::printf("\n");
+
+    // 画面にも出す（日本語表示の確認も兼ねる）
+    std::string line = "\r\n" + std::string(argv[1]) + " -> " + kana + " -> ";
+    for (size_t i = 0; i < cands.size() && i < 6; ++i) {
+        line += cands[i];
+        line += " ";
+    }
+    line += "\r\n";
+    term->write(line);
+    renderer->render(*term);
+    return 0;
+}
+
+int cmd_ssh(int argc, char** argv)
+{
+    SshConfig cfg;
+    if (argc == 1) {
+        if (ssh_config_load(cfg) != ESP_OK || cfg.host.empty()) {
+            std::printf("no saved connection. usage: ssh <user> <host> <password> [port]\n");
+            return 1;
+        }
+    } else if (argc == 4 || argc == 5) {
+        cfg.user     = argv[1];
+        cfg.host     = argv[2];
+        cfg.password = argv[3];
+        cfg.port     = (argc == 5) ? (uint16_t)atoi(argv[4]) : 22;
+        if (esp_err_t err = ssh_config_save(cfg); err != ESP_OK) {
+            std::printf("warning: could not save connection: %s\n", esp_err_to_name(err));
+        }
+    } else {
+        std::printf("usage: ssh [<user> <host> <password> [port]]\n");
+        return 1;
+    }
+
+    term->write("\r\n\033[33mconnecting to ");
+    term->write(cfg.user + "@" + cfg.host + "...\033[m\r\n");
+    renderer->render(*term);
+
+    esp_err_t err = ssh_connect(cfg, renderer->cols(), renderer->rows());
+    if (err != ESP_OK) {
+        std::printf("connect failed: %s (%s)\n", esp_err_to_name(err), ssh_last_error());
+        return 1;
+    }
+    std::printf("connecting... watch the screen\n");
+    return 0;
+}
+
+int cmd_sshclose(int, char**)
+{
+    ssh_disconnect();
+    std::printf("disconnected\n");
+    return 0;
+}
+
+// キーボードが届くまでの入力手段。\e などのエスケープも送れる。
+int cmd_key(int argc, char** argv)
+{
+    if (argc < 2) {
+        std::printf("usage: key <text>   (\\e = ESC, \\n = LF, \\t = TAB)\n");
+        return 1;
+    }
+    std::string out;
+    for (int i = 1; i < argc; ++i) {
+        if (i > 1) out += ' ';
+        out += unescape(argv[i]);
+    }
+    if (!ssh_is_connected()) {
+        std::printf("not connected\n");
+        return 1;
+    }
+    esp_err_t err = ssh_send(out.data(), out.size());
+    if (err != ESP_OK) {
+        std::printf("send failed: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+    return 0;
+}
+
 void register_term_commands()
 {
     const esp_console_cmd_t cmds[] = {
@@ -200,6 +340,11 @@ void register_term_commands()
         {"termtest", "色・全角・装飾のテストパターンを描画する", nullptr, &cmd_termtest, nullptr, nullptr, nullptr},
         {"termscroll", "40 行流してスクロールを見る", nullptr, &cmd_termscroll, nullptr, nullptr, nullptr},
         {"fonttest", "フォント描画経路の切り分け", nullptr, &cmd_fonttest, nullptr, nullptr, nullptr},
+        {"ssh", "SSH 接続 (引数なしで保存済み設定)", "[<user> <host> <password> [port]]", &cmd_ssh,
+         nullptr, nullptr, nullptr},
+        {"sshclose", "SSH セッションを閉じる", nullptr, &cmd_sshclose, nullptr, nullptr, nullptr},
+        {"key", "SSH にキー入力を送る", "<text>", &cmd_key, nullptr, nullptr, nullptr},
+        {"conv", "ローマ字→かな→漢字を試す", "<romaji>", &cmd_conv, nullptr, nullptr, nullptr},
     };
     for (const auto& c : cmds) ESP_ERROR_CHECK_WITHOUT_ABORT(esp_console_cmd_register(&c));
 }
@@ -242,7 +387,11 @@ extern "C" void app_main(void)
                   renderer->rows(), renderer->cell_w(), renderer->cell_h(), (int)display.width(),
                   (int)display.height());
     term->write(line);
-    term->write("console: term / termtest / termscroll / wifi / wifi-status\r\n");
+    term->write("console: term / termtest / wifi / ssh / key\r\n");
+    // DSR/CPR や DA の応答をリモートへ返す。vim などがこれを待つ。
+    term->set_reply([](const std::string& s) {
+        if (ssh_is_connected()) ssh_send(s.data(), s.size());
+    });
     renderer->render(*term, /*force=*/true);
     ESP_LOGI(TAG, "first full draw: %d rows in %u us (draw %u / push %u)",
              renderer->last_rows_drawn(), (unsigned)renderer->last_render_us(),
@@ -260,6 +409,14 @@ extern "C" void app_main(void)
     bool touching   = false;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(20));
+
+        // リモートからの出力を端末に流す。term を触るのはこのループだけに保つ。
+        uint8_t rx[1024];
+        for (;;) {
+            size_t n = ssh_receive(rx, sizeof(rx));
+            if (n == 0) break;
+            term->write(rx, n);
+        }
 
         if (term->any_dirty()) renderer->render(*term);
 

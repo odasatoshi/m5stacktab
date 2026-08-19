@@ -5,5 +5,6 @@ dependencies:
   # Tab5 のピン・reset GPIO のプリセット (CONFIG_ESP32P4_TAB5_C6_BOARD) は esp_hosted 3.0.2 以降。
   espressif/esp_wifi_remote: "^1.6"
   espressif/esp_hosted: "^3.0.2"
-  # C6 の電源は P4 の GPIO ではなく I2C の IO エクスパンダ (PI4IOE5V6408 @0x44) の先にあるが、
-  # 触るのは 3 レジスタの 1 ビットだけなので専用ドライバは入れない (wifi.cpp のコメント参照)。
+  # SSH クライアント。libssh2 1.11.1 を mbedTLS で使う ESP-IDF ポート。
+  # Registry の wolfssh / david-cermak/libssh はサーバ向けなので使わない。
+  skuodi/libssh2_esp: "^1.1.0"
