@@ -33,6 +33,8 @@ struct NetifStats {
     uint32_t tx_dropped = 0;
     uint32_t rx_dropped = 0;  // 復号失敗・リプレイ・宛先不一致
     uint32_t handshakes = 0;
+    uint32_t keepalives = 0;
+    uint32_t rekeys     = 0;
 };
 
 class Netif {
@@ -47,13 +49,19 @@ public:
     esp_err_t set_peer(const PeerConfig& peer);
     bool      handshake_done() const;
 
+    // タイムスタンプの単調性を保つために、最後に送った TAI64N を保存・復元する。
+    // 保存しないと再起動でカウンタが巻き戻り、ピアがリプレイとして無視する。
+    using TimestampStore = bool (*)(uint64_t* seconds, bool write);
+    void set_timestamp_store(TimestampStore fn) { ts_store_ = fn; }
+
     const NetifStats& stats() const { return stats_; }
     const char*       last_error() const { return last_error_.c_str(); }
 
 private:
-    bool netif_up_ = false;
-    NetifStats  stats_;
-    std::string last_error_;
+    bool           netif_up_ = false;
+    NetifStats     stats_;
+    std::string    last_error_;
+    TimestampStore ts_store_ = nullptr;
 };
 
 // 実装が持つシングルトンを返す（lwIP のコールバックから触るため）。

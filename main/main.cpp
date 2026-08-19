@@ -580,10 +580,12 @@ int cmd_wg(int argc, char** argv)
     }
     if (argc >= 2 && std::string(argv[1]) == "stat") {
         const auto& st = nif.stats();
-        std::printf("up=%d handshake=%d tx=%u pkt/%u B (drop %u) rx=%u pkt/%u B (drop %u) hs=%u\n",
+        std::printf("up=%d handshake=%d tx=%u pkt/%u B (drop %u) rx=%u pkt/%u B (drop %u)\n",
                     nif.is_up() ? 1 : 0, nif.handshake_done() ? 1 : 0, (unsigned)st.tx_packets,
                     (unsigned)st.tx_bytes, (unsigned)st.tx_dropped, (unsigned)st.rx_packets,
-                    (unsigned)st.rx_bytes, (unsigned)st.rx_dropped, (unsigned)st.handshakes);
+                    (unsigned)st.rx_bytes, (unsigned)st.rx_dropped);
+        std::printf("  handshakes=%u rekeys=%u keepalives=%u\n", (unsigned)st.handshakes,
+                    (unsigned)st.rekeys, (unsigned)st.keepalives);
         return 0;
     }
     if (argc < 2) {
@@ -633,6 +635,21 @@ int cmd_wg(int argc, char** argv)
     // tailnet 宛だけがこの netif に向く（lwIP にポリシールーティングは無い）。
     ip4addr_aton("255.192.0.0", &mask);
 
+    // WireGuard のタイムスタンプは再起動をまたいで単調増加させる必要がある。
+    // 巻き戻るとピアがリプレイとして無視し、原因の分からない無応答になる。
+    nif.set_timestamp_store([](uint64_t* seconds, bool write) -> bool {
+        nvs_handle_t h;
+        if (nvs_open("wg", NVS_READWRITE, &h) != ESP_OK) return false;
+        bool ok = false;
+        if (write) {
+            ok = (nvs_set_u64(h, "ts", *seconds) == ESP_OK) && (nvs_commit(h) == ESP_OK);
+        } else {
+            ok = (nvs_get_u64(h, "ts", seconds) == ESP_OK);
+        }
+        nvs_close(h);
+        return ok;
+    });
+
     if (!nif.is_up()) {
         const esp_err_t err = nif.up(priv, addr, mask);
         if (err != ESP_OK) {
@@ -641,15 +658,34 @@ int cmd_wg(int argc, char** argv)
         }
     }
 
+    if (argc == 3) {
+        // 公開鍵だけ渡されても接続できない。黙って netif だけ上げると原因が分からない。
+        std::printf("peer endpoint is missing: wg <tunnel-ip> <pubkey> <host:port>\n");
+        return 1;
+    }
     if (argc >= 4) {
         wg::PeerConfig peer;
         const std::string hex = argv[2];
+        // std::stoul は例外を投げる。例外を捕まえていないので、打ち間違いで abort してしまう。
         if (hex.size() != 64) {
             std::printf("peer pubkey must be 64 hex chars\n");
             return 1;
         }
         for (int i = 0; i < 32; ++i) {
-            peer.public_key[i] = static_cast<uint8_t>(std::stoul(hex.substr(i * 2, 2), nullptr, 16));
+            int hi = -1, lo = -1;
+            auto nib = [](char ch) {
+                if (ch >= '0' && ch <= '9') return ch - '0';
+                if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+                if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+                return -1;
+            };
+            hi = nib(hex[i * 2]);
+            lo = nib(hex[i * 2 + 1]);
+            if (hi < 0 || lo < 0) {
+                std::printf("peer pubkey must be hex\n");
+                return 1;
+            }
+            peer.public_key[i] = static_cast<uint8_t>((hi << 4) | lo);
         }
         peer.endpoint = argv[3];
         const esp_err_t err = nif.set_peer(peer);
