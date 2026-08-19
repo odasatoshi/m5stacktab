@@ -61,6 +61,31 @@ printf 'ssh <user> <host>\r\n' > /dev/cu.usbmodem101
 - [ ] `scroll 5` で過去に戻り、`scroll -5` で最新に戻る
 - [ ] `bench` の値が記録できる（1 文字あたり数百 us、全画面 70ms 程度）
 
+## 3.5 相手機なしでできる疎通確認
+
+WiFi や相手機が無くても、UDP ループバックで暗号とプロトコルの往復を確かめられる。
+実機に書き込んだ直後の健全性確認に使う。
+
+```sh
+printf 'wgloop\r\n' > /dev/cu.usbmodem101      # WireGuard のハンドシェイクとデータ往復
+printf 'discoloop\r\n' > /dev/cu.usbmodem101   # DISCO の Ping/Pong 往復
+printf 'wgtest\r\n' > /dev/cu.usbmodem101      # 暗号プリミティブの自己検証
+```
+
+期待する出力:
+
+```
+handshake over udp loopback: ok (698062 us)
+data over udp loopback: ok (322 us round trip)
+reverse direction: ok
+
+pong says our address is 127.0.0.1:41651
+disco ping/pong over udp loopback: ok (1420 us round trip)
+  pings=1 pongs=1 unknown=0
+```
+
+これが通らない状態で相手機と繋いでも原因の切り分けができないので、先にここを確認する。
+
 ## 4. WireGuard トンネル（#9）
 
 相手側（Linux / macOS）で WireGuard を用意する。Tab5 の公開鍵は `wg <ip>` の実行時に表示される。
