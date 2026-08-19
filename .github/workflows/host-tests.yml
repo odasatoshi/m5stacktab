@@ -48,6 +48,13 @@ jobs:
               components/wg/crypto_mbedtls.cpp components/wg/transport.cpp -lmbedcrypto
           /tmp/test_noise
 
+      - name: nacl crypto_box (xsalsa20-poly1305)
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \
+              -I components/wg -o /tmp/test_salsa20 components/wg/test_salsa20.cpp \
+              components/wg/salsa20.cpp -lmbedcrypto
+          /tmp/test_salsa20
+
       - name: tailscale ts2021 noise
         run: |
           c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \
