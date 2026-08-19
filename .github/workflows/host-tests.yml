@@ -14,19 +14,15 @@ jobs:
 
       # WireGuard の暗号テストは mbedTLS 3.x を使う（4.x では ChaCha20-Poly1305 が private API）。
       - name: install mbedtls and cjson
-        # apt のミラーが詰まることがあるのでリトライする（5 分では足りなかった）。
-        timeout-minutes: 12
+        # `apt-get update` はミラーが詰まると 10 分以上かかることがある。ランナーは
+        # 既に apt リストを持っているので、まず update 抜きで install を試す。
+        timeout-minutes: 10
         run: |
-          for i in 1 2 3; do
-            sudo apt-get update -qq && break
-            echo "apt-get update failed (attempt $i), retrying"
-            sleep 10
-          done
-          for i in 1 2 3; do
-            sudo apt-get install -y -qq libmbedtls-dev libcjson-dev && break
-            echo "apt-get install failed (attempt $i), retrying"
-            sleep 10
-          done
+          if ! sudo apt-get install -y -qq libmbedtls-dev libcjson-dev; then
+            echo "install without update failed; refreshing lists"
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq libmbedtls-dev libcjson-dev
+          fi
           dpkg -s libmbedtls-dev | grep -i version
 
       # Linux では AddressSanitizer も併用する（macOS の開発機では起動時に固まるため外している）。
