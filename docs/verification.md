@@ -1,7 +1,15 @@
 # 実機での検証手順
 
 実機の目視やネットワークが必要で、ホストテストでは代替できない項目をまとめる。
-上から順に実行すれば、依存関係の順序で確認できる。
+上から順に実行すれば依存関係の順序で確認できる。
+
+コマンドは USB Type-C のシリアルコンソールに送る。対話で使うなら
+`screen /dev/cu.usbmodem101 115200`、非対話なら次の形で送れる。
+
+```sh
+printf '<command>\r\n' > /dev/cu.usbmodem101
+python tools/serial_log.py --no-reset --send "<command>" --seconds 10
+```
 
 ## 0. 準備
 
@@ -10,7 +18,7 @@ source ~/esp/esp-idf/export.sh
 idf.py -p /dev/cu.usbmodem101 flash
 ```
 
-WiFi を設定する（SSID が変わったら再設定が必要）:
+WiFi を設定する（**SSID が変わったら再設定が必要**）:
 
 ```sh
 printf 'wifi <SSID> <パスワード>\r\n' > /dev/cu.usbmodem101
@@ -20,21 +28,21 @@ python tools/serial_log.py --no-reset --send wifi-status --seconds 5
 
 ## 1. 画面キーボードと日本語入力（#7）
 
-`kbd` で画面下部にキーボードが出ている状態で、実機を触って確認する。
+画面下部にキーボードが出ている状態で実機を触る。
 
 - [ ] 3 列 × 4 行のかなキーと、右端の機能キー（⌫ / 変換 / 確定 / abc）が見える
 - [ ] キーを押すと青くなり、四方にフリック先のかなが薄く出る
 - [ ] 「あ」キーを上フリックで「う」、右フリックで「え」が入る
-- [ ] 「か」を押して `゛小` キーで「が」になる（もう一度で「か」に戻る）
+- [ ] 「か」を押して `゛小` キーで「が」になる（もう一度押すと「か」に戻る）
 - [ ] 「にほんご」と入れて `変換` を押すと「日本語」が候補に出る
-- [ ] `確定` で端末に文字が入る（SSH 未接続ならエコーされる）
+- [ ] `確定` で端末に文字が入る（SSH 未接続なら画面にエコーされる）
 
 ## 2. SSH（#5）
 
-```sh
-# 接続先で公開鍵を登録しておく
-cat ~/.ssh/id_rsa_tab5.pub >> ~/.ssh/authorized_keys
+接続先で公開鍵を登録しておく（Tab5 の鍵は `sshkey` パーティションに書いたもの）:
 
+```sh
+cat ~/.ssh/id_rsa_tab5.pub >> ~/.ssh/authorized_keys
 printf 'ssh <user> <host>\r\n' > /dev/cu.usbmodem101
 ```
 
@@ -42,8 +50,8 @@ printf 'ssh <user> <host>\r\n' > /dev/cu.usbmodem101
 - [ ] 画面にリモートのシェルプロンプトが出る
 - [ ] `key ls -la\n` を送ると結果が画面に出る
 - [ ] `key echo 日本語テスト\n` の日本語が正しく表示される
-- [ ] ホスト鍵を変えた別ホストに繋ぐと `HOST KEY CHANGED` で拒否される
-- [ ] 接続を切って再接続してもクラッシュしない
+- [ ] ホスト鍵が変わった相手には `HOST KEY CHANGED` で接続を拒否する
+- [ ] 切断して再接続してもクラッシュしない
 
 ## 3. ターミナル UI（#6）
 
@@ -51,6 +59,7 @@ printf 'ssh <user> <host>\r\n' > /dev/cu.usbmodem101
 - [ ] 文字を入力して保存・終了でき、元の画面に戻る
 - [ ] `key yes | head -2000\n` のような連続出力で取りこぼしやクラッシュがない
 - [ ] `scroll 5` で過去に戻り、`scroll -5` で最新に戻る
+- [ ] `bench` の値が記録できる（1 文字あたり数百 us、全画面 70ms 程度）
 
 ## 4. WireGuard トンネル（#9）
 
@@ -69,7 +78,7 @@ python tools/serial_log.py --no-reset --send "wg stat" --seconds 5
 
 ## 5. Tailscale（#10, #11）
 
-ローカル Headscale を使う（SaaS より原因が分かる）:
+ローカル Headscale を相手にする（SaaS より原因が分かる。プロトコルは同一）。
 
 ```sh
 docker run -d --name headscale-tab5 -p 8080:8080 \
@@ -80,7 +89,7 @@ docker exec headscale-tab5 headscale preauthkeys create --user 1 --reusable --ex
 ```
 
 Rancher Desktop などでポートフォワードが localhost 限定の場合は、`0.0.0.0` で待って
-`127.0.0.1` に中継する TCP プロキシを挟む。
+`127.0.0.1` へ中継する TCP プロキシを挟む必要がある。
 
 ```sh
 printf 'ts <headscale-ip> <authkey> 8080 131\r\n' > /dev/cu.usbmodem101
@@ -96,3 +105,12 @@ printf 'ts <headscale-ip> <authkey> 8080 131\r\n' > /dev/cu.usbmodem101
 
 - [ ] 30 分放置して `alive` ログが続き、ヒープが減り続けないこと
 - [ ] WiFi の AP を落として戻すと再接続する（`reconnect in ... ms` のあと `got ip`）
+
+## 記録の残し方
+
+PR に貼るログは次で採取する。`idf.py monitor` は標準入力が TTY でないと動かないので使えない。
+
+```sh
+python tools/serial_log.py --seconds 30 > /tmp/log.txt          # リセットしてから採取
+python tools/serial_log.py --no-reset --seconds 30 > /tmp/l.txt # 動作中の様子を採取
+```
