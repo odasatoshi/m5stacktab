@@ -26,6 +26,9 @@ struct PeerConfig {
 };
 
 struct NetifStats {
+    // 応答側として処理したハンドシェイク（相手から rekey された回数）。
+    uint32_t responses_sent = 0;
+    uint32_t stale_initiations = 0;  // タイムスタンプが巻き戻っていて拒否した数
     uint32_t tx_packets = 0;
     uint32_t rx_packets = 0;
     uint32_t tx_bytes   = 0;

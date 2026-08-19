@@ -19,6 +19,8 @@
 #include <nvs_flash.h>
 
 #include <esp_netif.h>
+#include <arpa/inet.h>
+#include <lwip/sockets.h>
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/error.h>
@@ -30,7 +32,9 @@
 #include "skk_dict.hpp"
 #include "ssh.hpp"
 #include "ts_client.hpp"
+#include "disco.hpp"
 #include "disco_responder.hpp"
+#include "salsa20.hpp"
 #include "netmap.hpp"
 #include <driver/ppa.h>
 #include <esp_memory_utils.h>
@@ -653,6 +657,274 @@ int cmd_ts(int argc, char** argv)
     return ok ? 0 : 1;
 }
 
+// DISCO の Ping/Pong を実機で往復させる。相手機が無くても、自分を peer として登録して
+// UDP ループバックで投げ合えば「レスポンダが正しく応答するか」を確かめられる。
+int cmd_discoloop(int, char**)
+{
+    const auto& c = wg::default_crypto();
+
+    // 2 者ぶんの disco 鍵を作る（片方が Tab5 のレスポンダ、もう片方が仮想のピア）。
+    uint8_t me_priv[32], me_pub[32], peer_priv[32], peer_pub[32];
+    if (!c.random_bytes(me_priv, 32) || !c.random_bytes(peer_priv, 32) ||
+        !c.dh_pubkey(me_pub, me_priv) || !c.dh_pubkey(peer_pub, peer_priv)) {
+        std::printf("key generation failed\n");
+        return 1;
+    }
+
+    ts::DiscoResponder resp;
+    if (!resp.set_key(me_priv) || !resp.add_peer(peer_pub)) {
+        std::printf("responder setup failed\n");
+        return 1;
+    }
+
+    // ピア側の共有鍵（beforenm）を作る
+    uint8_t dh[32], peer_shared[32];
+    if (!c.dh(dh, peer_priv, me_pub)) {
+        std::printf("dh failed\n");
+        return 1;
+    }
+    wg::box_beforenm(peer_shared, dh);
+
+    // UDP でループバックに投げ合う
+    const int sp = socket(AF_INET, SOCK_DGRAM, 0);
+    const int sm = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sp < 0 || sm < 0) {
+        std::printf("socket failed\n");
+        if (sp >= 0) close(sp);
+        if (sm >= 0) close(sm);
+        return 1;
+    }
+    sockaddr_in peer_addr{}, me_addr{};
+    peer_addr.sin_family      = me_addr.sin_family = AF_INET;
+    peer_addr.sin_addr.s_addr = me_addr.sin_addr.s_addr = htonl(0x7f000001);
+    peer_addr.sin_port        = htons(41651);
+    me_addr.sin_port          = htons(41652);
+    bool ok = bind(sp, reinterpret_cast<sockaddr*>(&peer_addr), sizeof(peer_addr)) == 0 &&
+              bind(sm, reinterpret_cast<sockaddr*>(&me_addr), sizeof(me_addr)) == 0;
+    timeval tv{2, 0};
+    setsockopt(sp, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sm, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (!ok) {
+        std::printf("bind failed\n");
+        close(sp);
+        close(sm);
+        return 1;
+    }
+
+    // ピアが Ping を送る
+    uint8_t tx_id[ts::kDiscoTxIdLen], nonce[ts::kDiscoNonceLen];
+    if (!c.random_bytes(tx_id, sizeof(tx_id)) || !c.random_bytes(nonce, sizeof(nonce))) {
+        close(sp);
+        close(sm);
+        return 1;
+    }
+    static uint8_t pkt[512];
+    const int64_t  t0 = esp_timer_get_time();
+    const size_t   plen =
+        ts::disco_build_ping(pkt, sizeof(pkt), peer_pub, peer_shared, tx_id, nullptr, nonce);
+    if (plen == 0) {
+        std::printf("build_ping failed\n");
+        close(sp);
+        close(sm);
+        return 1;
+    }
+    sendto(sp, pkt, plen, 0, reinterpret_cast<sockaddr*>(&me_addr), sizeof(me_addr));
+
+    // Tab5 側が受けて Pong を返す（wg_netif の foreign ハンドラと同じ処理）
+    sockaddr_in from{};
+    socklen_t   from_len = sizeof(from);
+    ssize_t     n = recvfrom(sm, pkt, sizeof(pkt), 0, reinterpret_cast<sockaddr*>(&from), &from_len);
+    if (n <= 0) {
+        std::printf("ping not received\n");
+        close(sp);
+        close(sm);
+        return 1;
+    }
+    static uint8_t pong[512];
+    const size_t   mlen = resp.handle(pkt, static_cast<size_t>(n), from.sin_addr.s_addr,
+                                    ntohs(from.sin_port), pong, sizeof(pong));
+    if (mlen == 0) {
+        std::printf("responder did not answer (peers=%u unknown=%u)\n", (unsigned)resp.peer_count(),
+                    (unsigned)resp.unknown_peers());
+        close(sp);
+        close(sm);
+        return 1;
+    }
+    sendto(sm, pong, mlen, 0, reinterpret_cast<sockaddr*>(&from), sizeof(from));
+    resp.note_send_result(true);
+
+    // ピアが Pong を受けて中身を確認する
+    n = recvfrom(sp, pkt, sizeof(pkt), 0, nullptr, nullptr);
+    const int64_t rt_us = esp_timer_get_time() - t0;
+    if (n <= 0) {
+        std::printf("pong not received\n");
+        close(sp);
+        close(sm);
+        return 1;
+    }
+    ts::DiscoType type{};
+    bool          opened = ts::disco_open(pkt, static_cast<size_t>(n), peer_shared, &type, nullptr);
+    bool          tx_ok  = false;
+    if (opened && type == ts::DiscoType::kPong) {
+        // TxID と、返ってきた送信元アドレスを確かめる
+        static uint8_t plain[512];
+        const size_t   box_len = static_cast<size_t>(n) - ts::kDiscoHeaderLen;
+        if (wg::secretbox_open(plain, pkt + ts::kDiscoHeaderLen, box_len,
+                               pkt + ts::kDiscoMagicLen + ts::kDiscoKeyLen, peer_shared)) {
+            tx_ok = std::memcmp(plain + 2, tx_id, sizeof(tx_id)) == 0;
+            const uint8_t* ip = plain + 2 + ts::kDiscoTxIdLen;
+            const uint16_t port = static_cast<uint16_t>((ip[16] << 8) | ip[17]);
+            std::printf("pong says our address is %u.%u.%u.%u:%u\n", ip[12], ip[13], ip[14], ip[15],
+                        port);
+        }
+    }
+    std::printf("disco ping/pong over udp loopback: %s (%lld us round trip)\n",
+                (opened && type == ts::DiscoType::kPong && tx_ok) ? "ok" : "FAILED", rt_us);
+    std::printf("  pings=%u pongs=%u unknown=%u\n", (unsigned)resp.pings_received(),
+                (unsigned)resp.pongs_sent(), (unsigned)resp.unknown_peers());
+    close(sp);
+    close(sm);
+    return (opened && tx_ok) ? 0 : 1;
+}
+
+// WireGuard のハンドシェイクと暗号化を、実機のループバック相手に往復させる。
+// 相手機や WiFi が無くても「トンネルとして成立するか」を確かめられる。
+// 2 つの独立した鍵ペアを作り、UDP でお互いに投げ合う（実装は wg_netif とは別経路）。
+int cmd_wgloop(int, char**)
+{
+    const auto& c = wg::default_crypto();
+    uint8_t a_priv[32], a_pub[32], b_priv[32], b_pub[32];
+    if (!c.random_bytes(a_priv, 32) || !c.random_bytes(b_priv, 32) ||
+        !c.dh_pubkey(a_pub, a_priv) || !c.dh_pubkey(b_pub, b_priv)) {
+        std::printf("key generation failed\n");
+        return 1;
+    }
+
+    // 2 つの UDP ソケットを作って localhost で向き合わせる。
+    const int sa = socket(AF_INET, SOCK_DGRAM, 0);
+    const int sb = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sa < 0 || sb < 0) {
+        std::printf("socket failed\n");
+        if (sa >= 0) close(sa);
+        if (sb >= 0) close(sb);
+        return 1;
+    }
+    sockaddr_in addr_a{}, addr_b{};
+    addr_a.sin_family      = addr_b.sin_family = AF_INET;
+    addr_a.sin_addr.s_addr = addr_b.sin_addr.s_addr = htonl(0x7f000001);  // 127.0.0.1
+    addr_a.sin_port        = htons(51820);
+    addr_b.sin_port        = htons(51821);
+    bool ok = bind(sa, reinterpret_cast<sockaddr*>(&addr_a), sizeof(addr_a)) == 0 &&
+              bind(sb, reinterpret_cast<sockaddr*>(&addr_b), sizeof(addr_b)) == 0;
+    timeval tv{2, 0};
+    setsockopt(sa, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sb, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (!ok) {
+        std::printf("bind failed\n");
+        close(sa);
+        close(sb);
+        return 1;
+    }
+
+    wg::Handshake ha(c), hb(c);
+    if (!ha.set_keys(a_priv, b_pub) || !hb.set_keys(b_priv, a_pub)) {
+        std::printf("set_keys failed\n");
+        close(sa);
+        close(sb);
+        return 1;
+    }
+
+    // A が initiation を送る
+    static uint8_t buf[2048];
+    uint8_t        ts[12] = {0x40, 0, 0, 0, 0x67, 0x89, 0xab, 0xcd, 0, 0, 0, 1};
+    const int64_t  t0 = esp_timer_get_time();
+    if (!ha.create_initiation(buf, 0x1111, ts)) {
+        std::printf("create_initiation failed\n");
+        close(sa);
+        close(sb);
+        return 1;
+    }
+    sendto(sa, buf, 148, 0, reinterpret_cast<sockaddr*>(&addr_b), sizeof(addr_b));
+
+    // B が受けて応答する
+    ssize_t n = recvfrom(sb, buf, sizeof(buf), 0, nullptr, nullptr);
+    if (n != 148) {
+        std::printf("initiation not received (%d)\n", (int)n);
+        close(sa);
+        close(sb);
+        return 1;
+    }
+    uint8_t     learned[32], tsout[12];
+    wg::Keypair kb, ka;
+    if (!hb.consume_initiation(buf, learned, tsout) || !hb.create_response(buf, 0x2222, kb)) {
+        std::printf("responder side failed\n");
+        close(sa);
+        close(sb);
+        return 1;
+    }
+    sendto(sb, buf, 92, 0, reinterpret_cast<sockaddr*>(&addr_a), sizeof(addr_a));
+
+    // A が応答を受けて鍵を確定する
+    n = recvfrom(sa, buf, sizeof(buf), 0, nullptr, nullptr);
+    if (n != 92 || !ha.consume_response(buf, ka)) {
+        std::printf("response not accepted (%d)\n", (int)n);
+        close(sa);
+        close(sb);
+        return 1;
+    }
+    const int64_t hs_us = esp_timer_get_time() - t0;
+    const bool    keys_match = std::memcmp(ka.send, kb.recv, 32) == 0 &&
+                            std::memcmp(ka.recv, kb.send, 32) == 0;
+    std::printf("handshake over udp loopback: %s (%lld us)\n", keys_match ? "ok" : "KEY MISMATCH",
+                hs_us);
+
+    // 確定した鍵で実際にパケットを往復させる
+    wg::Transport ta(c), tb(c);
+    ta.set_keypair(ka);
+    tb.set_keypair(kb);
+    const char*  payload = "tunnel payload over loopback";
+    const size_t plen    = std::strlen(payload);
+    const int64_t t1 = esp_timer_get_time();
+    const size_t  wlen =
+        ta.encrypt(buf, sizeof(buf), reinterpret_cast<const uint8_t*>(payload), plen);
+    if (wlen == 0) {
+        // 暗号化の失敗と経路の不通を区別できるようにする（検証コマンドなので重要）。
+        std::printf("encrypt failed\n");
+        close(sa);
+        close(sb);
+        return 1;
+    }
+    sendto(sa, buf, wlen, 0, reinterpret_cast<sockaddr*>(&addr_b), sizeof(addr_b));
+    n = recvfrom(sb, buf, sizeof(buf), 0, nullptr, nullptr);
+    static uint8_t out[2048];
+    bool           valid = false;
+    const size_t   got = (n > 0) ? tb.decrypt(out, sizeof(out), buf, static_cast<size_t>(n), &valid)
+                                 : 0;
+    const int64_t rt_us    = esp_timer_get_time() - t1;
+    const bool    data_ok  = valid && got == plen && std::memcmp(out, payload, plen) == 0;
+    std::printf("data over udp loopback: %s (%lld us round trip)\n", data_ok ? "ok" : "FAILED",
+                rt_us);
+
+    // 逆方向も確認する（応答側の鍵で送れること）
+    const size_t rlen = tb.encrypt(buf, sizeof(buf), reinterpret_cast<const uint8_t*>("reply"), 5);
+    bool         rev_ok = false;
+    if (rlen == 0) {
+        std::printf("reverse encrypt failed\n");
+    } else {
+        sendto(sb, buf, rlen, 0, reinterpret_cast<sockaddr*>(&addr_a), sizeof(addr_a));
+        n = recvfrom(sa, buf, sizeof(buf), 0, nullptr, nullptr);
+        const size_t got2 =
+            (n > 0) ? ta.decrypt(out, sizeof(out), buf, static_cast<size_t>(n), &valid) : 0;
+        rev_ok = valid && got2 == 5 && std::memcmp(out, "reply", 5) == 0;
+    }
+    std::printf("reverse direction: %s\n", rev_ok ? "ok" : "FAILED");
+
+    close(sa);
+    close(sb);
+    // 3 つ全部が通って初めて成功。検証手順から戻り値で判定できるようにする。
+    return (keys_match && data_ok && rev_ok) ? 0 : 1;
+}
+
 // DISCO レスポンダ。WireGuard と同じ UDP ポートに来るので、netif の
 // 「WireGuard 以外のパケット」ハンドラから呼ぶ。
 ts::DiscoResponder s_disco;
@@ -720,8 +992,9 @@ int cmd_wg(int argc, char** argv)
                     nif.is_up() ? 1 : 0, nif.handshake_done() ? 1 : 0, (unsigned)st.tx_packets,
                     (unsigned)st.tx_bytes, (unsigned)st.tx_dropped, (unsigned)st.rx_packets,
                     (unsigned)st.rx_bytes, (unsigned)st.rx_dropped);
-        std::printf("  handshakes=%u rekeys=%u keepalives=%u\n", (unsigned)st.handshakes,
-                    (unsigned)st.rekeys, (unsigned)st.keepalives);
+        std::printf("  handshakes=%u rekeys=%u keepalives=%u responses=%u stale=%u\n",
+                    (unsigned)st.handshakes, (unsigned)st.rekeys, (unsigned)st.keepalives,
+                    (unsigned)st.responses_sent, (unsigned)st.stale_initiations);
         return 0;
     }
     if (argc < 2) {
@@ -1063,6 +1336,10 @@ void register_term_commands()
         {"kbd", "画面キーボードの表示切り替え", "[off]", &cmd_kbd, nullptr, nullptr, nullptr},
         {"wgtest", "WireGuard の暗号とハンドシェイクを実機で検証", nullptr, &cmd_wgtest, nullptr,
          nullptr, nullptr},
+        {"wgloop", "UDP ループバックでトンネルを往復させる（相手機不要）", nullptr, &cmd_wgloop,
+         nullptr, nullptr, nullptr},
+        {"discoloop", "UDP ループバックで DISCO の Ping/Pong を往復させる", nullptr,
+         &cmd_discoloop, nullptr, nullptr, nullptr},
         {"keytest", "sshkey パーティションの鍵を mbedTLS で直接パースする", nullptr, &cmd_keytest,
          nullptr, nullptr, nullptr},
         {"rottest", "座標変換が setRotation(1) と一致するか実機で照合", nullptr, &cmd_rottest,
