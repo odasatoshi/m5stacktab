@@ -34,22 +34,27 @@ uint32_t load_le32(const uint8_t* p)
 
 }  // namespace
 
-void Transport::set_keypair(const Keypair& kp, bool confirmed)
+void Transport::set_keypair(const Keypair& kp)
 {
     // 今の世代を 1 つ前に降格する。捨ててしまうと、相手がまだ古い鍵で送っている間の
     // パケットが全部復号できなくなる（rekey が交差すると数秒間そうなる）。
-    if (cur_.valid) prev_ = cur_;
+    //
+    // ただし**未確認の世代で確認済みの世代を押し出してはいけない**。
+    // こちらの msg2 が落ちるとピアは msg1 を再送し、そのたびに新しい未確認世代が来る。
+    // 無条件に降格すると「ピアが一度も持っていない世代」だけが残り、
+    // 送信が全損したままピアの送信を待つしかなくなる（ローカルには何も出ない）。
+    if (cur_.valid && (cur_.confirmed || !prev_.valid)) prev_ = cur_;
 
     cur_              = SessionState{};
     cur_.kp           = kp;
     cur_.valid        = true;
-    cur_.confirmed    = confirmed;
+    cur_.confirmed    = kp.initiator;
     cur_.send_counter = 0;
     cur_.recv_max     = 0;
     std::memset(cur_.window, 0, sizeof(cur_.window));
 }
 
-SessionState* Transport::sending_session()
+const SessionState* Transport::sending_session() const
 {
     // 現世代の確認が取れていて有効ならそれで送る。
     if (cur_.valid && cur_.confirmed) return &cur_;
@@ -96,6 +101,8 @@ bool Transport::check_replay(SessionState& s, uint64_t counter)
         const size_t   words = static_cast<size_t>(shift / 64);
         const unsigned bits  = static_cast<unsigned>(shift % 64);
         constexpr size_t n   = kReplayWindow / 64;
+        // shift < kReplayWindow は上の分岐で保証されているので words < n。
+        // ウィンドウ幅を変えたときに UB にならないよう残してある。
         if (words >= n) {
             std::memset(s.window, 0, sizeof(s.window));
         } else {
@@ -103,7 +110,7 @@ bool Transport::check_replay(SessionState& s, uint64_t counter)
                 uint64_t v = (i >= words) ? s.window[i - words] : 0;
                 if (bits && i >= words) {
                     const uint64_t lower = (i > words) ? s.window[i - words - 1] : 0;
-                    v = (v << bits) | (bits ? (lower >> (64 - bits)) : 0);
+                    v = (v << bits) | (lower >> (64 - bits));
                 }
                 s.window[i] = v;
             }

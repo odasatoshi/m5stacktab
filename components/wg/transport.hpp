@@ -32,10 +32,11 @@ public:
     Transport(const Crypto& crypto) : c_(crypto) {}
 
     // 新しい鍵世代を入れる。今の世代は「1 つ前」に降格し、そのまま復号に使える。
-    // confirmed = true は「自分がハンドシェイクを完了させた側」（開始側）のとき。
-    // 応答側は false で入れて、相手からデータが来たら昇格させる。
-    void set_keypair(const Keypair& kp, bool confirmed = true);
-    bool ready() const { return cur_.valid || prev_.valid; }
+    // 「相手がこの鍵を持っていると確定しているか」は kp.initiator がそのまま表す
+    // （開始側は msg2 を受けた時点で確定、応答側は msg2 が届いたか分からない）。
+    // 引数で渡すようにすると呼び出し側の書き忘れで静かに無効化されるので持たせない。
+    void set_keypair(const Keypair& kp);
+    bool ready() const { return cur_.valid; }
 
     // 平文パケットを暗号化する。out は len + kTransportHeader + kTagLen 必要。
     // 返り値は出力バイト数。0 なら失敗。
@@ -46,13 +47,8 @@ public:
     size_t decrypt(uint8_t* out, size_t out_cap, const uint8_t* in, size_t len, bool* is_valid);
 
     // 実際に送信に使っている世代のカウンタ（rekey 確認前は 1 つ前の世代）。
-    uint64_t send_counter() const
-    {
-        const SessionState* s = (cur_.valid && cur_.confirmed) ? &cur_
-                                : prev_.valid                  ? &prev_
-                                                               : &cur_;
-        return s->send_counter;
-    }
+    uint64_t send_counter() const { return sending_session()->send_counter; }
+    // 現世代の受信カウンタ。rekey 直後に 1 つ前で通信している間は 0 を返す。
     uint64_t recv_max() const { return cur_.recv_max; }
     uint32_t replay_drops() const { return replay_drops_; }
     bool     current_confirmed() const { return cur_.confirmed; }
@@ -61,7 +57,11 @@ public:
 private:
     bool check_replay(SessionState& s, uint64_t counter);
     // 送信に使う世代を選ぶ。現世代の確認が取れていなければ 1 つ前を使う。
-    SessionState* sending_session();
+    const SessionState* sending_session() const;
+    SessionState* sending_session()
+    {
+        return const_cast<SessionState*>(static_cast<const Transport*>(this)->sending_session());
+    }
 
     const Crypto& c_;
     SessionState  cur_{};
