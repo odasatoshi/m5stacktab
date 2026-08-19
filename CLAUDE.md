@@ -58,7 +58,12 @@ python tools/serial_log.py --seconds 20      # ログ採取
 - **L2 キャッシュを増やしてはいけない**。`SRAM_HIGH_SIZE = 0x80000 - CONFIG_CACHE_L2_CACHE_SIZE`
   なので、512KB にすると内蔵 SRAM の上半分 384KB が消える（内蔵ヒープ 567KB → 178KB）。
   underrun 対策には効かない（DPI は DMA で PSRAM を直読みする）。既定の 128KB のままにする
-- パネルはネイティブ縦 (720x1280)。横で使うなら `setRotation(1)`
+- パネルはネイティブ縦 (720x1280)。横で使うなら `setRotation(1)`。
+  **ただし回転すると転送が 3.3 倍遅くなる**（実測: 1280x24 の pushSprite が rot=0 で 1.21ms、
+  rot=1 で 3.96ms）。回転時は M5GFX がピクセル単位で座標変換するため。
+  全画面書き換えは 111ms（≒9fps）。差分更新なら 1 行 4ms で足りる。
+  横向きのまま速くするには ESP32-P4 の PPA (Pixel Processing Accelerator) で回転させる必要がある → #16
+- `Panel_DSI` はフレームバッファを `config_detail().buffer` で公開している（`Panel_FrameBufferBase` 派生）
 - P4 に WiFi は無い。ESP32-C6 を esp-hosted (SDIO) 経由で使う。ここに罠が 2 つある:
   - **C6 の電源は I2C の IO エクスパンダ (PI4IOE5V6408 @0x44) の pin0**。しかもこのチップは
     既定で全ピン Hi-Z なので、方向を出力にするだけでは電流が出ない。**Hi-Z レジスタ (0x07) の
