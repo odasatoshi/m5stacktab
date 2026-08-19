@@ -82,6 +82,20 @@ python tools/serial_log.py --seconds 20      # ログ採取
 - `CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM` は有効にしない。TX mempool の 1600B ストライドが
   128B キャッシュラインと合わず CMD53 がアライメント検査で弾かれる
 
+## lwIP を触るときの制約
+
+`CONFIG_LWIP_TCPIP_CORE_LOCKING` は無効なので、次を守る必要がある。
+
+- **`netif->output` の中で `sendto()` を呼んではいけない**。output は tcpip スレッドの上で
+  動くので、`sendto` → `tcpip_send_msg_wait_sem` で tcpip スレッド自身がセマフォを待ち、
+  **TCP/IP スタック全体がデッドロックする**（WiFi も SSH も止まる）。
+  パケットはキューに渡して別タスクで送る
+- **tcpip タスクのスタックは 3072B しかない**（`CONFIG_LWIP_TCPIP_TASK_STACK_SIZE`）。
+  output の中で KB 単位のローカル変数を取ると溢れる
+- **`netif_add` / `netif_remove` は `tcpip_callback` 経由で呼ぶ**。他スレッドから
+  `netif_list` を触ると、走査中のリストを壊す（WiFi 側は esp_netif が内部でやっている）
+- `tcpip_input` は tcpip スレッドにキューするだけなので、どのタスクから呼んでもよい
+
 ## SSH の鍵
 
 秘密鍵は `sshkey` パーティションに置く（NVS の blob 長制限と base64 経由を避けるため）。
@@ -119,7 +133,9 @@ c++ -std=c++17 -Wall -Wextra -Werror -O1 -I$M3/include -I components/wg \
 - **X25519 は mbedTLS の `mbedtls_ecp_mul` では自動でクランプされない**。RFC 7748 のとおり
   `k[0] &= 248; k[31] &= 127; k[31] |= 64` を自分でやる
 - **Montgomery カーブの `mbedtls_ecp_mul` は `f_rng` が必須**（座標ブラインディング）。NULL だと失敗する
-- **コンソールタスクのスタックは 16KB 必要**。既定 4KB では X25519 がスタック保護フォルトを起こす
+- **X25519 は 1 回で 10KB 近くスタックを使う**。既定 4KB では即スタック保護フォルト。
+  コンソールタスクは 32KB（鍵導出と netif 初期化が重なる経路があるため 16KB でも足りなかった）、
+  WireGuard の受信タスクも 16KB 必要。受信バッファは static にしてスタックから外す
 
 ## Tailscale / Headscale の開発環境
 
