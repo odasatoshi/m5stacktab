@@ -205,3 +205,24 @@ render path (vt100 -> sprite -> PPA -> framebuffer): ok
 角度だけを `ANGLE_90` に戻すと、右端に緑が来て（横方向の反転）`FAILED` になる。
 
 任意の座標の色を見たいときは `pix <lx> <ly> ...`。
+
+## 画面キャプチャ
+
+写真が撮れない状況（遠隔、CI、エージェント実行）でも、フレームバッファを吸い出せば
+画面が絡む変更の証跡を残せる。視差も照明も入らないので写真より正確。
+
+```sh
+# 全画面（間引き 4 → 320x180、約 20 秒）
+python tools/serial_log.py --no-reset --seconds 40 --send screencap > cap.log
+python tools/screencap.py cap.log screen.png
+
+# 文字を読みたいときは範囲を絞って間引きなし
+python tools/serial_log.py --no-reset --seconds 40 --send "screencap 1 0 0 640 48" > cap.log
+python tools/screencap.py cap.log top.png
+```
+
+`screencap [step] [x] [y] [w] [h]`。rotation 1（キーボードが描くのと同じ向き）で読むので、
+出てくる絵は目で見えているものと同じになる。
+
+`docs/screenshots/` に、端末とキーボードの天地が揃っていることを確かめたときの
+キャプチャを置いてある。

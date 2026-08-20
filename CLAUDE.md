@@ -49,6 +49,9 @@ python tools/serial_log.py --seconds 20      # ログ採取
 `idf.py monitor` は標準入力が TTY でないと動かないので、非対話環境では
 `tools/serial_log.py` を使う（RTS でリセットしてから指定秒数だけ拾う）。
 
+画面の証跡は実機の `screencap` + `tools/screencap.py` で PNG にできる
+（フレームバッファを読むので、写真が撮れない環境でも「画面キャプチャ」の要件を満たせる）。
+
 ## ハード由来のハマりどころ
 
 - **PSRAM は 200MHz が必須**。ESP32-P4 のデフォルトは 20MHz で、1280x720 の MIPI-DSI が

@@ -1395,6 +1395,55 @@ int cmd_ppatest(int, char**)
     return err == ESP_OK ? 0 : 1;
 }
 
+// 画面をシリアル経由で吸い出す。CLAUDE.md が「画面が絡む変更は写真か画面キャプチャ」を
+// 求めているが、遠隔・エージェント実行では写真が撮れない。フレームバッファを読めば
+// キャプチャは作れるし、視差も照明もないぶん写真より正確に判定できる。
+//
+// rotation 1（キーボードが描くのと同じ向き = 物理的に正しい向き）で読むので、
+// 出てくる絵はユーザーが見ているものと同じになる。端末だけが 180 度ずれていれば
+// その通りに写る。
+//
+// 115200 baud なので間引く。step=4 で 320x180、16 進で約 230KB / 20 秒。
+int cmd_screencap(int argc, char** argv)
+{
+    const int step = (argc > 1) ? atoi(argv[1]) : 4;
+    // 範囲を絞れば文字が読める解像度でも現実的な時間で吸い出せる。
+    const int x0 = (argc > 2) ? atoi(argv[2]) : 0;
+    const int y0 = (argc > 3) ? atoi(argv[3]) : 0;
+    const int rw = (argc > 4) ? atoi(argv[4]) : (int)display.width() - x0;
+    const int rh = (argc > 5) ? atoi(argv[5]) : (int)display.height() - y0;
+    if (step < 1 || step > 32 || x0 < 0 || y0 < 0 || rw <= 0 || rh <= 0 ||
+        x0 + rw > (int)display.width() || y0 + rh > (int)display.height()) {
+        std::printf("usage: screencap [step] [x] [y] [w] [h]   (step 1-32, 既定 4 で全画面)\n");
+        return 1;
+    }
+    TermGuard guard;
+    if (!guard.ok()) {
+        std::printf("busy\n");
+        return 1;
+    }
+    const int w = rw / step;
+    const int h = rh / step;
+    std::printf("SCREENCAP %d %d %d\n", w, h, step);
+    // 1 行ぶんをまとめて組んでから出す。1 画素ずつ printf すると桁違いに遅い。
+    static char line[1281 * 4 + 8];
+    for (int y = 0; y < h; ++y) {
+        char* out = line;
+        for (int x = 0; x < w; ++x) {
+            const uint16_t px = display.readPixel(x0 + x * step, y0 + y * step);
+            static const char kHex[] = "0123456789abcdef";
+            *out++ = kHex[(px >> 12) & 0xF];
+            *out++ = kHex[(px >> 8) & 0xF];
+            *out++ = kHex[(px >> 4) & 0xF];
+            *out++ = kHex[px & 0xF];
+        }
+        *out = '\0';
+        std::printf("%s\n", line);
+    }
+    std::printf("SCREENCAP END\n");
+    return 0;
+}
+
 // **本番のレンダラ経路を通して**回転を判定する。
 //
 // rottest も ppatest も term_render.cpp の回転を守れない。rottest は純関数の
@@ -1574,6 +1623,8 @@ void register_term_commands()
          &cmd_discoloop, nullptr, nullptr, nullptr},
         {"keytest", "sshkey パーティションの鍵を mbedTLS で直接パースする", nullptr, &cmd_keytest,
          nullptr, nullptr, nullptr},
+        {"screencap", "画面をシリアルに吸い出す（PNG は tools/screencap.py）", "[step]",
+         &cmd_screencap, nullptr, nullptr, nullptr},
         {"termcheck", "本番のレンダラ経路で描いて画素で回転を判定する", nullptr, &cmd_termcheck,
          nullptr, nullptr, nullptr},
         {"pix", "横向き座標の画素の色を読む", "<lx> <ly> ...", &cmd_pix, nullptr, nullptr, nullptr},
