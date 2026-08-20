@@ -2,6 +2,8 @@
 // 今の段階では「画面にターミナルを描く土台」と「WiFi 接続」まで。
 // SSH セッションを繋ぐのは #5 / #6。
 #include <cstdint>
+#include <cstdlib>
+#include <utility>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -212,8 +214,7 @@ std::string unescape(const char* src)
 // エージェント実行）で SSH の出力や描画を検証する唯一の手段なので、
 // 見た目ではなくセルの中身をそのまま出す。
 //
-// 出すのはライブ画面（cell）。scroll でスクロールバックを見ている間は
-// 画面に出ているもの（view_cell）とずれる。
+// 出すのは「今画面に見えているもの」（view_offset を反映する）。
 int cmd_termdump(int, char**)
 {
     TermGuard guard;
@@ -221,11 +222,18 @@ int cmd_termdump(int, char**)
         std::printf("busy\n");
         return 1;
     }
-    std::printf("--- term %dx%d cursor=(%d,%d)%s ---\n", term->cols(), term->rows(),
-                term->cursor_x(), term->cursor_y(), term->cursor_visible() ? "" : " hidden");
-    // UTF-8 化は vt100 の row_text に任せる（ホストテストで全角の境界まで固めてある）。
+    std::printf("--- term %dx%d cursor=(%d,%d)%s scrollback=%d/%d ---\n", term->cols(),
+                term->rows(), term->cursor_x(), term->cursor_y(),
+                term->cursor_visible() ? "" : " hidden", term->view_offset(),
+                term->scrollback_lines());
+    if (term->scrollback_stalled()) {
+        std::printf("!! scrollback stalled: 確保時の桁数と食い違っているので積んでいない\n");
+    }
+    // UTF-8 化は vt100 に任せる（ホストテストで全角の境界まで固めてある）。
+    // **view_row_text を使う。** スクロールバックを見ている間、ライブ画面を出すと
+    // 画面と食い違って「dump したのに見えているものと違う」ことになる。
     for (int y = 0; y < term->rows(); ++y) {
-        std::printf("%2d|%s\n", y, term->row_text(y).c_str());
+        std::printf("%2d|%s\n", y, term->view_row_text(y).c_str());
     }
     std::printf("--- end (bell=%u) ---\n", (unsigned)term->bell_count());
     return 0;
@@ -1098,38 +1106,99 @@ void set_menu_visible(bool show)
 // そこは指で押して確かめるしかない（touchlog を使う）。
 int cmd_touchmap(int, char**)
 {
-    rot::Panel panel;
-    panel.native_w = 720;
-    panel.native_h = 1280;
+    rot::Panel panel;  // 既定値が 720x1280
 
     const uint8_t prev = display.getRotation();
     display.setRotation(1);
     std::printf("M5GFX の convertRawXY と components/rotate を照合 (rotation 1):\n");
-    struct P { int nx, ny; const char* name; };
-    const P pts[] = {
-        {0, 0, "native 左上"},
-        {panel.native_w - 1, 0, "native 右上"},
-        {0, panel.native_h - 1, "native 左下"},
-        {panel.native_w - 1, panel.native_h - 1, "native 右下"},
-        {360, 640, "native 中央"},
-    };
-    int bad = 0;
-    for (const auto& pt : pts) {
+
+    // **ビット一致は要求しない。** タッチ側は float のアフィン変換を通り
+    // （`_affine[0] * (float)x + ...` を int32 に切り捨てる）、そのあとの
+    // swap と反転は整数。描画側 (rot::native_to_landscape) は最初から整数なので、
+    // 差は「アフィン係数の誤差 x 座標」＋切り捨てになる。
+    // **誤差はスケール由来なので座標が大きいところで最大になる。** だから最端
+    // (719 / 1279) を必ず踏む。四隅を別扱いで印字するだけにすると、
+    // 一番効いてほしい点が判定から外れる。
+    constexpr int kTolerance = 1;
+    int max_dx = 0, max_dy = 0, bad = 0, checked = 0;
+    int wx_nx = 0, wx_ny = 0, wy_nx = 0, wy_ny = 0;
+
+    auto check = [&](int nx, int ny) {
         lgfx::touch_point_t tp{};
-        tp.x = (int16_t)pt.nx;
-        tp.y = (int16_t)pt.ny;
+        tp.x = (int16_t)nx;
+        tp.y = (int16_t)ny;
         display.convertRawXY(&tp, 1);
         int lx = 0, ly = 0;
-        rot::native_to_landscape(panel, pt.nx, pt.ny, &lx, &ly);
-        const bool ok = (tp.x == lx && tp.y == ly);
-        if (!ok) ++bad;
-        std::printf("  %-12s (%3d,%4d) -> m5gfx(%4d,%3d) rotate(%4d,%3d) %s\n", pt.name, pt.nx,
-                    pt.ny, (int)tp.x, (int)tp.y, lx, ly, ok ? "ok" : "MISMATCH");
+        rot::native_to_landscape(panel, nx, ny, &lx, &ly);
+        const int dx = std::abs((int)tp.x - lx);
+        const int dy = std::abs((int)tp.y - ly);
+        ++checked;
+        // dx と dy で別々に最悪点を覚える。1 点に混ぜると、印字した座標と
+        // 数字の出所が食い違う。
+        if (dx > max_dx) {
+            max_dx = dx;
+            wx_nx  = nx;
+            wx_ny  = ny;
+        }
+        if (dy > max_dy) {
+            max_dy = dy;
+            wy_nx  = nx;
+            wy_ny  = ny;
+        }
+        if (dx > kTolerance || dy > kTolerance) {
+            ++bad;
+            std::printf("  native (%3d,%4d) -> m5gfx(%4d,%3d) rotate(%4d,%3d) OVER TOLERANCE\n",
+                        nx, ny, (int)tp.x, (int)tp.y, lx, ly);
+        }
+        return std::pair<int, int>{(int)tp.x, (int)tp.y};
+    };
+
+    // 全域を格子で舐める。最端を必ず含めるため、刻みを進めたあとに端へ丸める。
+    for (int nx = 0; nx < panel.native_w; nx = (nx + 37 >= panel.native_w - 1 && nx != panel.native_w - 1)
+                                                   ? panel.native_w - 1
+                                                   : nx + 37) {
+        for (int ny = 0; ny < panel.native_h;
+             ny = (ny + 53 >= panel.native_h - 1 && ny != panel.native_h - 1) ? panel.native_h - 1
+                                                                              : ny + 53) {
+            check(nx, ny);
+            if (ny == panel.native_h - 1) break;
+        }
+        if (nx == panel.native_w - 1) break;
+    }
+
+    // 四隅は個別にも出す（読み手が一番見たい値）。**判定は上の格子に含まれている。**
+    const struct { int nx, ny; const char* name; } corners[] = {
+        {0, 0, "左上"},
+        {panel.native_w - 1, 0, "右上"},
+        {0, panel.native_h - 1, "左下"},
+        {panel.native_w - 1, panel.native_h - 1, "右下"},
+    };
+    for (const auto& c : corners) {
+        lgfx::touch_point_t tp{};
+        tp.x = (int16_t)c.nx;
+        tp.y = (int16_t)c.ny;
+        display.convertRawXY(&tp, 1);
+        int lx = 0, ly = 0;
+        rot::native_to_landscape(panel, c.nx, c.ny, &lx, &ly);
+        std::printf("  %s native (%3d,%4d) -> m5gfx(%4d,%3d) rotate(%4d,%3d) 差 (%d,%d)\n", c.name,
+                    c.nx, c.ny, (int)tp.x, (int)tp.y, lx, ly, std::abs((int)tp.x - lx),
+                    std::abs((int)tp.y - ly));
     }
     display.setRotation(prev);
-    std::printf("touch/render rotation agreement: %s\n", bad == 0 ? "ok" : "MISMATCH");
-    std::printf("  残るのは「生座標 (0,0) が物理的な左上か」= M5GFX の"
-                "キャリブレーション。touchlog で指で確かめる\n");
+
+    const int cw = renderer ? renderer->cell_w() : 0;
+    const int ch = renderer ? renderer->cell_h() : 0;
+    std::printf("grid %d 点 (最端を含む): 最大ずれ dx=%d (native %d,%d) dy=%d (native %d,%d)\n",
+                checked, max_dx, wx_nx, wx_ny, max_dy, wy_nx, wy_ny);
+    std::printf("touch/render rotation agreement: %s (許容 %d 画素, 超え %d 点)\n",
+                bad == 0 ? "ok" : "MISMATCH", kTolerance, bad);
+    // セル境界では 1 画素のずれで隣のセルになる（x=11 が 12 と報告されれば隣）。
+    // 「別のセルにならない」は偽なので、「隣までで済む」と書く。
+    std::printf("  ずれは float のアフィン変換の切り捨て。セルは %dx%d なので、"
+                "ずれても隣のセルまで（誤差はセル 1 個未満）\n",
+                cw, ch);
+    std::printf("  残るのは「IC が物理的な角で報告する生座標の範囲」= パネルと IC の"
+                "個体差。touchlog で指で確かめる\n");
     return bad == 0 ? 0 : 1;
 }
 
@@ -2581,7 +2650,7 @@ extern "C" void app_main(void)
     auto* sb = static_cast<vt::Cell*>(heap_caps_malloc(
         sizeof(vt::Cell) * renderer->cols() * kScrollbackLines, MALLOC_CAP_SPIRAM));
     if (sb) {
-        term->set_scrollback(sb, kScrollbackLines);
+        term->set_scrollback(sb, kScrollbackLines, renderer->cols());
         ESP_LOGI(TAG, "scrollback: %d lines (%u KB in PSRAM)", kScrollbackLines,
                  (unsigned)(sizeof(vt::Cell) * renderer->cols() * kScrollbackLines / 1024));
     } else {
