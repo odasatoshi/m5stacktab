@@ -132,6 +132,10 @@ bool    s_ts_keys_ready       = false;
 
 // トンネルの netif がどの鍵で上がっているか。Netif::up() は秘密鍵をコピーするので、
 // 上がった後に差し替える手段が無い。張り替えの判断に使う。
+// トンネルの netmask。Tailscale のアドレスは 100.64.0.0/10 に収まるので /10 に
+// すれば tailnet 宛だけがこの netif に向く（lwIP にポリシールーティングは無い）。
+constexpr const char* kTunnelMask = "255.192.0.0";
+
 enum class NetifKey { kNone, kOwn, kNode };
 NetifKey    s_netif_key = NetifKey::kNone;
 // 今トンネルを張っている相手。netmap ごとに選び直さないために覚える。
@@ -1504,9 +1508,7 @@ void maybe_bring_up_tunnel(const ts::NetMap& map, const std::string& assigned)
     const std::string addr_str = assigned.substr(0, assigned.find('/'));
     ip4_addr_t        addr, mask;
     if (addr_str.empty() || !ip4addr_aton(addr_str.c_str(), &addr)) return;
-    // Tailscale のアドレスは 100.64.0.0/10 に収まる。マスクを /10 にすれば
-    // tailnet 宛だけがこの netif に向く（lwIP にポリシールーティングは無い）。
-    ip4addr_aton("255.192.0.0", &mask);
+    ip4addr_aton(kTunnelMask, &mask);
 
     // **node key 以外で上がっている netif は張り替える。** Netif::up() は
     // 秘密鍵をコピーするので、上がった後に差し替える手段が無い。`wg` の独自鍵で
@@ -1773,9 +1775,7 @@ int cmd_wg(int argc, char** argv)
         std::printf("bad tunnel ip\n");
         return 1;
     }
-    // Tailscale のアドレスは 100.64.0.0/10 に収まる。マスクを /10 にすれば
-    // tailnet 宛だけがこの netif に向く（lwIP にポリシールーティングは無い）。
-    ip4addr_aton("255.192.0.0", &mask);
+    ip4addr_aton(kTunnelMask, &mask);
 
     wire_netif(nif);
 
