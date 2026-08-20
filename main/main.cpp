@@ -2,6 +2,7 @@
 // 今の段階では「画面にターミナルを描く土台」と「WiFi 接続」まで。
 // SSH セッションを繋ぐのは #5 / #6。
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -1108,31 +1109,61 @@ int cmd_touchmap(int, char**)
     const uint8_t prev = display.getRotation();
     display.setRotation(1);
     std::printf("M5GFX の convertRawXY と components/rotate を照合 (rotation 1):\n");
-    struct P { int nx, ny; const char* name; };
-    const P pts[] = {
-        {0, 0, "native 左上"},
-        {panel.native_w - 1, 0, "native 右上"},
-        {0, panel.native_h - 1, "native 左下"},
-        {panel.native_w - 1, panel.native_h - 1, "native 右下"},
-        {360, 640, "native 中央"},
+
+    // **ビット一致は要求しない。** タッチ側は float のアフィン変換を通り
+    // （`_affine[0] * (float)x + ...` を int32 に切り捨てる）、描画側は整数演算なので、
+    // 1 画素の差が出る点がある（実機で native (100,200) が 199 対 200）。
+    // 意味のある契約は「1 画素以内で一致する」なので、ずれの上限を測って出す。
+    // セルは 12x24 なので 1 画素のずれでは押した場所が別のセルになることはない。
+    constexpr int kTolerance = 1;
+    int max_dx = 0, max_dy = 0, bad = 0, checked = 0;
+    int worst_nx = 0, worst_ny = 0;
+    // 格子で走査する。四隅と中央だけだと、間で出る歪みを拾えない。
+    for (int nx = 0; nx < panel.native_w; nx += 37) {
+        for (int ny = 0; ny < panel.native_h; ny += 53) {
+            lgfx::touch_point_t tp{};
+            tp.x = (int16_t)nx;
+            tp.y = (int16_t)ny;
+            display.convertRawXY(&tp, 1);
+            int lx = 0, ly = 0;
+            rot::native_to_landscape(panel, nx, ny, &lx, &ly);
+            const int dx = std::abs((int)tp.x - lx);
+            const int dy = std::abs((int)tp.y - ly);
+            ++checked;
+            if (dx > max_dx || dy > max_dy) {
+                worst_nx = nx;
+                worst_ny = ny;
+            }
+            if (dx > max_dx) max_dx = dx;
+            if (dy > max_dy) max_dy = dy;
+            if (dx > kTolerance || dy > kTolerance) ++bad;
+        }
+    }
+    // 四隅は完全一致するはず（アフィン変換の原点と端）。
+    const struct { int nx, ny; const char* name; } corners[] = {
+        {0, 0, "左上"},
+        {panel.native_w - 1, 0, "右上"},
+        {0, panel.native_h - 1, "左下"},
+        {panel.native_w - 1, panel.native_h - 1, "右下"},
     };
-    int bad = 0;
-    for (const auto& pt : pts) {
+    for (const auto& c : corners) {
         lgfx::touch_point_t tp{};
-        tp.x = (int16_t)pt.nx;
-        tp.y = (int16_t)pt.ny;
+        tp.x = (int16_t)c.nx;
+        tp.y = (int16_t)c.ny;
         display.convertRawXY(&tp, 1);
         int lx = 0, ly = 0;
-        rot::native_to_landscape(panel, pt.nx, pt.ny, &lx, &ly);
-        const bool ok = (tp.x == lx && tp.y == ly);
-        if (!ok) ++bad;
-        std::printf("  %-12s (%3d,%4d) -> m5gfx(%4d,%3d) rotate(%4d,%3d) %s\n", pt.name, pt.nx,
-                    pt.ny, (int)tp.x, (int)tp.y, lx, ly, ok ? "ok" : "MISMATCH");
+        rot::native_to_landscape(panel, c.nx, c.ny, &lx, &ly);
+        std::printf("  native %-4s (%3d,%4d) -> m5gfx(%4d,%3d) rotate(%4d,%3d) %s\n", c.name, c.nx,
+                    c.ny, (int)tp.x, (int)tp.y, lx, ly, (tp.x == lx && tp.y == ly) ? "一致" : "差あり");
     }
     display.setRotation(prev);
-    std::printf("touch/render rotation agreement: %s\n", bad == 0 ? "ok" : "MISMATCH");
-    std::printf("  残るのは「生座標 (0,0) が物理的な左上か」= M5GFX の"
-                "キャリブレーション。touchlog で指で確かめる\n");
+    std::printf("grid %d 点: 最大ずれ dx=%d dy=%d (最悪 native %d,%d), 許容 %d 超え %d 点\n",
+                checked, max_dx, max_dy, worst_nx, worst_ny, kTolerance, bad);
+    std::printf("touch/render rotation agreement: %s\n", bad == 0 ? "ok (1 画素以内)" : "MISMATCH");
+    std::printf("  1 画素の差は float のアフィン変換の切り捨て。セルは 12x24 なので"
+                "押した場所が別のセルになることはない\n");
+    std::printf("  残るのは「IC が物理的な角で報告する生座標の範囲」= パネルと IC の"
+                "個体差。touchlog で指で確かめる\n");
     return bad == 0 ? 0 : 1;
 }
 
