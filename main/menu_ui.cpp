@@ -190,8 +190,9 @@ void MenuUi::draw(bool force)
     }
 
     gfx_.setTextColor(kHint, kBg);
-    gfx_.drawString(screen_ == Screen::kRoot ? "up/down select   Enter open   tap to choose"
-                                            : "up/down select   Esc / left back   tap to choose",
+    gfx_.drawString(screen_ == Screen::kRoot
+                        ? "tap an item to open   |   tap CLOSE (top left) to go to the terminal"
+                        : "tap an item   |   tap < Back to go up   |   tap CLOSE for the terminal",
                     24, top_ + height_ - 32);
     gfx_.setTextColor(TFT_WHITE, TFT_BLACK);
 }

@@ -12,7 +12,8 @@ bool StatusBar::Info::operator==(const Info& o) const
     // **RSSI は 10dBm 単位で比べる。** 1dBm ごとに差分ありと判定すると、
     // 揺れるだけでほぼ毎秒「状態が変わった」ことになり、呼び出し側が
     // メニューの全面再描画と C6 への RPC をやり直してしまう。
-    return wifi_up == o.wifi_up && (rssi / 10) == (o.rssi / 10) && vpn == o.vpn &&
+    return wifi_up == o.wifi_up && menu_open == o.menu_open &&
+           (rssi / 10) == (o.rssi / 10) && vpn == o.vpn &&
            std::strcmp(ssid, o.ssid) == 0 && std::strcmp(ip, o.ip) == 0 &&
            std::strcmp(vpn_ip, o.vpn_ip) == 0;
 }
@@ -34,6 +35,13 @@ bool StatusBar::draw(const Info& info, bool force)
     gfx_.setFont(&fonts::efontJA_24);
     gfx_.setTextDatum(textdatum_t::top_left);
 
+    // **左端に必ずラベルを出す。** ここをタップするとメニューが開く／閉じる、と
+    // 分かる手掛かりが無いと、端末に入ったあと戻り方が無いように見える
+    // （実機でそう報告された）。
+    gfx_.setTextColor(TFT_BLACK, info.menu_open ? TFT_ORANGE : TFT_CYAN);
+    gfx_.fillRect(0, 0, kLabelW, height_, info.menu_open ? TFT_ORANGE : TFT_CYAN);
+    gfx_.drawString(info.menu_open ? " CLOSE" : " MENU", 4, 0);
+
     char line[96];
     if (info.wifi_up) {
         // RSSI は esp_hosted 経由だと 0 が返ることがある（実機で確認）。
@@ -48,7 +56,7 @@ bool StatusBar::draw(const Info& info, bool force)
         std::snprintf(line, sizeof(line), "WiFi --");
         gfx_.setTextColor(TFT_DARKGREY, kBg);
     }
-    gfx_.drawString(line, 8, 0);
+    gfx_.drawString(line, kLabelW + 8, 0);
 
     // VPN は右寄せ。左の SSID が伸びても位置が動かないようにする。
     char vpn[64];

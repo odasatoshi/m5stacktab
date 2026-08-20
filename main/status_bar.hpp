@@ -21,10 +21,16 @@ public:
         char         ip[16]   = {};
         ui::VpnState vpn      = ui::VpnState::kOff;
         char         vpn_ip[24] = {};
+        // メニューが開いているか。左端のラベルを MENU / CLOSE に切り替える。
+        bool         menu_open = false;
 
         bool operator==(const Info& o) const;
         bool operator!=(const Info& o) const { return !(*this == o); }
     };
+
+    // 左端の「MENU」ラベルの幅。ここをタップするとメニューが開く。
+    // タップできる場所だと分かるように、必ず文字で出す。
+    static constexpr int kLabelW = 96;
 
     // 中身が変わっていなければ何も描かない。**毎フレーム描いてはいけない**。
     // PPA は転送のたびに出力側のキャッシュを無効化するので、端末の描画と

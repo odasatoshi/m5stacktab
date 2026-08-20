@@ -844,6 +844,7 @@ int cmd_ts_stop(int, char**)
 StatusBar::Info gather_status()
 {
     StatusBar::Info info{};
+    info.menu_open = (menu && menu->visible());
     info.wifi_up = wifi_status(info.ssid, sizeof(info.ssid), &info.rssi, info.ip, sizeof(info.ip));
 
     auto& nif = wg::netif_instance();
@@ -935,6 +936,8 @@ void set_menu_visible(bool show)
         keyboard->draw();
         renderer->render(*term, /*force=*/true);
     }
+    // ラベルを MENU / CLOSE に切り替える。開閉のたびに必ず描き直す。
+    status_bar->draw(gather_status(), /*force=*/true);
 }
 
 // メニューの操作。#15 の純正キーボードが来るまでは、上下や Enter を送る手段が
