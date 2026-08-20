@@ -162,7 +162,11 @@ int cmd_wifi(int argc, char** argv)
 int cmd_wifi_status(int, char**)
 {
     wifi_ap_record_t ap;
-    if (wifi_is_connected() && esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+    // ステータスバーが 1 秒ごとに叩く経路なので、所要時間を出せるようにしておく。
+    const int64_t t0 = esp_timer_get_time();
+    const bool    ok = wifi_is_connected() && esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
+    std::printf("esp_wifi_sta_get_ap_info: %lld us\n", esp_timer_get_time() - t0);
+    if (ok) {
         esp_netif_ip_info_t ip{};
         esp_netif_t*        netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
         if (netif) esp_netif_get_ip_info(netif, &ip);
@@ -229,6 +233,24 @@ esp_err_t wifi_start(void)
     }
     ESP_LOGW(TAG, "no credentials in NVS. set them with: wifi <ssid> [password]");
     return ESP_OK;
+}
+
+bool wifi_status(char* ssid, size_t ssid_len, int* rssi, char* ip, size_t ip_len)
+{
+    if (!wifi_is_connected()) return false;
+    wifi_ap_record_t ap{};
+    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) return false;
+    if (ssid && ssid_len) std::snprintf(ssid, ssid_len, "%s", (const char*)ap.ssid);
+    if (rssi) *rssi = ap.rssi;
+    if (ip && ip_len) {
+        ip[0] = '\0';
+        esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        esp_netif_ip_info_t info{};
+        if (netif && esp_netif_get_ip_info(netif, &info) == ESP_OK) {
+            std::snprintf(ip, ip_len, IPSTR, IP2STR(&info.ip));
+        }
+    }
+    return true;
 }
 
 bool wifi_is_connected(void)

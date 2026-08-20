@@ -51,6 +51,8 @@ public:
     // ピアを設定してハンドシェイクを開始する（今は 1 ピアのみ）。
     esp_err_t set_peer(const PeerConfig& peer);
     bool      handshake_done() const;
+    // 鍵が確定したかを立てる。wg_netif.cpp の内部から呼ぶ（ロックの内側）。
+    void      set_handshake_ok(bool v) { handshake_ok_ = v; }
 
     // WireGuard 以外のパケット（DISCO / STUN）を受けたときに呼ばれる。
     // wg は ts に依存しないので、DISCO の処理は呼び出し側（ts 層）に任せる。
@@ -73,6 +75,8 @@ public:
 
 private:
     bool           netif_up_ = false;
+    // 鍵が確定したか。生の transport ポインタを別タスクから触らせないための写し。
+    volatile bool  handshake_ok_ = false;
     NetifStats     stats_;
     std::string    last_error_;
     TimestampStore ts_store_ = nullptr;

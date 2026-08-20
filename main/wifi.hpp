@@ -1,4 +1,6 @@
 #pragma once
+#include <cstddef>
+
 #include <esp_err.h>
 
 // NVS に保存済みの SSID / パスワードで STA 接続を開始する。
@@ -15,3 +17,7 @@ esp_err_t wifi_start(void);
 esp_err_t console_start(void);
 
 bool wifi_is_connected(void);
+
+// ステータスバー用。接続していなければ false を返し、出力は触らない。
+// esp_wifi のヘッダを main.cpp に持ち込まないためにここに置く。
+bool wifi_status(char* ssid, size_t ssid_len, int* rssi, char* ip, size_t ip_len);

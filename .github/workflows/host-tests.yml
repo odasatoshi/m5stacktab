@@ -54,6 +54,13 @@ jobs:
               components/wg/crypto_mbedtls.cpp components/wg/transport.cpp -lmbedcrypto
           /tmp/test_noise
 
+      - name: ui (menu, vpn state)
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \
+              -I components/ui -o /tmp/test_menu components/ui/test_menu.cpp \
+              components/ui/menu.cpp
+          /tmp/test_menu
+
       - name: landscape/native coordinate rotation
         run: |
           c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \

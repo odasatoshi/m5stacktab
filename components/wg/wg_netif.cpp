@@ -164,6 +164,7 @@ void handle_initiation_locked(const uint8_t* pkt, size_t len, const sockaddr_in&
     // 相手はまだ msg2 を処理していない可能性があり、ここで新しい鍵に切り替えて
     // 送ると相手側で復号できずに落ちる。相手から新しい鍵のデータが届いた時点で昇格する。
     g_state.transport->set_keypair(kp);
+    netif_instance().set_handshake_ok(true);
     g_state.last_handshake_us = esp_timer_get_time();
     // すぐ keepalive を送って、相手から見た経路を開ける。
     g_state.last_tx_us = 0;
@@ -376,6 +377,7 @@ void rx_task(void*)
             Keypair kp;
             if (g_state.hs && g_state.transport && g_state.hs->consume_response(buf, kp)) {
                 g_state.transport->set_keypair(kp);
+                netif_instance().set_handshake_ok(true);
                 g_state.last_handshake_us = esp_timer_get_time();
                 g_state.last_tx_us       = 0;  // すぐ keepalive を送って経路を開ける
                 ESP_LOGI(TAG, "handshake complete (peer index %08x)", (unsigned)kp.remote_index);
@@ -459,6 +461,7 @@ esp_err_t Netif::up(const uint8_t static_priv[kKeyLen], const ip4_addr_t& addr,
     // 前回のセッション鍵を持ち越さない（持ち越すと死んだ鍵で送り続けてしまう）。
     delete g_state.transport;
     g_state.transport = new Transport(default_crypto());
+    handshake_ok_     = false;  // 新しい netif には鍵がまだ無い
 
     g_state.sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (g_state.sock < 0) {
@@ -545,6 +548,7 @@ void Netif::down()
     g_state.transport = nullptr;
     g_state.has_peer            = false;
     g_state.have_peer_timestamp = false;
+    handshake_ok_               = false;
     netif_up_                   = false;
     ESP_LOGI(TAG, "netif down");
 }
@@ -612,7 +616,11 @@ bool Netif::send_raw(const uint8_t* data, size_t len, uint32_t dst_ip, uint16_t 
 
 bool Netif::handshake_done() const
 {
-    return netif_up_ && g_state.transport && g_state.transport->ready();
+    // **生ポインタを触らない。** 以前は g_state.transport を読んで ->ready() を
+    // 呼んでいたが、down()/up() がロック無しで delete/new するので、
+    // 別タスク（画面のステータス表示）から毎秒呼ぶと use-after-free になる。
+    // 鍵が確定したかどうかは bool にして、書く側（ロックの内側）が更新する。
+    return netif_up_ && handshake_ok_;
 }
 
 }  // namespace wg
