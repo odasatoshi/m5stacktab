@@ -69,7 +69,8 @@ public:
     // タイムスタンプの単調性を保つために、最後に送った TAI64N を保存・復元する。
     // 保存しないと再起動でカウンタが巻き戻り、ピアがリプレイとして無視する。
     using TimestampStore = bool (*)(uint64_t* seconds, bool write);
-    void set_timestamp_store(TimestampStore fn) { ts_store_ = fn; }
+    // up() の後に呼んでも効く（実装は .cpp）。
+    void set_timestamp_store(TimestampStore fn);
 
     const NetifStats& stats() const { return stats_; }
     const char*       last_error() const { return last_error_.c_str(); }
