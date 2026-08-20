@@ -651,9 +651,14 @@ void ts_task(void* arg)
 {
     auto* client = static_cast<ts::Client*>(arg);
     const bool ok = client->run_once();
+    // 同じタスクなので status() を参照で受けて安全。
     const auto& st = client->status();
     ESP_LOGI(TAG, "ts finished: %s state=%d registered=%d map_messages=%u", ok ? "ok" : "failed",
              (int)st.state, st.registered ? 1 : 0, (unsigned)st.map_messages);
+    // X25519 と HTTP/2 のバッファが重なる経路なので、残量は記録しておく
+    // （CLAUDE.md がスタック不足を名指しのハマりどころにしている）。
+    ESP_LOGI(TAG, "ts task stack headroom: %u bytes",
+             (unsigned)uxTaskGetStackHighWaterMark(nullptr));
     if (!st.assigned_address.empty()) {
         std::string line = "\r\n\033[32mtailscale: " + st.assigned_address + "\033[m\r\n";
         TermGuard guard;
@@ -671,6 +676,14 @@ int cmd_ts(int argc, char** argv)
 {
     if (argc < 3) {
         std::printf("usage: ts <host> <authkey> [port] [capver]\n");
+        return 1;
+    }
+    // **共有オブジェクトを触る前に弾く。** ts::Client は関数ローカル static で
+    // 実体が 1 つしかないので、long-poll 中に set_config / set_map_handler を
+    // 呼ぶと走行中のタスクが読んでいる std::string と std::function を
+    // 差し替えることになる（use-after-free）。
+    if (s_ts_task) {
+        std::printf("already running (ts-status で状態、ts-stop で停止)\n");
         return 1;
     }
     // machine / node / disco の 3 つは別の鍵にする（役割ごとに分離する）。
@@ -714,14 +727,17 @@ int cmd_ts(int argc, char** argv)
     }
 
     static ts::Client client;
-    s_ts_client = &client;
     ts::ClientConfig  cfg;
     cfg.host     = argv[1];
     cfg.auth_key = argv[2];
     cfg.port     = (argc > 3) ? static_cast<uint16_t>(atoi(argv[3])) : 80;
     cfg.capability_version = (argc > 4) ? static_cast<uint16_t>(atoi(argv[4])) : 131;
     cfg.hostname = "m5stack-tab5";
-    // 自分のエンドポイント（STUN を実装していないので LAN アドレスのみ申告する）
+    // 自分のエンドポイント。
+    // ponytail: STUN も portmap も実装していないので LAN アドレスしか申告しない。
+    // かつ DERP を持たない（PreferredDERP=0 = ホーム無し）ので、相手から
+    // 中継経由で最初の Ping を投げてもらう手段もない。**つまり同一 LAN 限定で、
+    // NAT 越えは成立しない。** 越えたくなったら STUN と DERP のどちらかが必要 → #11 の続き。
     esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     if (netif) {
         esp_netif_ip_info_t ip{};
@@ -748,16 +764,16 @@ int cmd_ts(int argc, char** argv)
     // 保持する（それが正しい動作で、DISCO の往復はこのストリームが開いている
     // 間に起きる）。コンソールタスクから呼ぶと 10 分間 REPL が死んで、
     // ストリームを開けたまま `wg disco` を見ることすらできない。
-    if (s_ts_task) {
-        std::printf("already running (ts-status で状態、ts-stop で停止)\n");
-        return 1;
-    }
     std::printf("connecting to %s:%u (capver %u) in background...\n", cfg.host.c_str(), cfg.port,
                 cfg.capability_version);
+    // 起動できてから公開する。先に入れると、鍵導出や xTaskCreate で失敗した後に
+    // ts-status が「一度も動いていないのに finished」と表示する。
     s_ts_started_us = esp_timer_get_time();
+    s_ts_client     = &client;
     // X25519 が 1 回で 10KB 近く使い、HTTP/2 のバッファも重なるので広く取る。
     if (xTaskCreate(&ts_task, "ts", 32768, &client, 5, &s_ts_task) != pdPASS) {
-        s_ts_task = nullptr;
+        s_ts_task   = nullptr;
+        s_ts_client = nullptr;
         std::printf("xTaskCreate failed\n");
         return 1;
     }
@@ -771,7 +787,9 @@ int cmd_ts_status(int, char**)
         std::printf("ts: not started\n");
         return 1;
     }
-    const auto& st = s_ts_client->status();
+    // **参照ではなく値で受ける。** ts タスクが st_ の std::string を書くので、
+    // 参照のまま c_str() を printf に渡すと読んでいる最中に解放され得る。
+    const ts::ClientStatus st = s_ts_client->snapshot();
     std::printf("ts: %s (%lld ms)\n", s_ts_task ? "running" : "finished",
                 (esp_timer_get_time() - s_ts_started_us) / 1000);
     std::printf("  state=%d registered=%d map_messages=%u keepalives=%u\n", (int)st.state,

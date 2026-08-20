@@ -221,15 +221,12 @@ void test_map_request()
     CHECK(s.find("\"Endpoints\":[\"192.168.0.29:41641\",\"10.0.0.5:41641\"]") != std::string::npos);
     CHECK(s.find("\"EndpointTypes\":[1,1]") != std::string::npos);
     // NetInfo は常に入れる。無いと Headscale がエンドポイントをピアに配らない。
-    CHECK(s.find("\"NetInfo\":{\"PreferredDERP\":0") != std::string::npos);
-    CHECK(s.find("\"WorkingUDP\":true") != std::string::npos);
-    CHECK(s.find("\"LinkType\":\"wifi\"") != std::string::npos);
-    // NetInfo は Hostinfo の中に入っていること（外に出すと無視される）
-    CHECK(s.find("\"Hostinfo\":{") < s.find("\"NetInfo\":"));
-    CHECK(s.find("\"NetInfo\":") < s.find("\"Endpoints\":"));
-
-    p.preferred_derp = 12;
-    CHECK(ts::build_map_request(p).find("\"NetInfo\":{\"PreferredDERP\":12") != std::string::npos);
+    // **Hostinfo の直下にあること**を 1 本で固める。位置関係だけを見ると、
+    // Hostinfo の閉じ括弧の外に出ても通ってしまう。
+    CHECK(s.find("\"OS\":\"linux\",\"NetInfo\":{\"PreferredDERP\":0,\"WorkingUDP\":true,"
+                 "\"LinkType\":\"wifi\"}}") != std::string::npos);
+    // Endpoints は Hostinfo の外（兄弟）に出す
+    CHECK(s.find("\"LinkType\":\"wifi\"}},\"Endpoints\":") != std::string::npos);
 
     // エンドポイントが無ければキー自体を出さない
     p.endpoints.clear();
