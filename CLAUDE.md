@@ -152,7 +152,7 @@ openssl ec -in ssh_key -out key.pem -param_enc named_curve            # 既存�
 ```
 
 鍵のパースだけを確かめたいときは実機の `keytest` コマンドを使う。
-`CONFIG_MBEDTLS_ERROR_STRINGS=y` を入れてあるので、失敗理由が文字列で出る（`CONFIG_MBEDTLS_ERROR_C` という symbol は無い。書いても `unknown kconfig symbol` の警告が出るだけで効かない）。
+失敗理由は文字列で出る（`CONFIG_MBEDTLS_ERROR_STRINGS` は ESP-IDF の既定が `y`。`sdkconfig.defaults` に明示してあるのは意図を残すためで、これを消しても出る）。**`CONFIG_MBEDTLS_ERROR_C` という symbol は存在しない** ので、書いても `sdkconfig` 再生成のときに `unknown kconfig symbol` の警告が出るだけ。
 
 ## ホストテストで使う mbedTLS
 

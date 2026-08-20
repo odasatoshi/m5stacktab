@@ -4,6 +4,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 #include <arpa/inet.h>
 #include <esp_log.h>
@@ -72,10 +73,11 @@ bool verify_host_key(LIBSSH2_SESSION* session, const char* host, uint16_t port)
     // 12 桁の 16 進にする（fail-closed だが誤検知は困る）。
     // **ポートも含める。** 同じホストの別ポートに別のサーバを置くのは普通なので、
     // host だけでハッシュすると今度はそこで衝突する。
-    char ident[80];
-    std::snprintf(ident, sizeof(ident), "%s:%u", host, (unsigned)port);
-    uint8_t host_digest[32] = {};
-    mbedtls_sha256(reinterpret_cast<const unsigned char*>(ident), std::strlen(ident), host_digest,
+    // 固定長にすると長いホスト名が黙って切られて、先頭が同じホスト同士で
+    // また衝突する（まさにこの関数が直した問題）。std::string にして切らない。
+    const std::string ident = std::string(host) + ":" + std::to_string(port);
+    uint8_t           host_digest[32] = {};
+    mbedtls_sha256(reinterpret_cast<const unsigned char*>(ident.data()), ident.size(), host_digest,
                    0);
     char key_name[16];
     std::snprintf(key_name, sizeof(key_name), "hk_%02x%02x%02x%02x%02x%02x", host_digest[0],
@@ -87,7 +89,7 @@ bool verify_host_key(LIBSSH2_SESSION* session, const char* host, uint16_t port)
     bool      ok        = true;
     if (err == ESP_OK && saved_len == sizeof(digest)) {
         if (std::memcmp(saved, digest, sizeof(digest)) != 0) {
-            set_error("HOST KEY CHANGED for %s - refusing to connect", ident);
+            set_error("HOST KEY CHANGED for %s - refusing to connect", ident.c_str());
             ok = false;
         }
     } else {
@@ -95,7 +97,7 @@ bool verify_host_key(LIBSSH2_SESSION* session, const char* host, uint16_t port)
         nvs_commit(nvs);
         char hex[65] = {};
         for (int i = 0; i < 32; ++i) std::snprintf(hex + i * 2, 3, "%02x", digest[i]);
-        ESP_LOGW(TAG, "new host key for %s (sha256:%s) - remembered", ident, hex);
+        ESP_LOGW(TAG, "new host key for %s (sha256:%s) - remembered", ident.c_str(), hex);
     }
     nvs_close(nvs);
     return ok;
