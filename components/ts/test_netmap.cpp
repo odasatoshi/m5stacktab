@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -161,8 +162,51 @@ void test_bad_input()
 
 }  // namespace
 
+// エンドポイントの選択。**先頭を無条件に取ってはいけない**（ピアは全
+// インターフェースを申告する）ことと、IPv4 として解析できないものを返さないこと。
+void test_pick_endpoint()
+{
+    // 192.168.0.29/24 にいるとする（ネットワークバイトオーダ）。
+    auto v4 = [](uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+        return a | (b << 8) | (c << 16) | (d << 24);
+    };
+    const uint32_t me   = v4(192, 168, 0, 29);
+    const uint32_t mask = v4(255, 255, 255, 0);
+
+    // 実機で踏んだ並び。先頭は届かないので 192.168.0.57 を選ぶ。
+    const std::vector<std::string> real = {"111.102.218.1:41642", "192.168.0.57:41642",
+                                           "192.168.0.101:41642", "192.168.64.1:41642"};
+    CHECK(ts::pick_endpoint(real, me, mask) == "192.168.0.57:41642");
+
+    // 同じサブネットが無ければ、最初に解析できた IPv4。
+    const std::vector<std::string> far = {"10.0.0.1:41641", "172.16.0.1:41641"};
+    CHECK(ts::pick_endpoint(far, me, mask) == "10.0.0.1:41641");
+
+    // **IPv6 は返さない。** 返すと set_peer が落ちて、後ろの IPv4 を試さない。
+    const std::vector<std::string> v6first = {"[fd7a:115c:a1e0::1]:41641", "192.168.0.57:41641"};
+    CHECK(ts::pick_endpoint(v6first, me, mask) == "192.168.0.57:41641");
+    const std::vector<std::string> v6only = {"[fd7a:115c:a1e0::1]:41641", "fd7a::1:41641"};
+    CHECK(ts::pick_endpoint(v6only, me, mask).empty());
+
+    // サブネットが分からないとき（マスク 0）は最初の IPv4。
+    CHECK(ts::pick_endpoint(real, 0, 0) == "111.102.218.1:41642");
+    CHECK(ts::pick_endpoint(real, me, 0) == "111.102.218.1:41642");
+
+    // 壊れた入力
+    CHECK(ts::pick_endpoint({}, me, mask).empty());
+    CHECK(ts::pick_endpoint({"nonsense"}, me, mask).empty());
+    CHECK(ts::pick_endpoint({":41641"}, me, mask).empty());
+    CHECK(ts::pick_endpoint({"192.168.0.57"}, me, mask).empty());     // ポート無し
+    CHECK(ts::pick_endpoint({"192.168.0.999:1"}, me, mask).empty());  // octet が範囲外
+    CHECK(ts::pick_endpoint({"192.168.0:1"}, me, mask).empty());      // octet が足りない
+    CHECK(ts::pick_endpoint({"192.168.0.1.2:1"}, me, mask).empty());  // 多い
+    // /8 のような広いマスクでも動く
+    CHECK(ts::pick_endpoint(real, v4(111, 0, 0, 5), v4(255, 0, 0, 0)) == "111.102.218.1:41642");
+}
+
 int main()
 {
+    test_pick_endpoint();
     test_full_map();
     test_keepalive();
     test_incremental();

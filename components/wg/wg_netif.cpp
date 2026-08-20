@@ -443,6 +443,7 @@ Netif& netif_instance()
 esp_err_t Netif::up(const uint8_t static_priv[kKeyLen], const ip4_addr_t& addr,
                     const ip4_addr_t& netmask, uint16_t listen_port)
 {
+    std::lock_guard<std::mutex> cfg_guard(cfg_mu_);
     if (netif_up_) return ESP_ERR_INVALID_STATE;
 
     std::memcpy(g_state.static_priv, static_priv, kKeyLen);
@@ -519,6 +520,7 @@ esp_err_t Netif::up(const uint8_t static_priv[kKeyLen], const ip4_addr_t& addr,
 
 void Netif::down()
 {
+    std::lock_guard<std::mutex> cfg_guard(cfg_mu_);
     if (!netif_up_) return;
     g_state.running = false;
 
@@ -555,6 +557,7 @@ void Netif::down()
 
 esp_err_t Netif::set_peer(const PeerConfig& peer)
 {
+    std::lock_guard<std::mutex> cfg_guard(cfg_mu_);
     if (!netif_up_) return ESP_ERR_INVALID_STATE;
 
     const size_t colon = peer.endpoint.rfind(':');
