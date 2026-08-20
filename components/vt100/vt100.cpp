@@ -173,12 +173,21 @@ void Terminal::resize(int cols, int rows)
     rows = std::max(1, rows);
     if (cols == cols_ && rows == rows_) return;
 
-    auto regrow = [&](std::vector<Cell>& src) {
+    // 行が減るときに画面から追い出される行。**捨てずにスクロールバックへ積む。**
+    // 積まないと、キーボードやメニューの表示を切り替えるたびにその分の行が
+    // 画面にもスクロールバックにも無い状態になり、履歴に穴があく（実機で確認:
+    // 29 行 → 15 行で 14 行が消えた）。桁数が変わるときは履歴自体を捨てるので積まない。
+    auto regrow = [&](std::vector<Cell>& src, bool push_evicted) {
         std::vector<Cell> dst(static_cast<size_t>(cols) * rows, Cell{});
         // 下端を保ったまま詰め替える。行が減る場合は上を捨てる (シェルの挙動に近い)。
         int copy_rows = std::min(rows, rows_);
         int copy_cols = std::min(cols, cols_);
         int src_off   = rows_ - copy_rows;
+        if (push_evicted) {
+            for (int y = 0; y < src_off; ++y) {
+                push_scrollback(&src[static_cast<size_t>(y) * cols_]);
+            }
+        }
         for (int y = 0; y < copy_rows; ++y) {
             for (int x = 0; x < copy_cols; ++x) {
                 dst[static_cast<size_t>(y) * cols + x] =
@@ -189,8 +198,10 @@ void Terminal::resize(int cols, int rows)
     };
     const int old_rows = rows_;
     const int old_cols = cols_;
-    regrow(main_);
-    regrow(alt_);
+    // 追い出す行を積むのは、桁数が変わらない主画面のときだけ。
+    // 代替画面 (vim など) の内容は履歴に入れない（本家の端末も入れない）。
+    regrow(main_, cols == old_cols && !alt_active_);
+    regrow(alt_, false);
 
     cur_.y -= std::max(0, old_rows - rows);
     cols_ = cols;

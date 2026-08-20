@@ -593,18 +593,60 @@ void test_resize_keeps_scrollback()
     CHECK(t.row_text(2) == "f");
 
     // 行数だけ変える（キーボードの表示切り替えに相当）→ 履歴は残る。
+    // **縮めた分は追い出されて履歴に積まれる**（3 行 → 2 行なので 1 行増える）。
     t.resize(10, 2);
-    CHECK(t.scrollback_lines() == 3);
+    CHECK(t.scrollback_lines() == 4);
+    // 広げるときは何も追い出さないので増えない。
     t.resize(10, 3);
-    CHECK(t.scrollback_lines() == 3);
+    CHECK(t.scrollback_lines() == 4);
     // 見ている位置は最新に戻る。
     CHECK(t.view_offset() == 0);
     CHECK(t.scroll_view(2) == 2);
     t.resize(10, 4);
     CHECK(t.view_offset() == 0);
 
+    // **行が減るとき、画面から追い出される行は履歴に積まれる。**
+    // 積まないと、キーボードの表示を切り替えるたびに履歴に穴があく
+    // （実機で 29 行 → 15 行で 14 行が消えた）。
+    {
+        vt::Terminal t2(10, 5);
+        std::vector<vt::Cell> sb2(10 * 50);
+        t2.set_scrollback(sb2.data(), 50);
+        // 画面は 5 行ちょうど（履歴は空）。
+        t2.write("1\r\n2\r\n3\r\n4\r\n5");
+        CHECK(t2.scrollback_lines() == 0);
+        CHECK(t2.row_text(0) == "1");
+        CHECK(t2.row_text(4) == "5");
+
+        // 2 行に縮める → 上の 3 行が追い出される。
+        t2.resize(10, 2);
+        CHECK(t2.row_text(0) == "4");
+        CHECK(t2.row_text(1) == "5");
+        // 1,2,3 が履歴に入った。**履歴 3 + 画面 2 = 元の 5 行**で、
+        // どこにも無い行が生まれていない（穴があいていない）ことがこれで言える。
+        CHECK(t2.scrollback_lines() == 3);
+        // row_text はライブ画面を読むので scroll_view は反映されない。
+        // 履歴の中身は行数と、画面に残った行が 4,5 であることから確定する。
+
+        // 広げるときは何も追い出さない。
+        const int held = t2.scrollback_lines();
+        t2.resize(10, 6);
+        CHECK(t2.scrollback_lines() == held);
+    }
+
+    // 代替画面の内容は履歴に入れない（本家の端末も入れない）。
+    {
+        vt::Terminal t3(10, 4);
+        std::vector<vt::Cell> sb3(10 * 50);
+        t3.set_scrollback(sb3.data(), 50);
+        t3.write("\033[?1049h");  // 代替画面へ
+        t3.write("a\r\nb\r\nc\r\nd");
+        t3.resize(10, 2);
+        CHECK(t3.scrollback_lines() == 0);
+    }
+
     // 桁数が変わったら捨てる（履歴は cols 単位で詰めてあるので使い回せない）。
-    CHECK(t.scrollback_lines() == 3);
+    CHECK(t.scrollback_lines() == 4);
     t.resize(12, 4);
     CHECK(t.scrollback_lines() == 0);
 

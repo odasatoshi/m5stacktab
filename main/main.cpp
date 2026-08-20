@@ -1107,12 +1107,16 @@ int cmd_tap(int argc, char** argv)
 int cmd_swipe(int argc, char** argv)
 {
     if (argc < 4) {
-        std::printf("usage: swipe <x> <y_from> <y_to>\n");
+        std::printf("usage: swipe <x> <y_from> <y_to> [x_to]\n");
+        std::printf("       x_to を付けると斜め・横方向になる（IME の横フリック用）\n");
         return 1;
     }
     const int x  = atoi(argv[1]);
     const int y1 = atoi(argv[2]);
     const int y2 = atoi(argv[3]);
+    // **横方向も出せるようにする。** x 固定だと ime::Flick の kLeft / kRight に
+    // 到達できず、IME の入力面の半分が指でしか試せない。
+    const int x2 = (argc > 4) ? atoi(argv[4]) : x;
     TermGuard guard;
     if (!guard.ok()) {
         std::printf("busy\n");
@@ -1120,11 +1124,13 @@ int cmd_swipe(int argc, char** argv)
     }
     const int before = term->view_offset();
     touch_down_at(x, y1);
-    const int step = (y2 >= y1) ? 8 : -8;
-    for (int y = y1; (step > 0) ? (y <= y2) : (y >= y2); y += step) touch_move_at(x, y);
-    touch_move_at(x, y2);
-    touch_up_at(x, y2);
-    std::printf("swipe (%d,%d)->(%d,%d): scrollback %d -> %d / %d lines\n", x, y1, x, y2, before,
+    // 実タッチと同じ刻み（20ms ごとのポーリング相当）で動かす。
+    constexpr int kSteps = 8;
+    for (int i = 1; i <= kSteps; ++i) {
+        touch_move_at(x + (x2 - x) * i / kSteps, y1 + (y2 - y1) * i / kSteps);
+    }
+    touch_up_at(x2, y2);
+    std::printf("swipe (%d,%d)->(%d,%d): scrollback %d -> %d / %d lines\n", x, y1, x2, y2, before,
                 term->view_offset(), term->scrollback_lines());
     return 0;
 }
@@ -2219,6 +2225,10 @@ int cmd_termcheck(int, char**)
     }
     const int far = renderer->cols() - 2;  // 右端の少し内側（グリッド幅に追随させる）
 
+    // **スクロールバックを見ている状態を解除する。** 見たままだと探査点が
+    // 1 セル分ずれて、健全な描画経路に対して FAILED と言ってしまう
+    // （スワイプを足したせいで、その状態に入るのが簡単になった）。
+    if (term->view_offset() != 0) term->scroll_view(-term->view_offset());
     // 行 0: セル 0 が赤、セル 1 が緑。行 1: セル 0 が青。ほかは空。
     term->write("\033[2J\033[H\033[41m \033[42m \033[m\r\n\033[44m \033[m");
     // **render_term ではなく直接呼ぶ。** これは本番経路を実際に通すための診断なので、
