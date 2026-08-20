@@ -66,9 +66,15 @@ bool verify_host_key(LIBSSH2_SESSION* session, const char* host)
         set_error("nvs_open failed for host key");
         return false;
     }
-    char key_name[24];
-    // NVS のキー名は 15 文字までなので、ホスト名そのままではなく指紋の先頭で識別する。
-    std::snprintf(key_name, sizeof(key_name), "hk_%.11s", host);
+    // NVS のキー名は 15 文字までなので、ホスト名そのままでは入らない。
+    // 先頭 11 文字で切ると 192.168.0.101 と 192.168.0.102 が同じ枠を共有し、
+    // 別のホストが「鍵が変わった」として理由なく拒否される。ホスト名を
+    // ハッシュして 12 桁の 16 進にする（fail-closed だが誤検知は困る）。
+    uint8_t host_digest[32];
+    mbedtls_sha256(reinterpret_cast<const unsigned char*>(host), std::strlen(host), host_digest, 0);
+    char key_name[16];
+    std::snprintf(key_name, sizeof(key_name), "hk_%02x%02x%02x%02x%02x%02x", host_digest[0],
+                  host_digest[1], host_digest[2], host_digest[3], host_digest[4], host_digest[5]);
 
     uint8_t   saved[32];
     size_t    saved_len = sizeof(saved);

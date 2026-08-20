@@ -117,10 +117,24 @@ void init_nvs()
 }
 
 // コンソールから任意のバイト列を端末に流し込むための最小のエスケープ展開。
+// コンソールから制御文字を送るための記法。
+//
+// **`\r` は使えない。** esp_console_split_argv が argv を作る時点で
+// バックスラッシュを 1 段はがすので、ここには `r` しか届かない
+// （実機で確認: `key echo X\r` が送るのは "echo X" で CR が落ちる）。
+// コンソールで打つには `\\r` と二重にする必要がある。
+// そのため、はがされない `^M` 形式（端末で標準的な caret 記法）も受ける。
 std::string unescape(const char* src)
 {
     std::string out;
     for (const char* p = src; *p; ++p) {
+        if (*p == '^' && p[1]) {
+            const char c = *++p;
+            if (c == '^') out += '^';        // リテラルの ^
+            else if (c == '?') out += '\177';  // DEL
+            else out += static_cast<char>(c & 0x1f);  // ^M=CR ^I=TAB ^[=ESC ^C=INTR
+            continue;
+        }
         if (*p != '\\') {
             out += *p;
             continue;
@@ -139,10 +153,54 @@ std::string unescape(const char* src)
     return out;
 }
 
+// 端末の内容をシリアルに吐く。実機の画面を見られない状況（CI、遠隔、
+// エージェント実行）で SSH の出力や描画を検証する唯一の手段なので、
+// 見た目ではなくセルの中身をそのまま出す。
+int cmd_termdump(int, char**)
+{
+    TermGuard guard;
+    if (!guard.ok()) {
+        std::printf("busy\n");
+        return 1;
+    }
+    std::printf("--- term %dx%d cursor=(%d,%d)%s ---\n", term->cols(), term->rows(),
+                term->cursor_x(), term->cursor_y(), term->cursor_visible() ? "" : " hidden");
+    std::string line;
+    for (int y = 0; y < term->rows(); ++y) {
+        line.clear();
+        int last_ink = -1;  // 末尾の空白は落とす（1 行 106 文字が全部出ると読めない）
+        for (int x = 0; x < term->cols(); ++x) {
+            const uint32_t cp = term->cell(x, y).ch;
+            if (cp == 0) continue;  // 全角の右半分
+            // UTF-8 に戻す。vt100 はコードポイントで持っている。
+            if (cp < 0x80) {
+                line += static_cast<char>(cp);
+            } else if (cp < 0x800) {
+                line += static_cast<char>(0xC0 | (cp >> 6));
+                line += static_cast<char>(0x80 | (cp & 0x3F));
+            } else if (cp < 0x10000) {
+                line += static_cast<char>(0xE0 | (cp >> 12));
+                line += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                line += static_cast<char>(0x80 | (cp & 0x3F));
+            } else {
+                line += static_cast<char>(0xF0 | (cp >> 18));
+                line += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+                line += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                line += static_cast<char>(0x80 | (cp & 0x3F));
+            }
+            if (cp != ' ') last_ink = static_cast<int>(line.size());
+        }
+        line.resize(last_ink > 0 ? static_cast<size_t>(last_ink) : 0);
+        std::printf("%2d|%s\n", y, line.c_str());
+    }
+    std::printf("--- end (bell=%u) ---\n", (unsigned)term->bell_count());
+    return 0;
+}
+
 int cmd_term(int argc, char** argv)
 {
     if (argc < 2) {
-        std::printf("usage: term <text>   (\\e = ESC, \\n \\r \\t \\a も使える)\n");
+        std::printf("usage: term <text>   (^M=CR ^[=ESC ^I=TAB、^^ でリテラルの ^)\n");
         return 1;
     }
     std::string s;
@@ -310,6 +368,41 @@ bool dict_open()
 }
 
 // ローマ字 → かな → 漢字 を一気に試す。
+// ローマ字を IME に通して、その結果を SSH に送る。
+// シリアルコンソールは非 ASCII を argv に通さない（実機で確認: `key echo 日本語` は
+// echo に空の引数を渡す）ので、日本語を送る経路を ASCII だけで叩くために用意した。
+// タッチ → フリックの層は通らないが、IME の出力から先（ssh_send → リモート →
+// 端末描画）という未検証の継ぎ目はこれで通る。
+int cmd_keyj(int argc, char** argv)
+{
+    if (argc < 2) {
+        std::printf("usage: keyj <romaji>...   例: keyj nihongo tsukuba\n");
+        return 1;
+    }
+    if (!ssh_is_connected()) {
+        std::printf("not connected\n");
+        return 1;
+    }
+    std::string out;
+    for (int i = 1; i < argc; ++i) {
+        if (i > 1) out += ' ';
+        ime::Romaji r;
+        std::string kana;
+        for (const char* p = argv[i]; *p; ++p) r.input(*p, kana);
+        r.flush(kana);
+        out += kana;
+    }
+    std::printf("sending %d bytes:", (int)out.size());
+    for (unsigned char ch : out) std::printf(" %02x", ch);
+    std::printf("\n");
+    esp_err_t err = ssh_send(out.data(), out.size());
+    if (err != ESP_OK) {
+        std::printf("send failed: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+    return 0;
+}
+
 int cmd_conv(int argc, char** argv)
 {
     if (argc < 2) {
@@ -376,6 +469,15 @@ int cmd_ssh(int argc, char** argv)
         // 秘密鍵 (sshkey パーティション) で認証する。パスワードは保存しない。
         cfg.user = argv[1];
         cfg.host = argv[2];
+        // host:port も受ける。これがないと 22 番以外では鍵認証が使えない
+        // （パスワード認証の 4 引数形式にしかポート指定が無かった）。
+        if (const size_t colon = cfg.host.rfind(':'); colon != std::string::npos) {
+            const int port = atoi(cfg.host.c_str() + colon + 1);
+            if (port > 0 && port <= 65535) {
+                cfg.port = (uint16_t)port;
+                cfg.host.resize(colon);
+            }
+        }
         if (esp_err_t err = ssh_config_save(cfg); err != ESP_OK) {
             std::printf("warning: could not save connection: %s\n", esp_err_to_name(err));
         }
@@ -388,7 +490,7 @@ int cmd_ssh(int argc, char** argv)
             std::printf("warning: could not save connection: %s\n", esp_err_to_name(err));
         }
     } else {
-        std::printf("usage: ssh <user> <host>                    # 秘密鍵で認証\n");
+        std::printf("usage: ssh <user> <host>[:<port>]           # 秘密鍵で認証\n");
         std::printf("       ssh <user> <host> <password> [port]  # パスワードで認証\n");
         std::printf("       ssh                                  # 保存済み設定で再接続\n");
         return 1;
@@ -421,7 +523,7 @@ int cmd_sshclose(int, char**)
 int cmd_key(int argc, char** argv)
 {
     if (argc < 2) {
-        std::printf("usage: key <text>   (\\e = ESC, \\n = LF, \\t = TAB)\n");
+        std::printf("usage: key <text>   (^M=CR ^[=ESC ^I=TAB ^C=INTR、^^ でリテラルの ^)\n");
         return 1;
     }
     std::string out;
@@ -1609,7 +1711,9 @@ int cmd_rottest(int, char**)
 void register_term_commands()
 {
     const esp_console_cmd_t cmds[] = {
-        {"term", "端末に文字列を流し込む (\\e で ESC)", "<text>", &cmd_term, nullptr, nullptr, nullptr},
+        {"term", "端末に文字列を流し込む (^[ で ESC)", "<text>", &cmd_term, nullptr, nullptr, nullptr},
+        {"termdump", "端末の内容をシリアルに出す（画面を見られないとき用）", nullptr,
+         &cmd_termdump, nullptr, nullptr, nullptr},
         {"termtest", "色・全角・装飾のテストパターンを描画する", nullptr, &cmd_termtest, nullptr, nullptr, nullptr},
         {"termscroll", "40 行流してスクロールを見る", nullptr, &cmd_termscroll, nullptr, nullptr, nullptr},
         {"fonttest", "フォント描画経路の切り分け", nullptr, &cmd_fonttest, nullptr, nullptr, nullptr},
@@ -1618,6 +1722,8 @@ void register_term_commands()
         {"sshclose", "SSH セッションを閉じる", nullptr, &cmd_sshclose, nullptr, nullptr, nullptr},
         {"key", "SSH にキー入力を送る", "<text>", &cmd_key, nullptr, nullptr, nullptr},
         {"conv", "ローマ字→かな→漢字を試す", "<romaji>", &cmd_conv, nullptr, nullptr, nullptr},
+        {"keyj", "ローマ字を IME に通して SSH に送る", "<romaji>...", &cmd_keyj, nullptr, nullptr,
+         nullptr},
         {"scroll", "スクロールバックを動かす (正=過去へ)", "[lines]", &cmd_scroll, nullptr, nullptr,
          nullptr},
         {"bench", "描画コストを測る (全画面 vs 1 文字)", nullptr, &cmd_bench, nullptr, nullptr,
