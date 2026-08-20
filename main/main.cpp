@@ -119,22 +119,19 @@ void init_nvs()
 // コンソールから任意のバイト列を端末に流し込むための最小のエスケープ展開。
 // コンソールから制御文字を送るための記法。
 //
-// **`\r` は使えない。** esp_console_split_argv が argv を作る時点で
-// バックスラッシュを 1 段はがすので、ここには `r` しか届かない
-// （実機で確認: `key echo X\r` が送るのは "echo X" で CR が落ちる）。
-// コンソールで打つには `\\r` と二重にする必要がある。
-// そのため、はがされない `^M` 形式（端末で標準的な caret 記法）も受ける。
+// **コンソールで打つときはバックスラッシュを二重にする（`\\r`）。**
+// esp_console_split_argv が argv を作る時点で 1 段はがすので、`\r` と書くと
+// ここには `r` しか届かない（実機で確認: `key echo X\r` が送るのは "echo X" で
+// CR が落ちる）。ヘルプがこれを書いていなかったせいで「SSH は繋がるのに
+// コマンドが実行できない」の原因究明に時間がかかった。
+//
+// `^M` 形式も一度入れたが落とした。CR は `\\r` で送れるので新しい記法は
+// 要らない一方、`^` を食う副作用で `key grep ^root ...` が黙って壊れる
+// （`^r` が 0x12 になる）。任意のテキストをリモートに送る道具でそれは困る。
 std::string unescape(const char* src)
 {
     std::string out;
     for (const char* p = src; *p; ++p) {
-        if (*p == '^' && p[1]) {
-            const char c = *++p;
-            if (c == '^') out += '^';        // リテラルの ^
-            else if (c == '?') out += '\177';  // DEL
-            else out += static_cast<char>(c & 0x1f);  // ^M=CR ^I=TAB ^[=ESC ^C=INTR
-            continue;
-        }
         if (*p != '\\') {
             out += *p;
             continue;
@@ -156,6 +153,9 @@ std::string unescape(const char* src)
 // 端末の内容をシリアルに吐く。実機の画面を見られない状況（CI、遠隔、
 // エージェント実行）で SSH の出力や描画を検証する唯一の手段なので、
 // 見た目ではなくセルの中身をそのまま出す。
+//
+// 出すのはライブ画面（cell）。scroll でスクロールバックを見ている間は
+// 画面に出ているもの（view_cell）とずれる。
 int cmd_termdump(int, char**)
 {
     TermGuard guard;
@@ -165,33 +165,9 @@ int cmd_termdump(int, char**)
     }
     std::printf("--- term %dx%d cursor=(%d,%d)%s ---\n", term->cols(), term->rows(),
                 term->cursor_x(), term->cursor_y(), term->cursor_visible() ? "" : " hidden");
-    std::string line;
+    // UTF-8 化は vt100 の row_text に任せる（ホストテストで全角の境界まで固めてある）。
     for (int y = 0; y < term->rows(); ++y) {
-        line.clear();
-        int last_ink = -1;  // 末尾の空白は落とす（1 行 106 文字が全部出ると読めない）
-        for (int x = 0; x < term->cols(); ++x) {
-            const uint32_t cp = term->cell(x, y).ch;
-            if (cp == 0) continue;  // 全角の右半分
-            // UTF-8 に戻す。vt100 はコードポイントで持っている。
-            if (cp < 0x80) {
-                line += static_cast<char>(cp);
-            } else if (cp < 0x800) {
-                line += static_cast<char>(0xC0 | (cp >> 6));
-                line += static_cast<char>(0x80 | (cp & 0x3F));
-            } else if (cp < 0x10000) {
-                line += static_cast<char>(0xE0 | (cp >> 12));
-                line += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-                line += static_cast<char>(0x80 | (cp & 0x3F));
-            } else {
-                line += static_cast<char>(0xF0 | (cp >> 18));
-                line += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
-                line += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-                line += static_cast<char>(0x80 | (cp & 0x3F));
-            }
-            if (cp != ' ') last_ink = static_cast<int>(line.size());
-        }
-        line.resize(last_ink > 0 ? static_cast<size_t>(last_ink) : 0);
-        std::printf("%2d|%s\n", y, line.c_str());
+        std::printf("%2d|%s\n", y, term->row_text(y).c_str());
     }
     std::printf("--- end (bell=%u) ---\n", (unsigned)term->bell_count());
     return 0;
@@ -200,7 +176,8 @@ int cmd_termdump(int, char**)
 int cmd_term(int argc, char** argv)
 {
     if (argc < 2) {
-        std::printf("usage: term <text>   (^M=CR ^[=ESC ^I=TAB、^^ でリテラルの ^)\n");
+        std::printf("usage: term <text>   (\\\\e=ESC \\\\r=CR \\\\n \\\\t \\\\a"
+                    " — コンソールでは二重にする)\n");
         return 1;
     }
     std::string s;
@@ -362,13 +339,13 @@ bool dict_open()
         std::printf("dict not written yet or corrupt (mmap ok at %p)\n", ptr);
         return false;
     }
-    std::printf("dict: %u entries mmapped from partition (%u bytes)\n", s_dict.count(),
-                (unsigned)part->size);
+    std::printf("dict: %u entries mmapped from partition (%u bytes)\n",
+                (unsigned)s_dict.count(), (unsigned)part->size);
     return true;
 }
 
 // ローマ字 → かな → 漢字 を一気に試す。
-// ローマ字を IME に通して、その結果を SSH に送る。
+// ローマ字を IME に通して、その結果を SSH に送る（かなまで。漢字変換はしない）。
 // シリアルコンソールは非 ASCII を argv に通さない（実機で確認: `key echo 日本語` は
 // echo に空の引数を渡す）ので、日本語を送る経路を ASCII だけで叩くために用意した。
 // タッチ → フリックの層は通らないが、IME の出力から先（ssh_send → リモート →
@@ -471,7 +448,11 @@ int cmd_ssh(int argc, char** argv)
         cfg.host = argv[2];
         // host:port も受ける。これがないと 22 番以外では鍵認証が使えない
         // （パスワード認証の 4 引数形式にしかポート指定が無かった）。
-        if (const size_t colon = cfg.host.rfind(':'); colon != std::string::npos) {
+        // **コロンが 1 個のときだけ**解析する。無条件に rfind すると
+        // IPv6 リテラル（fd7a:115c:a1e0::5）を切り刻む。getaddrinfo は
+        // AF_UNSPEC なので IPv6 は実際に解決できる経路。
+        if (const size_t colon = cfg.host.rfind(':');
+            colon != std::string::npos && cfg.host.find(':') == colon) {
             const int port = atoi(cfg.host.c_str() + colon + 1);
             if (port > 0 && port <= 65535) {
                 cfg.port = (uint16_t)port;
@@ -523,7 +504,8 @@ int cmd_sshclose(int, char**)
 int cmd_key(int argc, char** argv)
 {
     if (argc < 2) {
-        std::printf("usage: key <text>   (^M=CR ^[=ESC ^I=TAB ^C=INTR、^^ でリテラルの ^)\n");
+        std::printf("usage: key <text>   (\\\\r=CR \\\\e=ESC \\\\t=TAB"
+                    " — コンソールでは二重にする)\n");
         return 1;
     }
     std::string out;
@@ -1711,7 +1693,7 @@ int cmd_rottest(int, char**)
 void register_term_commands()
 {
     const esp_console_cmd_t cmds[] = {
-        {"term", "端末に文字列を流し込む (^[ で ESC)", "<text>", &cmd_term, nullptr, nullptr, nullptr},
+        {"term", "端末に文字列を流し込む (\\\\e で ESC)", "<text>", &cmd_term, nullptr, nullptr, nullptr},
         {"termdump", "端末の内容をシリアルに出す（画面を見られないとき用）", nullptr,
          &cmd_termdump, nullptr, nullptr, nullptr},
         {"termtest", "色・全角・装飾のテストパターンを描画する", nullptr, &cmd_termtest, nullptr, nullptr, nullptr},

@@ -49,7 +49,7 @@ void set_error(const char* fmt, ...)
 }
 
 // ホスト鍵の TOFU 検証。初回は覚え、変わったら拒否する。
-bool verify_host_key(LIBSSH2_SESSION* session, const char* host)
+bool verify_host_key(LIBSSH2_SESSION* session, const char* host, uint16_t port)
 {
     size_t      len  = 0;
     int         type = 0;
@@ -68,10 +68,15 @@ bool verify_host_key(LIBSSH2_SESSION* session, const char* host)
     }
     // NVS のキー名は 15 文字までなので、ホスト名そのままでは入らない。
     // 先頭 11 文字で切ると 192.168.0.101 と 192.168.0.102 が同じ枠を共有し、
-    // 別のホストが「鍵が変わった」として理由なく拒否される。ホスト名を
-    // ハッシュして 12 桁の 16 進にする（fail-closed だが誤検知は困る）。
-    uint8_t host_digest[32];
-    mbedtls_sha256(reinterpret_cast<const unsigned char*>(host), std::strlen(host), host_digest, 0);
+    // 別のホストが「鍵が変わった」として理由なく拒否される。ハッシュして
+    // 12 桁の 16 進にする（fail-closed だが誤検知は困る）。
+    // **ポートも含める。** 同じホストの別ポートに別のサーバを置くのは普通なので、
+    // host だけでハッシュすると今度はそこで衝突する。
+    char ident[80];
+    std::snprintf(ident, sizeof(ident), "%s:%u", host, (unsigned)port);
+    uint8_t host_digest[32] = {};
+    mbedtls_sha256(reinterpret_cast<const unsigned char*>(ident), std::strlen(ident), host_digest,
+                   0);
     char key_name[16];
     std::snprintf(key_name, sizeof(key_name), "hk_%02x%02x%02x%02x%02x%02x", host_digest[0],
                   host_digest[1], host_digest[2], host_digest[3], host_digest[4], host_digest[5]);
@@ -82,7 +87,7 @@ bool verify_host_key(LIBSSH2_SESSION* session, const char* host)
     bool      ok        = true;
     if (err == ESP_OK && saved_len == sizeof(digest)) {
         if (std::memcmp(saved, digest, sizeof(digest)) != 0) {
-            set_error("HOST KEY CHANGED for %s - refusing to connect", host);
+            set_error("HOST KEY CHANGED for %s - refusing to connect", ident);
             ok = false;
         }
     } else {
@@ -90,7 +95,7 @@ bool verify_host_key(LIBSSH2_SESSION* session, const char* host)
         nvs_commit(nvs);
         char hex[65] = {};
         for (int i = 0; i < 32; ++i) std::snprintf(hex + i * 2, 3, "%02x", digest[i]);
-        ESP_LOGW(TAG, "new host key for %s (sha256:%s) - remembered", host, hex);
+        ESP_LOGW(TAG, "new host key for %s (sha256:%s) - remembered", ident, hex);
     }
     nvs_close(nvs);
     return ok;
@@ -228,7 +233,7 @@ void ssh_task(void*)
             set_error("handshake failed: %d", rc);
             break;
         }
-        if (!verify_host_key(session, s_cfg.host.c_str())) break;
+        if (!verify_host_key(session, s_cfg.host.c_str(), s_cfg.port)) break;
 
         if (!authenticate(session, s_cfg)) break;
         channel = libssh2_channel_open_session(session);
