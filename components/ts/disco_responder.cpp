@@ -14,6 +14,10 @@ bool DiscoResponder::set_key(const uint8_t disco_priv[32])
     std::lock_guard<std::mutex> guard(mu_);
     std::memcpy(disco_priv_, disco_priv, 32);
     have_key_ = wg::default_crypto().dh_pubkey(disco_pub_, disco_priv_);
+    // **登録済みのピアを捨てる。** 各ピアの shared_key は自分の秘密鍵から
+    // 導出したものなので、鍵が変われば全部作り直しになる。残すと
+    // 「登録されているのに復号できない」状態になり、Ping が黙って失敗する。
+    peers_.clear();
     return have_key_;
 }
 

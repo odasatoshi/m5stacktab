@@ -120,4 +120,60 @@ bool parse_netmap(const std::string& json, NetMap* out)
     return true;
 }
 
+namespace {
+
+// "192.168.0.5" をネットワークバイトオーダの uint32 にする。
+// 解析できなければ false。lwIP に依存させたくないので自分で書く
+// （ホストでテストするため）。
+bool parse_ipv4(const std::string& s, uint32_t* out)
+{
+    uint32_t octets[4] = {};
+    size_t   pos       = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (pos >= s.size() || s[pos] < '0' || s[pos] > '9') return false;
+        uint32_t v     = 0;
+        int      digits = 0;
+        while (pos < s.size() && s[pos] >= '0' && s[pos] <= '9') {
+            v = v * 10 + static_cast<uint32_t>(s[pos] - '0');
+            ++pos;
+            if (++digits > 3 || v > 255) return false;
+        }
+        octets[i] = v;
+        if (i < 3) {
+            if (pos >= s.size() || s[pos] != '.') return false;
+            ++pos;
+        }
+    }
+    if (pos != s.size()) return false;  // 末尾にごみがあるものは弾く
+    // ネットワークバイトオーダ = 最初の octet が下位バイト（lwIP の並び）。
+    *out = octets[0] | (octets[1] << 8) | (octets[2] << 16) | (octets[3] << 24);
+    return true;
+}
+
+// "192.168.0.5:41641" からホスト部分を取る。IPv6 は取れなくて良い
+// （IPv4 として解析できないものは呼び出し側が捨てる）。
+bool host_part(const std::string& ep, std::string* out)
+{
+    const size_t colon = ep.rfind(':');
+    if (colon == std::string::npos || colon == 0) return false;
+    *out = ep.substr(0, colon);
+    return true;
+}
+
+}  // namespace
+
+std::string pick_endpoint(const std::vector<std::string>& endpoints, uint32_t my_addr,
+                          uint32_t my_mask)
+{
+    std::string first_v4;
+    for (const auto& ep : endpoints) {
+        std::string host;
+        uint32_t    addr = 0;
+        if (!host_part(ep, &host) || !parse_ipv4(host, &addr)) continue;  // IPv6 などは飛ばす
+        if (my_mask != 0 && my_addr != 0 && (addr & my_mask) == (my_addr & my_mask)) return ep;
+        if (first_v4.empty()) first_v4 = ep;
+    }
+    return first_v4;
+}
+
 }  // namespace ts

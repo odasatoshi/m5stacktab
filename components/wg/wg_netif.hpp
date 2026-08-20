@@ -8,6 +8,7 @@
 // 収まっているので、netif のマスクを /10 にすれば tailnet 宛だけがこの netif に向く
 // （lwIP にポリシールーティングは無い）。
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -68,7 +69,8 @@ public:
     // タイムスタンプの単調性を保つために、最後に送った TAI64N を保存・復元する。
     // 保存しないと再起動でカウンタが巻き戻り、ピアがリプレイとして無視する。
     using TimestampStore = bool (*)(uint64_t* seconds, bool write);
-    void set_timestamp_store(TimestampStore fn) { ts_store_ = fn; }
+    // up() の後に呼んでも効く（実装は .cpp）。
+    void set_timestamp_store(TimestampStore fn);
 
     const NetifStats& stats() const { return stats_; }
     const char*       last_error() const { return last_error_.c_str(); }
@@ -77,6 +79,11 @@ private:
     bool           netif_up_ = false;
     // 鍵が確定したか。生の transport ポインタを別タスクから触らせないための写し。
     volatile bool  handshake_ok_ = false;
+    // up / down / set_peer の相互排他。**別々のタスクから呼ばれる**
+    // （コンソールと ts のタスク）。g_state.lock は rx/tx が短時間で取り合うので
+    // 分ける。これを取らないと、up() の途中（socket と netif_add とタスク生成の間）に
+    // もう片方が入って、負けた側が書いた static_priv だけが残る。
+    std::mutex     cfg_mu_;
     NetifStats     stats_;
     std::string    last_error_;
     TimestampStore ts_store_ = nullptr;

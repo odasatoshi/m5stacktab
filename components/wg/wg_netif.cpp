@@ -443,6 +443,7 @@ Netif& netif_instance()
 esp_err_t Netif::up(const uint8_t static_priv[kKeyLen], const ip4_addr_t& addr,
                     const ip4_addr_t& netmask, uint16_t listen_port)
 {
+    std::lock_guard<std::mutex> cfg_guard(cfg_mu_);
     if (netif_up_) return ESP_ERR_INVALID_STATE;
 
     std::memcpy(g_state.static_priv, static_priv, kKeyLen);
@@ -519,6 +520,7 @@ esp_err_t Netif::up(const uint8_t static_priv[kKeyLen], const ip4_addr_t& addr,
 
 void Netif::down()
 {
+    std::lock_guard<std::mutex> cfg_guard(cfg_mu_);
     if (!netif_up_) return;
     g_state.running = false;
 
@@ -553,8 +555,19 @@ void Netif::down()
     ESP_LOGI(TAG, "netif down");
 }
 
+// **up() の後に呼んでも効くようにする。** 以前はメンバに置くだけで、
+// g_state.ts_store に入るのは up() の中だけだった。上がった後に呼ぶと
+// 黙って無視される API になっていて罠だった。
+void Netif::set_timestamp_store(TimestampStore fn)
+{
+    std::lock_guard<std::mutex> cfg_guard(cfg_mu_);
+    ts_store_ = fn;
+    if (netif_up_) g_state.ts_store = fn;
+}
+
 esp_err_t Netif::set_peer(const PeerConfig& peer)
 {
+    std::lock_guard<std::mutex> cfg_guard(cfg_mu_);
     if (!netif_up_) return ESP_ERR_INVALID_STATE;
 
     const size_t colon = peer.endpoint.rfind(':');
