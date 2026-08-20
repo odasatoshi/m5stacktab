@@ -122,6 +122,10 @@ void apply_layout();
 void set_menu_visible(bool show);
 // メニュー表示中は端末を描かない（メニューの矩形を上書きしてしまう）。
 void render_term(bool force = false);
+// 実タッチの生座標をログに出すか。四隅の照合（描画側とタッチ側の回転が
+// 一致しているか）を指で取るときに使う。既定は off（毎タップでログが出ると邪魔）。
+bool s_touch_log = false;
+
 // タッチのルーティング（実タッチと tap / swipe コマンドで共有）。
 void touch_down_at(int x, int y);
 void touch_move_at(int x, int y);
@@ -1080,6 +1084,21 @@ void set_menu_visible(bool show)
 // タッチを合成する。**実タッチと同じ関数を呼ぶ**ので、経路の検証になる
 // （タッチ IC そのものは実機で反応することを確認済み。残るのは座標から先の
 // 振り分けで、それがここで測れる）。指で触れない環境でも UI を検証できる。
+// 実タッチの座標をログに出す。**描画側 (components/rotate) とタッチ側 (M5GFX) は
+// 回転の実装が別物**なので、この 2 系がずれていないかは指で押して座標を見るしか
+// 確かめる方法がない（tap / swipe は M5GFX の変換より下流に注入するので届かない）。
+int cmd_touchlog(int argc, char** argv)
+{
+    s_touch_log = (argc < 2) || (std::string(argv[1]) != "off");
+    std::printf("touch log %s. 画面を押すと (x,y) が出ます。\n", s_touch_log ? "on" : "off");
+    if (s_touch_log) {
+        std::printf("  四隅の期待値: 左上 (0,0) 付近 / 右上 (%d,0) / 左下 (0,%d) / 右下 (%d,%d)\n",
+                    (int)display.width() - 1, (int)display.height() - 1, (int)display.width() - 1,
+                    (int)display.height() - 1);
+    }
+    return 0;
+}
+
 int cmd_tap(int argc, char** argv)
 {
     if (argc < 3) {
@@ -1123,15 +1142,24 @@ int cmd_swipe(int argc, char** argv)
         return 1;
     }
     const int before = term->view_offset();
+    // **メニューの状態は dispatch の前に読む。** 後で読むと、メニュー項目が発火して
+    // 閉じた後の状態を見てしまい「menu に食われた」を取り逃がす（実機で踏んだ）。
+    const bool menu_was_shown = menu->visible();
     touch_down_at(x, y1);
+    // どこに食われたかを出す。「0 -> 0」の理由が分からないと、メニューに食われた・
+    // 代替画面で固定された・本当に動かない の区別がつかない（実際に取り違えた）。
+    const char* target = (s_swipe_start_y >= 0) ? "terminal"
+                         : menu_was_shown       ? "menu"
+                                                : "keyboard/status";
     // 実タッチと同じ刻み（20ms ごとのポーリング相当）で動かす。
     constexpr int kSteps = 8;
     for (int i = 1; i <= kSteps; ++i) {
         touch_move_at(x + (x2 - x) * i / kSteps, y1 + (y2 - y1) * i / kSteps);
     }
     touch_up_at(x2, y2);
-    std::printf("swipe (%d,%d)->(%d,%d): scrollback %d -> %d / %d lines\n", x, y1, x2, y2, before,
-                term->view_offset(), term->scrollback_lines());
+    std::printf("swipe (%d,%d)->(%d,%d) [%s]: scrollback %d -> %d / %d lines%s\n", x, y1, x2, y2,
+                target, before, term->view_offset(), term->scrollback_lines(),
+                term->alt_screen() ? " (alt screen: scrollback is pinned)" : "");
     return 0;
 }
 
@@ -2397,6 +2425,8 @@ void register_term_commands()
          nullptr, nullptr, nullptr},
         {"tap", "タッチを合成する（実タッチと同じ経路）", "<x> <y>", &cmd_tap, nullptr, nullptr,
          nullptr},
+        {"touchlog", "実タッチの座標をログに出す（四隅の照合用）", "[off]", &cmd_touchlog, nullptr,
+         nullptr, nullptr},
         {"swipe", "縦スワイプを合成する", "<x> <y_from> <y_to>", &cmd_swipe, nullptr, nullptr,
          nullptr},
         {"wgtest", "WireGuard の暗号とハンドシェイクを実機で検証", nullptr, &cmd_wgtest, nullptr,
@@ -2649,6 +2679,7 @@ extern "C" void app_main(void)
                 touching = true;
                 last_x   = tp.x;
                 last_y   = tp.y;
+                if (s_touch_log) ESP_LOGI(TAG, "touch down (%d,%d)", tp.x, tp.y);
                 touch_down_at(tp.x, tp.y);
             } else {
                 touch_move_at(tp.x, tp.y);
@@ -2657,6 +2688,7 @@ extern "C" void app_main(void)
             }
         } else if (touching && touch_guard.ok()) {
             touching = false;
+            if (s_touch_log) ESP_LOGI(TAG, "touch up   (%d,%d)", last_x, last_y);
             touch_up_at(last_x, last_y);
         }
 
