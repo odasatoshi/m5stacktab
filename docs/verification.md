@@ -194,13 +194,16 @@ printf 'termcheck\r\n' > /dev/cu.usbmodem101
 ```
 
 ```
-  (   6, 12) want c800 got c800  row0 cell0 = red                   ok
-  (  18, 12) want 0660 got 0660  row0 cell1 = green (red の右)      ok
-  (1254, 12) want 0000 got 0000  row0 右端付近 = 黒                 ok
-  (   6, 36) want 001d got 001d  row1 cell0 = blue (row0 の下)      ok
-  (   6, 60) want 0000 got 0000  row2 = 黒                          ok
+  (   6, 36) want c800 got c800  row0 cell0 = red                   ok
+  (  18, 36) want 0660 got 0660  row0 cell1 = green (red の右)      ok
+  (1254, 36) want 0000 got 0000  row0 右端付近 = 黒                 ok
+  (   6, 60) want 001d got 001d  row1 cell0 = blue (row0 の下)      ok
+  (   6, 84) want 0000 got 0000  row2 = 黒                          ok
 render path (vt100 -> sprite -> PPA -> framebuffer): ok
 ```
+
+y が 36 から始まるのは、画面上端の 24px をステータスバーに譲っているため
+（`renderer->origin_y()`）。ここを足し忘れるとステータスバーの背景色を読む。
 
 角度だけを `ANGLE_90` に戻すと、右端に緑が来て（横方向の反転）`FAILED` になる。
 
@@ -226,3 +229,33 @@ python tools/screencap.py cap.log top.png
 
 `docs/screenshots/` に、端末とキーボードの天地が揃っていることを確かめたときの
 キャプチャを置いてある。
+
+## 初期メニュー
+
+電源投入でメニューが出る。純正キーボード (#15) が来るまでのキー入力手段は
+シリアルの `menu` コマンド。
+
+```sh
+printf 'menu\r\n'        > /dev/cu.usbmodem101   # 表示（引数なしは show）
+printf 'menu down\r\n'   > /dev/cu.usbmodem101
+printf 'menu enter\r\n'  > /dev/cu.usbmodem101
+printf 'menu esc\r\n'    > /dev/cu.usbmodem101   # 戻る
+printf 'menu hide\r\n'   > /dev/cu.usbmodem101
+```
+
+タップは 3 通り。
+
+- 項目をタップすると、移動と決定を兼ねる（指で 2 度押しは使いにくい）
+- **ステータスバーをタップするとメニューを開閉する。** 判定は上から 56px
+  （描画は 24px だが、指で当てるには 3.5mm は狭い）
+- VPN / Settings 画面の `< Back` をタップで戻れる
+
+メニュー表示中はキーボードを隠す。隠さないとメニューがキーボードの領域を覆わないので
+指でキーを押せてしまい、その出力が端末経由でメニューの矩形に描かれて崩れる。
+
+画面の配分は `apply_layout()` 1 箇所で決める。
+
+| 状態 | 端末 |
+|---|---|
+| キーボード表示 | 15 行 (360px) |
+| キーボード非表示 | 29 行 (696px) |

@@ -1804,7 +1804,11 @@ int cmd_termcheck(int, char**)
 
     // 行 0: セル 0 が赤、セル 1 が緑。行 1: セル 0 が青。ほかは空。
     term->write("\033[2J\033[H\033[41m \033[42m \033[m\r\n\033[44m \033[m");
-    render_term(/*force=*/true);
+    // **render_term ではなく直接呼ぶ。** これは本番経路を実際に通すための診断なので、
+    // メニュー表示中でも端末を描かないと、メニューの画素を読んで FAILED になる
+    // （実機で踏んだ）。終わったらメニューを描き直す。
+    const bool menu_was_shown = menu && menu->visible();
+    renderer->render(*term, /*force=*/true);
 
     // 期待色は kBase16 (xterm 標準 16 色) と同じ変換で作る。
     const uint16_t red   = display.color565(205, 0, 0);
@@ -1816,13 +1820,16 @@ int cmd_termcheck(int, char**)
         uint16_t    want;
         const char* what;
     };
+    // **端末の原点はステータスバーの下。** ここを足し忘れると 1 行ぶん上を読んで
+    // ステータスバーの背景色が返る（実機で踏んだ）。
+    const int oy = renderer->origin_y();
     const Probe probes[] = {
-        {cw / 2, ch / 2, red, "row0 cell0 = red"},
-        {cw + cw / 2, ch / 2, green, "row0 cell1 = green (red の右)"},
+        {cw / 2, oy + ch / 2, red, "row0 cell0 = red"},
+        {cw + cw / 2, oy + ch / 2, green, "row0 cell1 = green (red の右)"},
         // 横方向に反転していれば、ここに赤が来て左端が黒になる。
-        {far * cw + cw / 2, ch / 2, 0x0000, "row0 右端付近 = 黒"},
-        {cw / 2, ch + ch / 2, blue, "row1 cell0 = blue (row0 の下)"},
-        {cw / 2, 2 * ch + ch / 2, 0x0000, "row2 = 黒"},
+        {far * cw + cw / 2, oy + ch / 2, 0x0000, "row0 右端付近 = 黒"},
+        {cw / 2, oy + ch + ch / 2, blue, "row1 cell0 = blue (row0 の下)"},
+        {cw / 2, oy + 2 * ch + ch / 2, 0x0000, "row2 = 黒"},
     };
 
     int bad = 0;
@@ -1836,6 +1843,7 @@ int cmd_termcheck(int, char**)
     std::printf("render path (vt100 -> sprite -> %s -> framebuffer): %s\n",
                 renderer->ppa_enabled() ? "PPA" : "pushSprite", bad == 0 ? "ok" : "FAILED");
     status_bar->draw(gather_status(), /*force=*/true);
+    if (menu_was_shown) menu->draw(/*force=*/true);
     return bad == 0 ? 0 : 1;
 }
 
