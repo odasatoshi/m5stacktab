@@ -19,6 +19,7 @@
 #include <nvs_flash.h>
 
 #include <esp_netif.h>
+#include <ping/ping_sock.h>
 #include <arpa/inet.h>
 #include <lwip/sockets.h>
 #include <mbedtls/ctr_drbg.h>
@@ -100,6 +101,10 @@ mbedtls_ctr_drbg_context* ts_drbg()
 
 // cmd_ts から呼ぶので前方宣言する（定義は DISCO のセクション）。
 void register_disco_peers(const ts::NetMap& map);
+// DISCO のレスポンダ（定義は下）。ts の鍵設定から先に触る。
+extern ts::DiscoResponder s_disco;
+void maybe_bring_up_tunnel(const ts::NetMap& map, const std::string& assigned);
+void wire_netif(wg::Netif& nif);
 
 M5GFX                          display;
 std::unique_ptr<TermRenderer>  renderer;
@@ -117,6 +122,26 @@ void apply_layout();
 void set_menu_visible(bool show);
 // メニュー表示中は端末を描かない（メニューの矩形を上書きしてしまう）。
 void render_term(bool force = false);
+
+// Tailscale の 3 つの鍵。node_priv は WireGuard の秘密鍵でもあるので、
+// netmap が来たときにトンネルを張るために map handler からも読む。
+uint8_t s_ts_machine_priv[32] = {};
+uint8_t s_ts_node_priv[32]    = {};
+uint8_t s_ts_disco_priv[32]   = {};
+bool    s_ts_keys_ready       = false;
+
+// トンネルの netif がどの鍵で上がっているか。Netif::up() は秘密鍵をコピーするので、
+// 上がった後に差し替える手段が無い。張り替えの判断に使う。
+// トンネルの netmask。Tailscale のアドレスは 100.64.0.0/10 に収まるので /10 に
+// すれば tailnet 宛だけがこの netif に向く（lwIP にポリシールーティングは無い）。
+constexpr const char* kTunnelMask = "255.192.0.0";
+
+enum class NetifKey { kNone, kOwn, kNode };
+NetifKey    s_netif_key = NetifKey::kNone;
+// 今トンネルを張っている相手。netmap ごとに選び直さないために覚える。
+std::string s_tunnel_peer_key;
+std::string s_tunnel_endpoint;
+bool        s_tunnel_peer_valid = false;
 
 // ステータスバーを見に行った最後の時刻。C6 への RPC なので毎フレームは叩かない。
 int64_t s_last_status_us = 0;
@@ -713,7 +738,11 @@ int cmd_ts(int argc, char** argv)
         return 1;
     }
     // machine / node / disco の 3 つは別の鍵にする（役割ごとに分離する）。
-    static uint8_t machine_priv[32], node_priv[32], disco_priv[32];
+    // node_priv は **WireGuard の秘密鍵でもある**（Tailscale の設計）。
+    // netmap が来たときにトンネルを張るので、map handler から見えるところに置く。
+    uint8_t* machine_priv = s_ts_machine_priv;
+    uint8_t* node_priv    = s_ts_node_priv;
+    uint8_t* disco_priv   = s_ts_disco_priv;
     nvs_handle_t   nvs;
     bool           have_keys = false;
     if (nvs_open("ts", NVS_READWRITE, &nvs) == ESP_OK) {
@@ -751,6 +780,16 @@ int cmd_ts(int argc, char** argv)
         std::printf("could not load or create keys\n");
         return 1;
     }
+    // これ以降 map handler が node_priv を WireGuard の秘密鍵として使う。
+    s_ts_keys_ready = true;
+    // **DISCO の鍵はここで入れる。** map handler は register_disco_peers を
+    // 先に呼ぶので、鍵が無いと add_peer が全部拒否されて peers=0 になる
+    // （実機で踏んだ: pings が来ても unknown として捨てられる）。
+    if (!s_disco.set_key(disco_priv)) {
+        std::printf("disco key setup failed\n");
+        s_ts_keys_ready = false;
+        return 1;
+    }
 
     static ts::Client client;
     ts::ClientConfig  cfg;
@@ -775,6 +814,7 @@ int cmd_ts(int argc, char** argv)
     }
     if (!client.set_keys(machine_priv, node_priv, disco_priv)) {
         std::printf("public key derivation failed\n");
+        s_ts_keys_ready = false;
         return 1;
     }
     client.set_config(cfg);
@@ -784,6 +824,9 @@ int cmd_ts(int argc, char** argv)
         if (!ts::parse_netmap(json, &map)) return;
         if (map.keepalive) return;
         register_disco_peers(map);
+        // 自分のアドレスは status 側で拾っている（netmap の Addresses）。
+        const std::string assigned = s_ts_client ? s_ts_client->snapshot().assigned_address : "";
+        if (!assigned.empty()) maybe_bring_up_tunnel(map, assigned);
     });
 
     // **別タスクで走らせる。** run_once() は map の long-poll を最長 600 秒
@@ -798,8 +841,9 @@ int cmd_ts(int argc, char** argv)
     s_ts_client     = &client;
     // X25519 が 1 回で 10KB 近く使い、HTTP/2 のバッファも重なるので広く取る。
     if (xTaskCreate(&ts_task, "ts", 32768, &client, 5, &s_ts_task) != pdPASS) {
-        s_ts_task   = nullptr;
-        s_ts_client = nullptr;
+        s_ts_task       = nullptr;
+        s_ts_client     = nullptr;
+        s_ts_keys_ready = false;
         std::printf("xTaskCreate failed\n");
         return 1;
     }
@@ -1397,6 +1441,260 @@ void register_disco_peers(const ts::NetMap& map)
     }
 }
 
+// netif を上げる前に必ずやる配線。
+//
+// **片方の経路だけに置くと、もう片方で DISCO が死ぬ。** 実機で踏んだ:
+// netmap 経由で上げた netif には foreign handler が無く、DISCO のパケットが
+// 全部 rx_dropped になって Ping に応答しなくなった（`wg stat` が
+// `rx=0 pkt (drop 17)`）。`cmd_wg` と `maybe_bring_up_tunnel` の両方から呼ぶ。
+void wire_netif(wg::Netif& nif)
+{
+    // WireGuard のタイムスタンプは再起動をまたいで単調増加させる必要がある。
+    // 巻き戻るとピアがリプレイとして無視し、原因の分からない無応答になる。
+    nif.set_timestamp_store([](uint64_t* seconds, bool write) -> bool {
+        nvs_handle_t h;
+        if (nvs_open("wg", NVS_READWRITE, &h) != ESP_OK) return false;
+        bool ok = false;
+        if (write) {
+            ok = (nvs_set_u64(h, "ts", *seconds) == ESP_OK) && (nvs_commit(h) == ESP_OK);
+        } else {
+            ok = (nvs_get_u64(h, "ts", seconds) == ESP_OK);
+        }
+        nvs_close(h);
+        return ok;
+    });
+
+    // DISCO の鍵は ts コマンドと同じ NVS の "dkey" を使う（netmap に載る鍵と一致させる）。
+    if (s_disco.has_key()) {
+        nif.set_foreign_handler(&on_foreign_packet);
+        return;
+    }
+    uint8_t      dkey[32];
+    nvs_handle_t h;
+    bool         ok = false;
+    if (nvs_open("ts", NVS_READONLY, &h) == ESP_OK) {
+        size_t len = 32;
+        ok         = (nvs_get_blob(h, "dkey", dkey, &len) == ESP_OK && len == 32);
+        nvs_close(h);
+    }
+    if (ok && s_disco.set_key(dkey)) {
+        nif.set_foreign_handler(&on_foreign_packet);
+    } else {
+        ESP_LOGW(TAG, "no disco key yet (run `ts` first) - DISCO disabled");
+    }
+}
+
+// netmap が来たら、トンネルを張れる材料が揃っているかを見て張る。
+//
+// **Tailscale では WireGuard の秘密鍵 = node key。** 以前は `wg` コマンドが
+// NVS に自前の鍵を作って使っていたので、ピアは Tab5 の node key を公開鍵として
+// 期待するのに Tab5 は別の鍵でハンドシェイクを投げ、必ず弾かれていた（#37）。
+//
+// ponytail: Netif は 1 ピアしか持てないので、**エンドポイントを申告している
+// オンラインのピアのうち最初の 1 つ**だけを相手にする。tailnet に 2 台以上いる
+// 構成が必要になったら Netif を複数ピア対応にする（そのときは AllowedIPs で
+// 宛先を振り分ける必要がある）。
+void maybe_bring_up_tunnel(const ts::NetMap& map, const std::string& assigned)
+{
+    if (!s_ts_keys_ready) return;
+    auto& nif = wg::netif_instance();
+
+    // **is_up() の外で呼ぶ。** 内側に置くと、`wg` を先に打って netif が
+    // 上がっている場合に配線されず、foreign handler が null のままになって
+    // DISCO のパケットが全部 rx_dropped になる（実機で踏んだ形と同じ）。
+    wire_netif(nif);
+
+    // "100.64.0.5/32" から自分のアドレスを取る。
+    const std::string addr_str = assigned.substr(0, assigned.find('/'));
+    ip4_addr_t        addr, mask;
+    if (addr_str.empty() || !ip4addr_aton(addr_str.c_str(), &addr)) return;
+    ip4addr_aton(kTunnelMask, &mask);
+
+    // **node key 以外で上がっている netif は張り替える。** Netif::up() は
+    // 秘密鍵をコピーするので、上がった後に差し替える手段が無い。`wg` の独自鍵で
+    // 上がっていると、ピアは node key を期待するので必ず弾かれる（#37 そのもの）。
+    if (nif.is_up() && s_netif_key != NetifKey::kNode) {
+        ESP_LOGW(TAG, "netif is up with a non-node key; bringing it down to re-key");
+        nif.down();
+        s_netif_key = NetifKey::kNone;
+        s_tunnel_peer_valid = false;
+    }
+    if (!nif.is_up()) {
+        if (esp_err_t err = nif.up(s_ts_node_priv, addr, mask); err != ESP_OK) {
+            ESP_LOGE(TAG, "tunnel netif up failed: %s (%s)", esp_err_to_name(err),
+                     nif.last_error());
+            return;
+        }
+        s_netif_key         = NetifKey::kNode;
+        s_tunnel_peer_valid = false;
+        ESP_LOGI(TAG, "tunnel netif up with the node key: %s", addr_str.c_str());
+    }
+
+    // 相手を 1 つ選ぶ。オンラインでエンドポイントを申告しているものだけ。
+    //
+    // **一度選んだピアに貼り付く。** 差分 netmap には Peers が無く
+    // PeersChanged だけが来るので、毎回選び直すと peers[0] と
+    // peers_changed[0] の間でトンネルがフラップする（`Netif` は 1 ピアしか
+    // 持てないので、切り替わるたびにハンドシェイクをやり直すことになる）。
+    auto usable = [](const ts::Peer& p) {
+        return p.online && !p.endpoints.empty() && !p.node_key.empty();
+    };
+    const ts::Peer* peer = nullptr;
+    auto find_in = [&](const std::vector<ts::Peer>& peers) {
+        for (const auto& p : peers) {
+            if (!usable(p)) continue;
+            if (s_tunnel_peer_valid && p.node_key != s_tunnel_peer_key) continue;
+            peer = &p;
+            return;
+        }
+    };
+    find_in(map.peers);
+    if (!peer) find_in(map.peers_changed);
+    if (!peer && s_tunnel_peer_valid) return;  // 選んだピアがこの netmap に出てこないだけ
+    if (!peer) {
+        // まだ誰も選んでいないので、条件を満たす最初のピアを取る。
+        for (const auto& list : {&map.peers, &map.peers_changed}) {
+            for (const auto& p : *list) {
+                if (usable(p)) {
+                    peer = &p;
+                    break;
+                }
+            }
+            if (peer) break;
+        }
+    }
+    if (!peer) return;
+
+    wg::PeerConfig cfg;
+    // ピアの node key が、そのまま WireGuard の公開鍵。
+    if (!ts::key_from_string(peer->node_key, "nodekey:", cfg.public_key)) {
+        ESP_LOGW(TAG, "peer node key not parseable: %s", peer->node_key.c_str());
+        return;
+    }
+    // 自分のサブネットは WiFi の netif から取る（トンネルの netif ではない）。
+    uint32_t            my_addr = 0, my_mask = 0;
+    esp_netif_t*        sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    esp_netif_ip_info_t ip{};
+    if (sta && esp_netif_get_ip_info(sta, &ip) == ESP_OK) {
+        my_addr = ip.ip.addr;
+        my_mask = ip.netmask.addr;
+    }
+    cfg.endpoint = ts::pick_endpoint(peer->endpoints, my_addr, my_mask);
+    if (cfg.endpoint.empty()) {
+        ESP_LOGW(TAG, "no usable IPv4 endpoint for %s", peer->name.c_str());
+        return;
+    }
+
+    // **同じピア・同じエンドポイントなら何もしない。** set_peer は無条件に
+    // ハンドシェイクを始めるので、netmap ごとに呼ぶと確立済みのセッションを
+    // 毎回張り替える。しかも X25519 を g_state.lock を握ったまま 2 回回すので
+    // （実測 72ms x 2）、rx/tx タスクの 200ms タイムアウトを踏んでパケットが落ちる。
+    if (s_tunnel_peer_valid && peer->node_key == s_tunnel_peer_key &&
+        cfg.endpoint == s_tunnel_endpoint) {
+        return;
+    }
+    if (esp_err_t err = nif.set_peer(cfg); err != ESP_OK) {
+        ESP_LOGE(TAG, "set_peer failed: %s (%s)", esp_err_to_name(err), nif.last_error());
+        return;
+    }
+    s_tunnel_peer_key   = peer->node_key;
+    s_tunnel_endpoint   = cfg.endpoint;
+    s_tunnel_peer_valid = true;
+    ESP_LOGI(TAG, "tunnel peer: %s at %s", peer->name.c_str(), cfg.endpoint.c_str());
+}
+
+// ICMP echo を投げる。トンネル越しの到達性を確かめる手段が無いと、
+// 「netif は上がったが本当に通っているのか」が分からない（#9 の完了条件）。
+int cmd_ping(int argc, char** argv)
+{
+    if (argc < 2) {
+        std::printf("usage: ping <ip> [count]\n");
+        return 1;
+    }
+    ip_addr_t target{};
+    if (!ipaddr_aton(argv[1], &target)) {
+        std::printf("bad address: %s\n", argv[1]);
+        return 1;
+    }
+    esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
+    cfg.target_addr       = target;
+    // **0 を渡してはいけない。** esp_ping では 0 = 無限で、下の待ちが必ず
+    // タイムアウトしてコールバックが解放済みスタックを触る。atoi は非数値でも
+    // 0 を返すので、ここでクランプする。
+    const int want = (argc > 2) ? atoi(argv[2]) : 4;
+    cfg.count      = (uint32_t)((want < 1) ? 1 : (want > 100) ? 100 : want);
+    cfg.timeout_ms = 2000;
+    cfg.interval_ms = 500;
+    // 既定のスタックは 2048 + extra しかなく、フル newlib の printf を
+    // このタスクで呼ぶので広げる（この repo は何度もスタック保護フォルトを踏んでいる）。
+    cfg.task_stack_size = 4096;
+    // トンネルの MTU は 1280 なので、既定の 64 バイトなら断片化しない。
+
+    // 結果はコールバックで来る。終わるまで待つのでセマフォで同期する。
+    struct Ctx {
+        SemaphoreHandle_t done = nullptr;
+        uint32_t          replies = 0;
+    } ctx;
+    ctx.done = xSemaphoreCreateBinary();
+    if (!ctx.done) {
+        std::printf("no memory\n");
+        return 1;
+    }
+
+    esp_ping_callbacks_t cbs{};
+    cbs.cb_args = &ctx;
+    cbs.on_ping_success = [](esp_ping_handle_t h, void* args) {
+        auto*    c   = static_cast<Ctx*>(args);
+        uint32_t seq = 0, ms = 0;
+        uint8_t  ttl = 0;
+        ip_addr_t addr{};
+        esp_ping_get_profile(h, ESP_PING_PROF_SEQNO, &seq, sizeof(seq));
+        esp_ping_get_profile(h, ESP_PING_PROF_TIMEGAP, &ms, sizeof(ms));
+        esp_ping_get_profile(h, ESP_PING_PROF_TTL, &ttl, sizeof(ttl));
+        esp_ping_get_profile(h, ESP_PING_PROF_IPADDR, &addr, sizeof(addr));
+        std::printf("  reply from %s: seq=%u ttl=%u time=%u ms\n", ipaddr_ntoa(&addr),
+                    (unsigned)seq, (unsigned)ttl, (unsigned)ms);
+        ++c->replies;
+    };
+    cbs.on_ping_timeout = [](esp_ping_handle_t h, void*) {
+        uint32_t seq = 0;
+        esp_ping_get_profile(h, ESP_PING_PROF_SEQNO, &seq, sizeof(seq));
+        std::printf("  timeout seq=%u\n", (unsigned)seq);
+    };
+    cbs.on_ping_end = [](esp_ping_handle_t, void* args) {
+        xSemaphoreGive(static_cast<Ctx*>(args)->done);
+    };
+
+    esp_ping_handle_t ping = nullptr;
+    if (esp_ping_new_session(&cfg, &cbs, &ping) != ESP_OK) {
+        std::printf("esp_ping_new_session failed\n");
+        vSemaphoreDelete(ctx.done);
+        return 1;
+    }
+    esp_ping_start(ping);
+    // count * (interval + timeout) より少し長く待つ。
+    // **pdMS_TO_TICKS は ms * configTICK_RATE_HZ を uint32 で計算する。**
+    // count を絞らずに 3600 を渡したら 9,002,000ms でオーバーフローし、
+    // 412 秒で早期タイムアウトして解放済みスタックに書き込み、panic した（実機）。
+    // count が 100 以下なら 252,000ms で収まる。
+    const uint32_t   wait_ms = cfg.count * (cfg.interval_ms + cfg.timeout_ms) + 2000;
+    const TickType_t wait    = pdMS_TO_TICKS(wait_ms);
+    const bool       ok   = (xSemaphoreTake(ctx.done, wait) == pdTRUE);
+    uint32_t         sent = 0, recv = 0;
+    esp_ping_get_profile(ping, ESP_PING_PROF_REQUEST, &sent, sizeof(sent));
+    esp_ping_get_profile(ping, ESP_PING_PROF_REPLY, &recv, sizeof(recv));
+    esp_ping_stop(ping);
+    // **stop は旗を立てるだけで、ping タスクを待たない**（ESP-IDF の
+    // ping_sock.c を確認）。走行中の recv を終えてから on_ping_end が呼ばれるので、
+    // ここで待たずに ctx とセマフォを捨てると解放済みスタックに書かれる。
+    if (!ok) xSemaphoreTake(ctx.done, pdMS_TO_TICKS(cfg.timeout_ms + cfg.interval_ms + 1000));
+    esp_ping_delete_session(ping);
+    vSemaphoreDelete(ctx.done);
+    std::printf("%u sent, %u received%s\n", (unsigned)sent, (unsigned)recv,
+                ok ? "" : " (timed out waiting)");
+    return (recv > 0) ? 0 : 1;
+}
+
 // WireGuard のトンネル netif を上げる。ピア指定は任意（無ければ netif だけ作る）。
 int cmd_wg(int argc, char** argv)
 {
@@ -1404,6 +1702,8 @@ int cmd_wg(int argc, char** argv)
 
     if (argc >= 2 && std::string(argv[1]) == "down") {
         nif.down();
+        s_netif_key         = NetifKey::kNone;
+        s_tunnel_peer_valid = false;
         std::printf("netif down\n");
         return 0;
     }
@@ -1475,44 +1775,13 @@ int cmd_wg(int argc, char** argv)
         std::printf("bad tunnel ip\n");
         return 1;
     }
-    // Tailscale のアドレスは 100.64.0.0/10 に収まる。マスクを /10 にすれば
-    // tailnet 宛だけがこの netif に向く（lwIP にポリシールーティングは無い）。
-    ip4addr_aton("255.192.0.0", &mask);
+    ip4addr_aton(kTunnelMask, &mask);
 
-    // WireGuard のタイムスタンプは再起動をまたいで単調増加させる必要がある。
-    // 巻き戻るとピアがリプレイとして無視し、原因の分からない無応答になる。
-    nif.set_timestamp_store([](uint64_t* seconds, bool write) -> bool {
-        nvs_handle_t h;
-        if (nvs_open("wg", NVS_READWRITE, &h) != ESP_OK) return false;
-        bool ok = false;
-        if (write) {
-            ok = (nvs_set_u64(h, "ts", *seconds) == ESP_OK) && (nvs_commit(h) == ESP_OK);
-        } else {
-            ok = (nvs_get_u64(h, "ts", seconds) == ESP_OK);
-        }
-        nvs_close(h);
-        return ok;
-    });
-
-    // DISCO の鍵は ts コマンドと同じ NVS の "dkey" を使う（netmap に載る鍵と一致させる）。
-    {
-        uint8_t      dkey[32];
-        nvs_handle_t h;
-        bool         ok = false;
-        if (nvs_open("ts", NVS_READONLY, &h) == ESP_OK) {
-            size_t len = 32;
-            ok = (nvs_get_blob(h, "dkey", dkey, &len) == ESP_OK && len == 32);
-            nvs_close(h);
-        }
-        if (ok && s_disco.set_key(dkey)) {
-            nif.set_foreign_handler(&on_foreign_packet);
-        } else {
-            std::printf("warning: no disco key yet (run `ts` first) - DISCO disabled\n");
-        }
-    }
+    wire_netif(nif);
 
     if (!nif.is_up()) {
         const esp_err_t err = nif.up(priv, addr, mask);
+        if (err == ESP_OK) s_netif_key = NetifKey::kOwn;
         if (err != ESP_OK) {
             std::printf("netif up failed: %s (%s)\n", esp_err_to_name(err), nif.last_error());
             return 1;
@@ -1990,6 +2259,8 @@ void register_term_commands()
          "<host> <authkey> [port] [capver]", &cmd_ts, nullptr, nullptr, nullptr},
         {"ts-status", "ts の状態を見る", nullptr, &cmd_ts_status, nullptr, nullptr, nullptr},
         {"ts-stop", "ts の long-poll を止める", nullptr, &cmd_ts_stop, nullptr, nullptr, nullptr},
+        {"ping", "ICMP echo を投げる（トンネル越しの到達性確認）", "<ip> [count]",
+         &cmd_ping, nullptr, nullptr, nullptr},
         {"wg", "WireGuard トンネルの netif を操作", "<tunnel-ip> [pubkey] [endpoint] | stat | down",
          &cmd_wg, nullptr, nullptr, nullptr},
     };
