@@ -1084,6 +1084,55 @@ void set_menu_visible(bool show)
 // タッチを合成する。**実タッチと同じ関数を呼ぶ**ので、経路の検証になる
 // （タッチ IC そのものは実機で反応することを確認済み。残るのは座標から先の
 // 振り分けで、それがここで測れる）。指で触れない環境でも UI を検証できる。
+// **描画側 (components/rotate) とタッチ側 (M5GFX) の回転が一致しているかを、
+// 指なしで照合する。**
+//
+// M5GFX の `convertRawXY` は「生座標 → アフィン変換 → 回転」を適用する公開関数なので、
+// 生座標を合成して通せる。rotation 1 では swap してから ty を反転するので、
+// 生座標がネイティブ画素と一致するなら (ny, native_w-1-nx) になる。
+// components/rotate の native_to_landscape も同じ式なので、一致すれば
+// 2 つの実装が同じ向きを指していることになる。
+//
+// **これでも残るもの**: 「生座標 (0,0) が物理的にパネルの左上か」は M5GFX の
+// ボード固有のキャリブレーション（アフィン係数）の話で、こちらのコードではない。
+// そこは指で押して確かめるしかない（touchlog を使う）。
+int cmd_touchmap(int, char**)
+{
+    rot::Panel panel;
+    panel.native_w = 720;
+    panel.native_h = 1280;
+
+    const uint8_t prev = display.getRotation();
+    display.setRotation(1);
+    std::printf("M5GFX の convertRawXY と components/rotate を照合 (rotation 1):\n");
+    struct P { int nx, ny; const char* name; };
+    const P pts[] = {
+        {0, 0, "native 左上"},
+        {panel.native_w - 1, 0, "native 右上"},
+        {0, panel.native_h - 1, "native 左下"},
+        {panel.native_w - 1, panel.native_h - 1, "native 右下"},
+        {360, 640, "native 中央"},
+    };
+    int bad = 0;
+    for (const auto& pt : pts) {
+        lgfx::touch_point_t tp{};
+        tp.x = (int16_t)pt.nx;
+        tp.y = (int16_t)pt.ny;
+        display.convertRawXY(&tp, 1);
+        int lx = 0, ly = 0;
+        rot::native_to_landscape(panel, pt.nx, pt.ny, &lx, &ly);
+        const bool ok = (tp.x == lx && tp.y == ly);
+        if (!ok) ++bad;
+        std::printf("  %-12s (%3d,%4d) -> m5gfx(%4d,%3d) rotate(%4d,%3d) %s\n", pt.name, pt.nx,
+                    pt.ny, (int)tp.x, (int)tp.y, lx, ly, ok ? "ok" : "MISMATCH");
+    }
+    display.setRotation(prev);
+    std::printf("touch/render rotation agreement: %s\n", bad == 0 ? "ok" : "MISMATCH");
+    std::printf("  残るのは「生座標 (0,0) が物理的な左上か」= M5GFX の"
+                "キャリブレーション。touchlog で指で確かめる\n");
+    return bad == 0 ? 0 : 1;
+}
+
 // 実タッチの座標をログに出す。**描画側 (components/rotate) とタッチ側 (M5GFX) は
 // 回転の実装が別物**なので、この 2 系がずれていないかは指で押して座標を見るしか
 // 確かめる方法がない（tap / swipe は M5GFX の変換より下流に注入するので届かない）。
@@ -2427,6 +2476,8 @@ void register_term_commands()
          nullptr},
         {"touchlog", "実タッチの座標をログに出す（四隅の照合用）", "[off]", &cmd_touchlog, nullptr,
          nullptr, nullptr},
+        {"touchmap", "描画側とタッチ側の回転が一致するか照合（指なし）", nullptr, &cmd_touchmap,
+         nullptr, nullptr, nullptr},
         {"swipe", "縦スワイプを合成する", "<x> <y_from> <y_to>", &cmd_swipe, nullptr, nullptr,
          nullptr},
         {"wgtest", "WireGuard の暗号とハンドシェイクを実機で検証", nullptr, &cmd_wgtest, nullptr,
