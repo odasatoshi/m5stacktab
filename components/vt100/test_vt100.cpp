@@ -578,8 +578,47 @@ void test_scrollback()
 
 }  // namespace
 
+// resize がスクロールバックを捨てる条件。**行数だけの変更で捨ててはいけない。**
+// 捨てていたので、実機でキーボードやメニューの表示を切り替えるたびに履歴が
+// 消えて、スクロールバックが常に空だった。
+void test_resize_keeps_scrollback()
+{
+    vt::Terminal t(10, 3);
+    std::vector<vt::Cell> sb(10 * 50);
+    t.set_scrollback(sb.data(), 50);
+
+    // 6 行流して 3 行を履歴に落とす。
+    t.write("a\r\nb\r\nc\r\nd\r\ne\r\nf");
+    CHECK(t.scrollback_lines() == 3);
+    CHECK(t.row_text(2) == "f");
+
+    // 行数だけ変える（キーボードの表示切り替えに相当）→ 履歴は残る。
+    t.resize(10, 2);
+    CHECK(t.scrollback_lines() == 3);
+    t.resize(10, 3);
+    CHECK(t.scrollback_lines() == 3);
+    // 見ている位置は最新に戻る。
+    CHECK(t.view_offset() == 0);
+    CHECK(t.scroll_view(2) == 2);
+    t.resize(10, 4);
+    CHECK(t.view_offset() == 0);
+
+    // 桁数が変わったら捨てる（履歴は cols 単位で詰めてあるので使い回せない）。
+    CHECK(t.scrollback_lines() == 3);
+    t.resize(12, 4);
+    CHECK(t.scrollback_lines() == 0);
+
+    // 同じ寸法なら何もしない（早期 return の経路）。
+    t.write("x\r\ny\r\nz\r\nw\r\nv");
+    const int held = t.scrollback_lines();
+    CHECK(held > 0);
+    t.resize(12, 4);
+    CHECK(t.scrollback_lines() == held);
+}
+
 int main()
 {
+    test_resize_keeps_scrollback();
     test_plain_text();
     test_autowrap();
     test_cursor_and_erase();

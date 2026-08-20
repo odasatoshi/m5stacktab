@@ -122,6 +122,10 @@ void apply_layout();
 void set_menu_visible(bool show);
 // メニュー表示中は端末を描かない（メニューの矩形を上書きしてしまう）。
 void render_term(bool force = false);
+// タッチのルーティング（実タッチと tap / swipe コマンドで共有）。
+void touch_down_at(int x, int y);
+void touch_move_at(int x, int y);
+void touch_up_at(int x, int y);
 
 // Tailscale の 3 つの鍵。node_priv は WireGuard の秘密鍵でもあるので、
 // netmap が来たときにトンネルを張るために map handler からも読む。
@@ -994,6 +998,55 @@ void apply_layout()
     if (menu) menu->set_area(s_status_h, avail - keyboard->height());
 }
 
+// タッチのルーティング。**実タッチと `tap` / `swipe` コマンドで同じ経路を通す。**
+// 分けると「指だと動くがコマンドだと動かない」（または逆）になって、
+// 検証にならない。ロックは呼び出し側が取っている。
+void touch_down_at(int x, int y)
+{
+    if (y < kStatusTapH) {
+        // ステータスバーをタップでメニューを開閉する。純正キーボードが来るまで、
+        // 指だけでメニューに戻れる経路はここだけなので、当たり判定は描画（24px）
+        // より広く取る。24px は 3.5mm しかない。
+        set_menu_visible(!menu->visible());
+    } else if (menu->visible()) {
+        // メニュー表示中はキーボードを隠しているので、ここで全部食う。
+        if (menu->touch_down(x, y)) menu->draw();
+    } else if (!keyboard->touch_down(x, y)) {
+        // キーボード外 = 端末領域。縦スワイプでスクロールバックを見る。
+        s_swipe_start_y      = y;
+        s_swipe_start_offset = term->view_offset();
+    }
+}
+
+void touch_move_at(int x, int y)
+{
+    if (s_swipe_start_y >= 0) {
+        // 端末領域のドラッグ。**下に引いたら過去に戻る**（紙を下に引く感覚）。
+        // 移動量をセル単位に落として絶対位置で当てる。相対で足していくと
+        // 20ms ごとのポーリングの取りこぼしでずれていく。
+        const int cells = (y - s_swipe_start_y) / renderer->cell_h();
+        const int want  = s_swipe_start_offset + cells;
+        if (const int delta = want - term->view_offset(); delta != 0) {
+            if (term->scroll_view(delta) != 0) render_term();
+        }
+        return;
+    }
+    // メニュー表示中はドラッグをキーボードに渡さない（見えていないので）。
+    if (!menu->visible()) keyboard->touch_move(x, y);
+}
+
+void touch_up_at(int x, int y)
+{
+    if (s_swipe_start_y >= 0) {
+        ESP_LOGI(TAG, "scrollback offset %d / %d lines", term->view_offset(),
+                 term->scrollback_lines());
+        s_swipe_start_y = -1;
+        return;
+    }
+    if (menu->visible()) return;  // 押した時点で決まっているので、離すのは無視する
+    if (!keyboard->touch_up(x, y)) ESP_LOGI(TAG, "touch up");
+}
+
 void render_term(bool force)
 {
     if (!renderer || !term) return;
@@ -1022,6 +1075,58 @@ void set_menu_visible(bool show)
     }
     // ラベルを MENU / CLOSE に切り替える。開閉のたびに必ず描き直す。
     status_bar->draw(gather_status(), /*force=*/true);
+}
+
+// タッチを合成する。**実タッチと同じ関数を呼ぶ**ので、経路の検証になる
+// （タッチ IC そのものは実機で反応することを確認済み。残るのは座標から先の
+// 振り分けで、それがここで測れる）。指で触れない環境でも UI を検証できる。
+int cmd_tap(int argc, char** argv)
+{
+    if (argc < 3) {
+        std::printf("usage: tap <x> <y>\n");
+        return 1;
+    }
+    const int x = atoi(argv[1]);
+    const int y = atoi(argv[2]);
+    TermGuard guard;
+    if (!guard.ok()) {
+        std::printf("busy\n");
+        return 1;
+    }
+    touch_down_at(x, y);
+    touch_up_at(x, y);
+    std::printf("tap (%d,%d): menu=%s keyboard=%s terminal=%dx%d scrollback=%d/%d\n", x, y,
+                menu->visible() ? "shown" : "hidden", keyboard->visible() ? "shown" : "hidden",
+                renderer->cols(), renderer->rows(), term->view_offset(),
+                term->scrollback_lines());
+    return 0;
+}
+
+// 縦スワイプを合成する。y1 から y2 まで、実タッチと同じ刻み（20ms ごとの
+// ポーリング相当）で動かす。
+int cmd_swipe(int argc, char** argv)
+{
+    if (argc < 4) {
+        std::printf("usage: swipe <x> <y_from> <y_to>\n");
+        return 1;
+    }
+    const int x  = atoi(argv[1]);
+    const int y1 = atoi(argv[2]);
+    const int y2 = atoi(argv[3]);
+    TermGuard guard;
+    if (!guard.ok()) {
+        std::printf("busy\n");
+        return 1;
+    }
+    const int before = term->view_offset();
+    touch_down_at(x, y1);
+    const int step = (y2 >= y1) ? 8 : -8;
+    for (int y = y1; (step > 0) ? (y <= y2) : (y >= y2); y += step) touch_move_at(x, y);
+    touch_move_at(x, y2);
+    touch_up_at(x, y2);
+    std::printf("swipe (%d,%d)->(%d,%d): scrollback %d -> %d / %d lines\n", x, y1, x, y2, before,
+                term->view_offset(), term->scrollback_lines());
+    return 0;
 }
 
 // メニューの操作。#15 の純正キーボードが来るまでは、上下や Enter を送る手段が
@@ -2280,6 +2385,10 @@ void register_term_commands()
         {"kbd", "画面キーボードの表示切り替え", "[off]", &cmd_kbd, nullptr, nullptr, nullptr},
         {"menu", "初期メニューの操作", "[show|hide|up|down|enter|esc|left|right]", &cmd_menu,
          nullptr, nullptr, nullptr},
+        {"tap", "タッチを合成する（実タッチと同じ経路）", "<x> <y>", &cmd_tap, nullptr, nullptr,
+         nullptr},
+        {"swipe", "縦スワイプを合成する", "<x> <y_from> <y_to>", &cmd_swipe, nullptr, nullptr,
+         nullptr},
         {"wgtest", "WireGuard の暗号とハンドシェイクを実機で検証", nullptr, &cmd_wgtest, nullptr,
          nullptr, nullptr},
         {"wgloop", "UDP ループバックでトンネルを往復させる（相手機不要）", nullptr, &cmd_wgloop,
@@ -2530,47 +2639,15 @@ extern "C" void app_main(void)
                 touching = true;
                 last_x   = tp.x;
                 last_y   = tp.y;
-                if (tp.y < kStatusTapH) {
-                    // ステータスバーをタップでメニューを開閉する。純正キーボードが
-                    // 来るまで、指だけでメニューに戻れる経路はここだけなので、
-                    // 当たり判定は描画（24px）より広く取る。24px は 3.5mm しかない。
-                    set_menu_visible(!menu->visible());
-                } else if (menu->visible()) {
-                    // メニュー表示中はキーボードを隠しているので、ここで全部食う。
-                    if (menu->touch_down(tp.x, tp.y)) menu->draw();
-                } else if (!keyboard->touch_down(tp.x, tp.y)) {
-                    // キーボード外 = 端末領域。縦スワイプでスクロールバックを見る。
-                    s_swipe_start_y      = tp.y;
-                    s_swipe_start_offset = term->view_offset();
-                }
-            } else if (s_swipe_start_y >= 0) {
-                // 端末領域のドラッグ。**下に引いたら過去に戻る**（紙を下に引く感覚）。
-                // 移動量をセル単位に落として絶対位置で当てる。相対で足していくと
-                // 20ms ごとのポーリングの取りこぼしでずれていく。
-                const int cells = (tp.y - s_swipe_start_y) / renderer->cell_h();
-                const int want  = s_swipe_start_offset + cells;
-                if (const int delta = want - term->view_offset(); delta != 0) {
-                    if (term->scroll_view(delta) != 0) render_term();
-                }
-                last_x = tp.x;
-                last_y = tp.y;
+                touch_down_at(tp.x, tp.y);
             } else {
-                // メニュー表示中はドラッグをキーボードに渡さない（見えていないので）。
-                if (!menu->visible()) keyboard->touch_move(tp.x, tp.y);
+                touch_move_at(tp.x, tp.y);
                 last_x = tp.x;
                 last_y = tp.y;
             }
         } else if (touching && touch_guard.ok()) {
             touching = false;
-            if (s_swipe_start_y >= 0) {
-                ESP_LOGI(TAG, "scrollback offset %d / %d lines", term->view_offset(),
-                         term->scrollback_lines());
-                s_swipe_start_y = -1;
-            } else if (menu->visible()) {
-                // メニュー表示中は押した時点で決まっているので、離すのは無視する。
-            } else if (!keyboard->touch_up(last_x, last_y)) {
-                ESP_LOGI(TAG, "touch up");
-            }
+            touch_up_at(last_x, last_y);
         }
 
         int now_s = (int)(esp_timer_get_time() / 1000000);

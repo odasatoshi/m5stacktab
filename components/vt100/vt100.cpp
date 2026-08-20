@@ -187,7 +187,8 @@ void Terminal::resize(int cols, int rows)
         }
         src.swap(dst);
     };
-    int old_rows = rows_;
+    const int old_rows = rows_;
+    const int old_cols = cols_;
     regrow(main_);
     regrow(alt_);
 
@@ -202,9 +203,14 @@ void Terminal::resize(int cols, int rows)
     scroll_top_    = 0;
     scroll_bottom_ = rows_ - 1;
     cur_.pending_wrap = false;
-    // 履歴は cols_ 単位で詰めてあるので、桁数が変わったら使い回せない。
-    sb_count_    = 0;
-    sb_head_     = 0;
+    // 履歴は cols_ 単位で詰めてあるので、**桁数が変わったときだけ**捨てる。
+    // 行数だけの変更でも捨てていたので、キーボードやメニューの表示を切り替える
+    // たびにスクロールバックが消えていた（実機では常に空になっていた）。
+    if (cols != old_cols) {
+        sb_count_ = 0;
+        sb_head_  = 0;
+    }
+    // 見ている位置は行数が変わると意味が変わるので、どちらでも最新に戻す。
     view_offset_ = 0;
     clamp_cursor();
 }
