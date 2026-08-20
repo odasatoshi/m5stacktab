@@ -231,6 +231,24 @@ esp_err_t wifi_start(void)
     return ESP_OK;
 }
 
+bool wifi_status(char* ssid, size_t ssid_len, int* rssi, char* ip, size_t ip_len)
+{
+    if (!wifi_is_connected()) return false;
+    wifi_ap_record_t ap{};
+    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) return false;
+    if (ssid && ssid_len) std::snprintf(ssid, ssid_len, "%s", (const char*)ap.ssid);
+    if (rssi) *rssi = ap.rssi;
+    if (ip && ip_len) {
+        ip[0] = '\0';
+        esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        esp_netif_ip_info_t info{};
+        if (netif && esp_netif_get_ip_info(netif, &info) == ESP_OK) {
+            std::snprintf(ip, ip_len, IPSTR, IP2STR(&info.ip));
+        }
+    }
+    return true;
+}
+
 bool wifi_is_connected(void)
 {
     return s_events && (xEventGroupGetBits(s_events) & kConnected);

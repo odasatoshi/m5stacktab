@@ -44,7 +44,7 @@ bool TermRenderer::begin()
         return false;
     }
     cols_      = gfx_.width() / cell_w_;
-    rows_      = gfx_.height() / cell_h_;
+    rows_      = (gfx_.height() - origin_y_) / cell_h_;
     full_rows_ = rows_;
 
     for (int i = 0; i < 16; ++i) {
@@ -105,6 +105,17 @@ void append_utf8(std::string& out, uint32_t cp)
 // rotate.cpp の landscape_to_native と対で意味を持つので、変えるときは両方見る。
 int TermRenderer::ppa_rotation_angle() { return PPA_SRM_ROTATION_ANGLE_270; }
 
+void TermRenderer::set_origin_y(int origin_y)
+{
+    if (origin_y < 0) return;
+    origin_y_ = origin_y;
+    if (cell_h_ > 0) {
+        // 使える行数が減る。set_rows で狭めていた分は呼び出し側が張り直す。
+        full_rows_ = (gfx_.height() - origin_y_) / cell_h_;
+        if (rows_ > full_rows_) rows_ = full_rows_;
+    }
+}
+
 bool TermRenderer::enable_ppa()
 {
     if (ppa_) return true;
@@ -154,7 +165,7 @@ bool TermRenderer::push_row_ppa(int y, int x_from, int x_to)
 {
     const int px  = x_from * cell_w_;
     const int pw  = (x_to - x_from + 1) * cell_w_;
-    const int py  = y * cell_h_;
+    const int py  = origin_y_ + y * cell_h_;
 
     // スプライトの該当矩形を DMA バッファに詰める（行ごとにストライドが違うのでコピーが必要）。
     const auto* src = static_cast<const uint16_t*>(row_.getBuffer());
@@ -283,8 +294,8 @@ void TermRenderer::draw_row(vt::Terminal& term, int y, int x_from, int x_to)
         // pushSprite に部分矩形版が無いので、転送先のクリップ矩形で範囲を絞る。
         const int px_from = x_from * cell_w_;
         const int px_w    = (x_to - x_from + 1) * cell_w_;
-        gfx_.setClipRect(px_from, y * cell_h_, px_w, cell_h_);
-        row_.pushSprite(&gfx_, 0, y * cell_h_);
+        gfx_.setClipRect(px_from, origin_y_ + y * cell_h_, px_w, cell_h_);
+        row_.pushSprite(&gfx_, 0, origin_y_ + y * cell_h_);
         gfx_.clearClipRect();
     }
     last_push_us_ += static_cast<uint32_t>(esp_timer_get_time() - t_push);

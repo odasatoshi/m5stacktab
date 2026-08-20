@@ -24,6 +24,11 @@ public:
         if (rows > 0 && rows <= full_rows_) rows_ = rows;
     }
     int full_rows() const { return full_rows_; }
+
+    // 画面上端から origin_y ピクセルを別用途（ステータスバー）に譲る。
+    // 端末の行 0 はここから描かれる。full_rows() も減る。
+    void set_origin_y(int origin_y);
+    int  origin_y() const { return origin_y_; }
     int cell_w() const { return cell_w_; }
     int cell_h() const { return cell_h_; }
 
@@ -60,6 +65,7 @@ private:
     int       cols_      = 0;
     int       rows_      = 0;
     int       full_rows_ = 0;  // 画面全体を使ったときの行数
+    int       origin_y_  = 0;  // ステータスバーに譲る上端の高さ
     uint32_t  last_us_      = 0;
     uint32_t  last_draw_us_ = 0;
     uint32_t  last_push_us_ = 0;
