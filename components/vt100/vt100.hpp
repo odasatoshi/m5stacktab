@@ -108,7 +108,9 @@ public:
     //
     // バッファは呼び出し側が用意する (cols * max_lines 個の Cell)。ESP-IDF 側は PSRAM から
     // 確保して渡す。コア側で確保するとアロケータを選べないため。
-    // resize() すると桁数が変わるので履歴は破棄される。
+    // **resize() の扱い**: 桁数が変わったときだけ履歴を破棄する（履歴は cols 単位で
+    // 詰めてあるので使い回せない）。行数だけの変更では履歴は残り、行が減って
+    // 画面から追い出される分はここに積まれる。view_offset はどちらでも 0 に戻る。
     void set_scrollback(Cell* buffer, int max_lines);
     int  scrollback_lines() const { return sb_count_; }
     int  view_offset() const { return view_offset_; }

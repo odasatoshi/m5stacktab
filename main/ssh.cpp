@@ -49,6 +49,28 @@ void set_error(const char* fmt, ...)
     ESP_LOGE(TAG, "%s", s_error);
 }
 
+// NVS のキー名は 15 文字までなので、ホスト名そのままでは入らない。
+// 先頭 11 文字で切ると 192.168.0.101 と 192.168.0.102 が同じ枠を共有し、
+// 別のホストが「鍵が変わった」として理由なく拒否される。ハッシュして
+// 12 桁の 16 進にする（fail-closed だが誤検知は困る）。
+//
+// **ポートも含める。** 同じホストの別ポートに別のサーバを置くのは普通なので、
+// host だけでハッシュすると今度はそこで衝突する。
+// 固定長にすると長いホスト名が黙って切られて、先頭が同じホスト同士でまた
+// 衝突するので std::string にして切らない。
+std::string host_ident(const char* host, uint16_t port)
+{
+    return std::string(host) + ":" + std::to_string(port);
+}
+
+void host_key_name(const std::string& ident, char out[16])
+{
+    uint8_t digest[32] = {};
+    mbedtls_sha256(reinterpret_cast<const unsigned char*>(ident.data()), ident.size(), digest, 0);
+    std::snprintf(out, 16, "hk_%02x%02x%02x%02x%02x%02x", digest[0], digest[1], digest[2],
+                  digest[3], digest[4], digest[5]);
+}
+
 // ホスト鍵の TOFU 検証。初回は覚え、変わったら拒否する。
 bool verify_host_key(LIBSSH2_SESSION* session, const char* host, uint16_t port)
 {
@@ -67,21 +89,9 @@ bool verify_host_key(LIBSSH2_SESSION* session, const char* host, uint16_t port)
         set_error("nvs_open failed for host key");
         return false;
     }
-    // NVS のキー名は 15 文字までなので、ホスト名そのままでは入らない。
-    // 先頭 11 文字で切ると 192.168.0.101 と 192.168.0.102 が同じ枠を共有し、
-    // 別のホストが「鍵が変わった」として理由なく拒否される。ハッシュして
-    // 12 桁の 16 進にする（fail-closed だが誤検知は困る）。
-    // **ポートも含める。** 同じホストの別ポートに別のサーバを置くのは普通なので、
-    // host だけでハッシュすると今度はそこで衝突する。
-    // 固定長にすると長いホスト名が黙って切られて、先頭が同じホスト同士で
-    // また衝突する（まさにこの関数が直した問題）。std::string にして切らない。
-    const std::string ident = std::string(host) + ":" + std::to_string(port);
-    uint8_t           host_digest[32] = {};
-    mbedtls_sha256(reinterpret_cast<const unsigned char*>(ident.data()), ident.size(), host_digest,
-                   0);
-    char key_name[16];
-    std::snprintf(key_name, sizeof(key_name), "hk_%02x%02x%02x%02x%02x%02x", host_digest[0],
-                  host_digest[1], host_digest[2], host_digest[3], host_digest[4], host_digest[5]);
+    const std::string ident = host_ident(host, port);
+    char              key_name[16];
+    host_key_name(ident, key_name);
 
     uint8_t   saved[32];
     size_t    saved_len = sizeof(saved);
@@ -349,6 +359,22 @@ esp_err_t ssh_config_load(SshConfig& out)
         if (nvs_get_u16(nvs, "port", &port) == ESP_OK) out.port = port;
     }
     nvs_close(nvs);
+    return err;
+}
+
+esp_err_t ssh_forget_host_key(const char* host, uint16_t port)
+{
+    if (!host || !*host) return ESP_ERR_INVALID_ARG;
+    const std::string ident = host_ident(host, port);
+    char              key_name[16];
+    host_key_name(ident, key_name);
+
+    nvs_handle_t nvs;
+    ESP_RETURN_ON_ERROR(nvs_open(kNvsNamespace, NVS_READWRITE, &nvs), TAG, "nvs_open");
+    esp_err_t err = nvs_erase_key(nvs, key_name);
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    if (err == ESP_OK) ESP_LOGW(TAG, "forgot the host key for %s", ident.c_str());
     return err;
 }
 

@@ -163,9 +163,12 @@ void handle_initiation_locked(const uint8_t* pkt, size_t len, const sockaddr_in&
     // kp.initiator == false なので Transport は「未確認」として扱う。
     // 相手はまだ msg2 を処理していない可能性があり、ここで新しい鍵に切り替えて
     // 送ると相手側で復号できずに落ちる。相手から新しい鍵のデータが届いた時点で昇格する。
-    g_state.transport->set_keypair(kp);
+    g_state.transport->set_keypair(kp, esp_timer_get_time());
     netif_instance().set_handshake_ok(true);
-    g_state.last_handshake_us = esp_timer_get_time();
+    // **応答側は last_handshake_us を更新しない（#30）。** 更新すると rekey タイマが
+    // 120 秒先に押し出されるが、相手が msg2 を受け取ったかは分からないので、
+    // 未確認の鍵で送り続けたまま 180 秒を越えて沈黙する可能性がある。
+    // 更新しなければタイマが走り続け、こちらから作り直して復帰できる。
     // すぐ keepalive を送って、相手から見た経路を開ける。
     g_state.last_tx_us = 0;
     if (g_state.stats) ++g_state.stats->responses_sent;
@@ -289,6 +292,11 @@ void tick_locked()
         if (now - g_state.last_initiation_us > kHandshakeRetryUs) start_handshake_locked();
         return;
     }
+    // 寿命を過ぎた「1 つ前」の鍵を捨てる。相手はもう破棄しているので、
+    // 使い続けると送っているのに届かない状態になる（#30）。
+    if (g_state.transport->expire_previous(now)) {
+        ESP_LOGI(TAG, "dropped the previous keypair (older than reject-after)");
+    }
     // WireGuard は 120 秒で鍵を作り直す。放っておくと 180 秒でピアが鍵を捨てて沈黙する。
     if (now - g_state.last_handshake_us > kRekeyAfterUs) {
         if (now - g_state.last_initiation_us > kHandshakeRetryUs) {
@@ -376,7 +384,7 @@ void rx_task(void*)
         if (type == kMsgResponse) {
             Keypair kp;
             if (g_state.hs && g_state.transport && g_state.hs->consume_response(buf, kp)) {
-                g_state.transport->set_keypair(kp);
+                g_state.transport->set_keypair(kp, esp_timer_get_time());
                 netif_instance().set_handshake_ok(true);
                 g_state.last_handshake_us = esp_timer_get_time();
                 g_state.last_tx_us       = 0;  // すぐ keepalive を送って経路を開ける

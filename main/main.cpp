@@ -122,6 +122,14 @@ void apply_layout();
 void set_menu_visible(bool show);
 // メニュー表示中は端末を描かない（メニューの矩形を上書きしてしまう）。
 void render_term(bool force = false);
+// 実タッチの生座標をログに出すか。四隅の照合（描画側とタッチ側の回転が
+// 一致しているか）を指で取るときに使う。既定は off（毎タップでログが出ると邪魔）。
+bool s_touch_log = false;
+
+// タッチのルーティング（実タッチと tap / swipe コマンドで共有）。
+void touch_down_at(int x, int y);
+void touch_move_at(int x, int y);
+void touch_up_at(int x, int y);
 
 // Tailscale の 3 つの鍵。node_priv は WireGuard の秘密鍵でもあるので、
 // netmap が来たときにトンネルを張るために map handler からも読む。
@@ -148,6 +156,12 @@ int64_t s_last_status_us = 0;
 // ステータスバーのタップ判定の高さ。描画は s_status_h (24px) だが、指で当てるには
 // 狭すぎるので判定だけ広げる（24px は 3.5mm しかない）。
 constexpr int kStatusTapH = 56;
+
+// 端末領域の縦スワイプでスクロールバックを見る。押した位置と、そのときの
+// view_offset を覚えて、指の移動量から絶対位置を出す（相対だと取りこぼしで
+// ずれていく）。-1 は「端末領域を掴んでいない」。
+int s_swipe_start_y      = -1;
+int s_swipe_start_offset = 0;
 
 // M5GFX はパネル・タッチの判別結果を NVS にキャッシュする。NVS を初期化しておかないと
 // 毎起動でフルプローブ（タッチ IC のファームウェア待ちを含む）が走る。
@@ -537,6 +551,39 @@ int cmd_ssh(int argc, char** argv)
     return 0;
 }
 
+// 覚えているホスト鍵を忘れる（#35）。サーバを作り直して鍵が正当に変わったとき、
+// これが無いとそのホストに永久に繋げない。**ハッシュから元のホスト名は復元できない**
+// ので、`ssh` と同じ形（host[:port]）で指定してもらう。
+int cmd_ssh_forget(int argc, char** argv)
+{
+    if (argc < 2) {
+        std::printf("usage: ssh-forget <host>[:<port>]\n");
+        return 1;
+    }
+    std::string host = argv[1];
+    uint16_t    port = 22;
+    if (const size_t colon = host.rfind(':');
+        colon != std::string::npos && host.find(':') == colon) {
+        const int p = atoi(host.c_str() + colon + 1);
+        if (p > 0 && p <= 65535) {
+            port = (uint16_t)p;
+            host.resize(colon);
+        }
+    }
+    const esp_err_t err = ssh_forget_host_key(host.c_str(), port);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        std::printf("no stored host key for %s:%u\n", host.c_str(), (unsigned)port);
+        return 1;
+    }
+    if (err != ESP_OK) {
+        std::printf("failed: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+    std::printf("forgot the host key for %s:%u (next connect will remember the new one)\n",
+                host.c_str(), (unsigned)port);
+    return 0;
+}
+
 int cmd_sshclose(int, char**)
 {
     ssh_disconnect();
@@ -673,8 +720,8 @@ int cmd_wgtest(int, char**)
 
     // トランスポートの往復とリプレイ拒否
     wg::Transport tx(c), rx(c);
-    tx.set_keypair(ik);
-    rx.set_keypair(rk);
+    tx.set_keypair(ik, esp_timer_get_time());
+    rx.set_keypair(rk, esp_timer_get_time());
     uint8_t      pkt[256], out[256];
     const char*  msg = "wireguard on esp32-p4";
     t0 = esp_timer_get_time();
@@ -955,6 +1002,55 @@ void apply_layout()
     if (menu) menu->set_area(s_status_h, avail - keyboard->height());
 }
 
+// タッチのルーティング。**実タッチと `tap` / `swipe` コマンドで同じ経路を通す。**
+// 分けると「指だと動くがコマンドだと動かない」（または逆）になって、
+// 検証にならない。ロックは呼び出し側が取っている。
+void touch_down_at(int x, int y)
+{
+    if (y < kStatusTapH) {
+        // ステータスバーをタップでメニューを開閉する。純正キーボードが来るまで、
+        // 指だけでメニューに戻れる経路はここだけなので、当たり判定は描画（24px）
+        // より広く取る。24px は 3.5mm しかない。
+        set_menu_visible(!menu->visible());
+    } else if (menu->visible()) {
+        // メニュー表示中はキーボードを隠しているので、ここで全部食う。
+        if (menu->touch_down(x, y)) menu->draw();
+    } else if (!keyboard->touch_down(x, y)) {
+        // キーボード外 = 端末領域。縦スワイプでスクロールバックを見る。
+        s_swipe_start_y      = y;
+        s_swipe_start_offset = term->view_offset();
+    }
+}
+
+void touch_move_at(int x, int y)
+{
+    if (s_swipe_start_y >= 0) {
+        // 端末領域のドラッグ。**下に引いたら過去に戻る**（紙を下に引く感覚）。
+        // 移動量をセル単位に落として絶対位置で当てる。相対で足していくと
+        // 20ms ごとのポーリングの取りこぼしでずれていく。
+        const int cells = (y - s_swipe_start_y) / renderer->cell_h();
+        const int want  = s_swipe_start_offset + cells;
+        if (const int delta = want - term->view_offset(); delta != 0) {
+            if (term->scroll_view(delta) != 0) render_term();
+        }
+        return;
+    }
+    // メニュー表示中はドラッグをキーボードに渡さない（見えていないので）。
+    if (!menu->visible()) keyboard->touch_move(x, y);
+}
+
+void touch_up_at(int x, int y)
+{
+    if (s_swipe_start_y >= 0) {
+        ESP_LOGI(TAG, "scrollback offset %d / %d lines", term->view_offset(),
+                 term->scrollback_lines());
+        s_swipe_start_y = -1;
+        return;
+    }
+    if (menu->visible()) return;  // 押した時点で決まっているので、離すのは無視する
+    if (!keyboard->touch_up(x, y)) ESP_LOGI(TAG, "touch up");
+}
+
 void render_term(bool force)
 {
     if (!renderer || !term) return;
@@ -967,6 +1063,7 @@ void render_term(bool force)
 void set_menu_visible(bool show)
 {
     if (!menu) return;
+    s_swipe_start_y = -1;  // 掴んだままメニューに移ると、次のドラッグが飛ぶ
     menu->set_visible(show);
     // メニューはキーボードの領域を覆わないので、隠さないと指でキーを押せてしまう。
     // ponytail: 端末に戻るときは必ずキーボードを出す（`kbd off` の状態は覚えない）。
@@ -982,6 +1079,137 @@ void set_menu_visible(bool show)
     }
     // ラベルを MENU / CLOSE に切り替える。開閉のたびに必ず描き直す。
     status_bar->draw(gather_status(), /*force=*/true);
+}
+
+// タッチを合成する。**実タッチと同じ関数を呼ぶ**ので、経路の検証になる
+// （タッチ IC そのものは実機で反応することを確認済み。残るのは座標から先の
+// 振り分けで、それがここで測れる）。指で触れない環境でも UI を検証できる。
+// **描画側 (components/rotate) とタッチ側 (M5GFX) の回転が一致しているかを、
+// 指なしで照合する。**
+//
+// M5GFX の `convertRawXY` は「生座標 → アフィン変換 → 回転」を適用する公開関数なので、
+// 生座標を合成して通せる。rotation 1 では swap してから ty を反転するので、
+// 生座標がネイティブ画素と一致するなら (ny, native_w-1-nx) になる。
+// components/rotate の native_to_landscape も同じ式なので、一致すれば
+// 2 つの実装が同じ向きを指していることになる。
+//
+// **これでも残るもの**: 「生座標 (0,0) が物理的にパネルの左上か」は M5GFX の
+// ボード固有のキャリブレーション（アフィン係数）の話で、こちらのコードではない。
+// そこは指で押して確かめるしかない（touchlog を使う）。
+int cmd_touchmap(int, char**)
+{
+    rot::Panel panel;
+    panel.native_w = 720;
+    panel.native_h = 1280;
+
+    const uint8_t prev = display.getRotation();
+    display.setRotation(1);
+    std::printf("M5GFX の convertRawXY と components/rotate を照合 (rotation 1):\n");
+    struct P { int nx, ny; const char* name; };
+    const P pts[] = {
+        {0, 0, "native 左上"},
+        {panel.native_w - 1, 0, "native 右上"},
+        {0, panel.native_h - 1, "native 左下"},
+        {panel.native_w - 1, panel.native_h - 1, "native 右下"},
+        {360, 640, "native 中央"},
+    };
+    int bad = 0;
+    for (const auto& pt : pts) {
+        lgfx::touch_point_t tp{};
+        tp.x = (int16_t)pt.nx;
+        tp.y = (int16_t)pt.ny;
+        display.convertRawXY(&tp, 1);
+        int lx = 0, ly = 0;
+        rot::native_to_landscape(panel, pt.nx, pt.ny, &lx, &ly);
+        const bool ok = (tp.x == lx && tp.y == ly);
+        if (!ok) ++bad;
+        std::printf("  %-12s (%3d,%4d) -> m5gfx(%4d,%3d) rotate(%4d,%3d) %s\n", pt.name, pt.nx,
+                    pt.ny, (int)tp.x, (int)tp.y, lx, ly, ok ? "ok" : "MISMATCH");
+    }
+    display.setRotation(prev);
+    std::printf("touch/render rotation agreement: %s\n", bad == 0 ? "ok" : "MISMATCH");
+    std::printf("  残るのは「生座標 (0,0) が物理的な左上か」= M5GFX の"
+                "キャリブレーション。touchlog で指で確かめる\n");
+    return bad == 0 ? 0 : 1;
+}
+
+// 実タッチの座標をログに出す。**描画側 (components/rotate) とタッチ側 (M5GFX) は
+// 回転の実装が別物**なので、この 2 系がずれていないかは指で押して座標を見るしか
+// 確かめる方法がない（tap / swipe は M5GFX の変換より下流に注入するので届かない）。
+int cmd_touchlog(int argc, char** argv)
+{
+    s_touch_log = (argc < 2) || (std::string(argv[1]) != "off");
+    std::printf("touch log %s. 画面を押すと (x,y) が出ます。\n", s_touch_log ? "on" : "off");
+    if (s_touch_log) {
+        std::printf("  四隅の期待値: 左上 (0,0) 付近 / 右上 (%d,0) / 左下 (0,%d) / 右下 (%d,%d)\n",
+                    (int)display.width() - 1, (int)display.height() - 1, (int)display.width() - 1,
+                    (int)display.height() - 1);
+    }
+    return 0;
+}
+
+int cmd_tap(int argc, char** argv)
+{
+    if (argc < 3) {
+        std::printf("usage: tap <x> <y>\n");
+        return 1;
+    }
+    const int x = atoi(argv[1]);
+    const int y = atoi(argv[2]);
+    TermGuard guard;
+    if (!guard.ok()) {
+        std::printf("busy\n");
+        return 1;
+    }
+    touch_down_at(x, y);
+    touch_up_at(x, y);
+    std::printf("tap (%d,%d): menu=%s keyboard=%s terminal=%dx%d scrollback=%d/%d\n", x, y,
+                menu->visible() ? "shown" : "hidden", keyboard->visible() ? "shown" : "hidden",
+                renderer->cols(), renderer->rows(), term->view_offset(),
+                term->scrollback_lines());
+    return 0;
+}
+
+// 縦スワイプを合成する。y1 から y2 まで、実タッチと同じ刻み（20ms ごとの
+// ポーリング相当）で動かす。
+int cmd_swipe(int argc, char** argv)
+{
+    if (argc < 4) {
+        std::printf("usage: swipe <x> <y_from> <y_to> [x_to]\n");
+        std::printf("       x_to を付けると斜め・横方向になる（IME の横フリック用）\n");
+        return 1;
+    }
+    const int x  = atoi(argv[1]);
+    const int y1 = atoi(argv[2]);
+    const int y2 = atoi(argv[3]);
+    // **横方向も出せるようにする。** x 固定だと ime::Flick の kLeft / kRight に
+    // 到達できず、IME の入力面の半分が指でしか試せない。
+    const int x2 = (argc > 4) ? atoi(argv[4]) : x;
+    TermGuard guard;
+    if (!guard.ok()) {
+        std::printf("busy\n");
+        return 1;
+    }
+    const int before = term->view_offset();
+    // **メニューの状態は dispatch の前に読む。** 後で読むと、メニュー項目が発火して
+    // 閉じた後の状態を見てしまい「menu に食われた」を取り逃がす（実機で踏んだ）。
+    const bool menu_was_shown = menu->visible();
+    touch_down_at(x, y1);
+    // どこに食われたかを出す。「0 -> 0」の理由が分からないと、メニューに食われた・
+    // 代替画面で固定された・本当に動かない の区別がつかない（実際に取り違えた）。
+    const char* target = (s_swipe_start_y >= 0) ? "terminal"
+                         : menu_was_shown       ? "menu"
+                                                : "keyboard/status";
+    // 実タッチと同じ刻み（20ms ごとのポーリング相当）で動かす。
+    constexpr int kSteps = 8;
+    for (int i = 1; i <= kSteps; ++i) {
+        touch_move_at(x + (x2 - x) * i / kSteps, y1 + (y2 - y1) * i / kSteps);
+    }
+    touch_up_at(x2, y2);
+    std::printf("swipe (%d,%d)->(%d,%d) [%s]: scrollback %d -> %d / %d lines%s\n", x, y1, x2, y2,
+                target, before, term->view_offset(), term->scrollback_lines(),
+                term->alt_screen() ? " (alt screen: scrollback is pinned)" : "");
+    return 0;
 }
 
 // メニューの操作。#15 の純正キーボードが来るまでは、上下や Enter を送る手段が
@@ -1251,8 +1479,8 @@ int cmd_wgloop(int, char**)
 
     // 確定した鍵で実際にパケットを往復させる
     wg::Transport ta(c), tb(c);
-    ta.set_keypair(ka);
-    tb.set_keypair(kb);
+    ta.set_keypair(ka, esp_timer_get_time());
+    tb.set_keypair(kb, esp_timer_get_time());
     const char*  payload = "tunnel payload over loopback";
     const size_t plen    = std::strlen(payload);
     const int64_t t1 = esp_timer_get_time();
@@ -1327,7 +1555,7 @@ int cmd_wgloop(int, char**)
         std::printf("rekey: inflight encrypt failed\n");
     } else {
         sendto(sa, buf, ilen, 0, reinterpret_cast<sockaddr*>(&addr_b), sizeof(addr_b));
-        tb.set_keypair(kb2);  // kb2.initiator == false なので未確認として入る
+        tb.set_keypair(kb2, esp_timer_get_time());  // kb2.initiator == false なので未確認として入る
         valid = false;
         n = recvfrom(sb, buf, sizeof(buf), 0, nullptr, nullptr);
         const size_t g1 =
@@ -1351,7 +1579,7 @@ int cmd_wgloop(int, char**)
         std::printf("  unconfirmed sends on old key: %s\n", pre_ok ? "ok" : "FAILED");
 
         // (3) A も世代 2 に移ってデータを送ると、B は世代 2 を確認済みに昇格させる。
-        ta.set_keypair(ka2);  // ka2.initiator == true なので確認済みで入る
+        ta.set_keypair(ka2, esp_timer_get_time());  // ka2.initiator == true なので確認済みで入る
         bool         post_ok = false;
         const size_t nlen = ta.encrypt(buf, sizeof(buf), reinterpret_cast<const uint8_t*>("new"), 3);
         if (nlen > 0) {
@@ -1381,8 +1609,8 @@ int cmd_wgloop(int, char**)
         // (5) 未確認の世代が 2 連続で来る場合（こちらの msg2 が落ちてピアが msg1 を
         // 再送した状況）。確認済みの世代 2 を押し出してはいけない。押し出すと
         // 「ピアが一度も持っていない世代」で送り続けて上りが全損する。
-        tb.set_keypair(kb3);
-        tb.set_keypair(kb4);
+        tb.set_keypair(kb3, esp_timer_get_time());
+        tb.set_keypair(kb4, esp_timer_get_time());
         bool         retry_ok = false;
         const size_t rtlen = tb.encrypt(buf, sizeof(buf), reinterpret_cast<const uint8_t*>("rty"), 3);
         if (rtlen > 0 && recv_index(buf) == kb2.remote_index) {
@@ -2074,6 +2302,10 @@ int cmd_termcheck(int, char**)
     }
     const int far = renderer->cols() - 2;  // 右端の少し内側（グリッド幅に追随させる）
 
+    // **スクロールバックを見ている状態を解除する。** 見たままだと探査点が
+    // 1 セル分ずれて、健全な描画経路に対して FAILED と言ってしまう
+    // （スワイプを足したせいで、その状態に入るのが簡単になった）。
+    if (term->view_offset() != 0) term->scroll_view(-term->view_offset());
     // 行 0: セル 0 が赤、セル 1 が緑。行 1: セル 0 が青。ほかは空。
     term->write("\033[2J\033[H\033[41m \033[42m \033[m\r\n\033[44m \033[m");
     // **render_term ではなく直接呼ぶ。** これは本番経路を実際に通すための診断なので、
@@ -2227,6 +2459,8 @@ void register_term_commands()
         {"ssh", "SSH 接続 (引数なしで保存済み設定)", "[<user> <host> <password> [port]]", &cmd_ssh,
          nullptr, nullptr, nullptr},
         {"sshclose", "SSH セッションを閉じる", nullptr, &cmd_sshclose, nullptr, nullptr, nullptr},
+        {"ssh-forget", "覚えているホスト鍵を忘れる", "<host>[:<port>]", &cmd_ssh_forget, nullptr,
+         nullptr, nullptr},
         {"key", "SSH にキー入力を送る", "<text>", &cmd_key, nullptr, nullptr, nullptr},
         {"conv", "ローマ字→かな→漢字を試す", "<romaji>", &cmd_conv, nullptr, nullptr, nullptr},
         {"keyj", "ローマ字を IME に通して SSH に送る", "<romaji>...", &cmd_keyj, nullptr, nullptr,
@@ -2238,6 +2472,14 @@ void register_term_commands()
         {"kbd", "画面キーボードの表示切り替え", "[off]", &cmd_kbd, nullptr, nullptr, nullptr},
         {"menu", "初期メニューの操作", "[show|hide|up|down|enter|esc|left|right]", &cmd_menu,
          nullptr, nullptr, nullptr},
+        {"tap", "タッチを合成する（実タッチと同じ経路）", "<x> <y>", &cmd_tap, nullptr, nullptr,
+         nullptr},
+        {"touchlog", "実タッチの座標をログに出す（四隅の照合用）", "[off]", &cmd_touchlog, nullptr,
+         nullptr, nullptr},
+        {"touchmap", "描画側とタッチ側の回転が一致するか照合（指なし）", nullptr, &cmd_touchmap,
+         nullptr, nullptr, nullptr},
+        {"swipe", "縦スワイプを合成する", "<x> <y_from> <y_to>", &cmd_swipe, nullptr, nullptr,
+         nullptr},
         {"wgtest", "WireGuard の暗号とハンドシェイクを実機で検証", nullptr, &cmd_wgtest, nullptr,
          nullptr, nullptr},
         {"wgloop", "UDP ループバックでトンネルを往復させる（相手機不要）", nullptr, &cmd_wgloop,
@@ -2488,35 +2730,17 @@ extern "C" void app_main(void)
                 touching = true;
                 last_x   = tp.x;
                 last_y   = tp.y;
-                if (tp.y < kStatusTapH) {
-                    // ステータスバーをタップでメニューを開閉する。純正キーボードが
-                    // 来るまで、指だけでメニューに戻れる経路はここだけなので、
-                    // 当たり判定は描画（24px）より広く取る。24px は 3.5mm しかない。
-                    set_menu_visible(!menu->visible());
-                } else if (menu->visible()) {
-                    // メニュー表示中はキーボードを隠しているので、ここで全部食う。
-                    if (menu->touch_down(tp.x, tp.y)) menu->draw();
-                } else if (!keyboard->touch_down(tp.x, tp.y)) {
-                    // キーボード外 = 端末領域。
-                    // ponytail: スワイプでスクロールバックを見る動作は未実装。
-                    // 今は座標をログに出すだけ（スクロールは `scroll` コマンドから）。
-                    // キーボードが届いて画面を触る頻度が上がったら実装する。
-                    ESP_LOGI(TAG, "touch down x=%d y=%d (cell %d,%d)", tp.x, tp.y,
-                             tp.x / renderer->cell_w(), tp.y / renderer->cell_h());
-                }
+                if (s_touch_log) ESP_LOGI(TAG, "touch down (%d,%d)", tp.x, tp.y);
+                touch_down_at(tp.x, tp.y);
             } else {
-                // メニュー表示中はドラッグをキーボードに渡さない（見えていないので）。
-                if (!menu->visible()) keyboard->touch_move(tp.x, tp.y);
+                touch_move_at(tp.x, tp.y);
                 last_x = tp.x;
                 last_y = tp.y;
             }
         } else if (touching && touch_guard.ok()) {
             touching = false;
-            if (menu->visible()) {
-                // メニュー表示中は押した時点で決まっているので、離すのは無視する。
-            } else if (!keyboard->touch_up(last_x, last_y)) {
-                ESP_LOGI(TAG, "touch up");
-            }
+            if (s_touch_log) ESP_LOGI(TAG, "touch up   (%d,%d)", last_x, last_y);
+            touch_up_at(last_x, last_y);
         }
 
         int now_s = (int)(esp_timer_get_time() / 1000000);
