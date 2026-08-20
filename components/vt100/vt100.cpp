@@ -944,7 +944,9 @@ const Cell* Terminal::sb_line(int lines_back) const
     // lines_back = 1 が最新の履歴行。
     if (!sb_buf_ || lines_back <= 0 || lines_back > sb_count_) return nullptr;
     const int idx = (sb_head_ - lines_back + sb_max_ * 2) % sb_max_;
-    return sb_buf_ + static_cast<size_t>(idx) * cols_;
+    // sb_count_ > 0 なら sb_cols_ == cols_（resize が桁数変更時に必ず捨てる）。
+    // 同じ値だが、依存している側を書く。
+    return sb_buf_ + static_cast<size_t>(idx) * sb_cols_;
 }
 
 int Terminal::scroll_view(int delta)

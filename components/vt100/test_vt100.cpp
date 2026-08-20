@@ -514,7 +514,7 @@ void test_scrollback()
 {
     Terminal t(8, 3);
     std::vector<vt::Cell> sb(8 * 10);
-    t.set_scrollback(sb.data(), 10);
+    t.set_scrollback(sb.data(), 10, 8);
 
     for (int i = 0; i < 6; ++i) {
         char buf[32];
@@ -585,7 +585,7 @@ void test_resize_keeps_scrollback()
 {
     vt::Terminal t(10, 3);
     std::vector<vt::Cell> sb(10 * 50);
-    t.set_scrollback(sb.data(), 50);
+    t.set_scrollback(sb.data(), 50, 10);
 
     // 6 行流して 3 行を履歴に落とす。
     t.write("a\r\nb\r\nc\r\nd\r\ne\r\nf");
@@ -611,7 +611,7 @@ void test_resize_keeps_scrollback()
     {
         vt::Terminal t2(10, 5);
         std::vector<vt::Cell> sb2(10 * 50);
-        t2.set_scrollback(sb2.data(), 50);
+        t2.set_scrollback(sb2.data(), 50, 10);
         // 画面は 5 行ちょうど（履歴は空）。
         t2.write("1\r\n2\r\n3\r\n4\r\n5");
         CHECK(t2.scrollback_lines() == 0);
@@ -648,7 +648,7 @@ void test_resize_keeps_scrollback()
     {
         vt::Terminal t3(10, 4);
         std::vector<vt::Cell> sb3(10 * 50);
-        t3.set_scrollback(sb3.data(), 50);
+        t3.set_scrollback(sb3.data(), 50, 10);
         t3.write("\033[?1049h");  // 代替画面へ
         t3.write("a\r\nb\r\nc\r\nd");
         t3.resize(10, 2);
@@ -666,7 +666,10 @@ void test_resize_keeps_scrollback()
         // 桁数を増やすと履歴は捨てられ、以後は積まれない（踏み越えない）。
         t4.resize(14, 3);
         CHECK(t4.scrollback_lines() == 0);
-        t4.write("\r\ne\r\nf\r\ng");
+        // **踏み越えが実際に起きる回数まで書く。** バッファは 10x20 = 200 Cell で、
+        // 14 桁で書くと h*14+14 > 200 すなわち 15 回目の push から外に出る。
+        // 3 行だけだとカナリアが無傷で、CI の ASan が何も検出しない。
+        for (int i = 0; i < 20; ++i) t4.write("\r\nx");
         CHECK(t4.scrollback_lines() == 0);
         // 元の桁数に戻せば再び積む。
         t4.resize(10, 3);
@@ -683,15 +686,17 @@ void test_resize_keeps_scrollback()
     t.write("x\r\ny\r\nz\r\nw\r\nv");
     CHECK(t.scrollback_lines() == 0);
 
-    // 同じ寸法なら何もしない（早期 return の経路）。
-    const int held = t.scrollback_lines();
-    t.resize(12, 4);
-    CHECK(t.scrollback_lines() == held);
-
     // 確保時の桁数に戻せば再び積む。
     t.resize(10, 4);
     t.write("\r\np\r\nq\r\nr\r\ns");
-    CHECK(t.scrollback_lines() > 0);
+    const int held = t.scrollback_lines();
+    CHECK(held > 0);
+
+    // 同じ寸法なら何もしない（早期 return の経路）。
+    // **held > 0 の状態で確かめる。** 0 のまま比べると 0 == 0 の空検査になり、
+    // 早期 return に履歴破棄を仕込んでも落ちない。
+    t.resize(10, 4);
+    CHECK(t.scrollback_lines() == held);
 }
 
 int main()
