@@ -49,6 +49,9 @@ python tools/serial_log.py --seconds 20      # ログ採取
 `idf.py monitor` は標準入力が TTY でないと動かないので、非対話環境では
 `tools/serial_log.py` を使う（RTS でリセットしてから指定秒数だけ拾う）。
 
+画面の証跡は実機の `screencap` + `tools/screencap.py` で PNG にできる
+（フレームバッファを読むので、写真が撮れない環境でも「画面キャプチャ」の要件を満たせる）。
+
 ## ハード由来のハマりどころ
 
 - **PSRAM は 200MHz が必須**。ESP32-P4 のデフォルトは 20MHz で、1280x720 の MIPI-DSI が
@@ -63,6 +66,21 @@ python tools/serial_log.py --seconds 20      # ログ採取
   （実測: 1280x24 の転送が pushSprite 4247us、PPA 924us）。
   そのため座標変換は `components/rotate` で自分で持ち、PPA でフレームバッファへ直接書く。
   実機の `rottest` で M5GFX の rotation 1 と向きが一致することを照合できる
+  （ピクセルを読み戻して自動判定する。目視の「白点が円の中にあれば ok」では
+  **180 度ずれに気づけなかった**。四隅が対角の色を読んでいても円の中には見える）。
+  ただし **`rottest` は写像だけを見る。PPA の角度は見ていない**。
+  角度は `ppatest`、**本番の描画経路は `termcheck`** で確かめる。
+  `termcheck` は vt100 に色つきセルを書いてレンダラを通し、画素を読み戻す。
+  push_row_ppa の角度がずれても rottest と ppatest は緑のまま通るので、
+  実際の症状を捕まえられるのは `termcheck` だけ（実機で実証済み）。
+  PPA の角度の定数は `TermRenderer::ppa_rotation_angle()` にしか置かない
+  （複製すると片方が取り残される。実際に ppatest が取り残された）
+- **`rot` の変換と PPA の `rotation_angle` は必ず対で直す**。PPA の角度は反時計回りなので、
+  `landscape_to_native` の時計回り 90 度に対応するのは `PPA_SRM_ROTATION_ANGLE_270`。
+  片方だけ変えるとブロックの位置は合うのに中身が 180 度回る。
+  そして端末は PPA、キーボードは M5GFX の rotation 1 で描くので、食い違うと
+  「端末とキーボードの天地が逆」になる（実機で発生）。
+  M5GFX の `getTouch` も rotation 1 の座標で返すため、端末領域のタッチも一緒にずれる
 - **`Panel_DSI::config_detail().buffer_length` は 0 が入っている**（M5GFX が埋めていない）。
   PPA に渡す `out.buffer_size` は自分で計算する（0 だと `ESP_ERR_INVALID_ARG`）
 - PPA の入力は DMA するので **64B 境界の内蔵 RAM** に置く（`heap_caps_aligned_alloc`）
