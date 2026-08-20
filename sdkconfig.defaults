@@ -68,4 +68,4 @@ CONFIG_MBEDTLS_CHACHAPOLY_C=y
 
 # mbedTLS のエラー文字列。無効だと mbedtls_strerror が何も返さず、
 # 鍵のパース失敗などの原因が分からない（#17 の調査で必要になった）。
-CONFIG_MBEDTLS_ERROR_C=y
+CONFIG_MBEDTLS_ERROR_STRINGS=y
