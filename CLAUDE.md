@@ -152,7 +152,7 @@ openssl ec -in ssh_key -out key.pem -param_enc named_curve            # 既存�
 ```
 
 鍵のパースだけを確かめたいときは実機の `keytest` コマンドを使う。
-`CONFIG_MBEDTLS_ERROR_C=y` を入れてあるので、失敗理由が文字列で出る。
+`CONFIG_MBEDTLS_ERROR_STRINGS=y` を入れてあるので、失敗理由が文字列で出る（`CONFIG_MBEDTLS_ERROR_C` という symbol は無い。書いても `unknown kconfig symbol` の警告が出るだけで効かない）。
 
 ## ホストテストで使う mbedTLS
 
