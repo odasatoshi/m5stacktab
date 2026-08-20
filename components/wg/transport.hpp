@@ -18,6 +18,8 @@ constexpr uint64_t kReplayWindow = 2048;
 // 1 つの鍵世代ぶんの状態（鍵・送信カウンタ・リプレイウィンドウ）。
 struct SessionState {
     Keypair  kp{};
+    // 生成時刻（呼び出し側の時計）。1 つ前の世代を捨てる判断に使う。
+    int64_t  born_us = 0;
     bool     valid        = false;
     // このセッションで相手からデータを受け取ったか。
     // 応答側は、確認が取れるまで**古い鍵で送り続ける**（相手はまだ新しい鍵を知らない）。
@@ -31,12 +33,21 @@ class Transport {
 public:
     Transport(const Crypto& crypto) : c_(crypto) {}
 
+    // 本家 wg の REJECT_AFTER_TIME。これを超えた鍵は相手が捨てているので使わない。
+    static constexpr int64_t kRejectAfterUs = 180 * 1000000LL;
+
     // 新しい鍵世代を入れる。今の世代は「1 つ前」に降格し、そのまま復号に使える。
     // 「相手がこの鍵を持っていると確定しているか」は kp.initiator がそのまま表す
     // （開始側は msg2 を受けた時点で確定、応答側は msg2 が届いたか分からない）。
     // 引数で渡すようにすると呼び出し側の書き忘れで静かに無効化されるので持たせない。
-    void set_keypair(const Keypair& kp);
+    // now_us は呼び出し側の時計（ホストでテストするため引数で受ける）。
+    void set_keypair(const Keypair& kp, int64_t now_us);
     bool ready() const { return cur_.valid; }
+
+    // 寿命を過ぎた「1 つ前」を捨てる。定期的に呼ぶ。
+    // **捨てないと、相手が既に破棄した鍵で送り続けて沈黙する**（#30）。
+    // 捨てた場合は true。
+    bool expire_previous(int64_t now_us);
 
     // 平文パケットを暗号化する。out は len + kTransportHeader + kTagLen 必要。
     // 返り値は出力バイト数。0 なら失敗。

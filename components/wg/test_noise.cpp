@@ -258,8 +258,8 @@ void test_transport()
     CHECK(i.consume_response(m2, ik));
 
     wg::Transport ti(c), tr(c);
-    ti.set_keypair(ik);
-    tr.set_keypair(rk);
+    ti.set_keypair(ik, 0);
+    tr.set_keypair(rk, 0);
     CHECK(ti.ready());
 
     // 開始側 → 応答側
@@ -321,8 +321,8 @@ void test_replay_window()
     kp.remote_index = 7;
 
     wg::Transport tx(c), rx(c);
-    tx.set_keypair(kp);
-    rx.set_keypair(kp);
+    tx.set_keypair(kp, 0);
+    rx.set_keypair(kp, 0);
 
     // 10 個作って、順番を入れ替えて渡す
     std::vector<std::vector<uint8_t>> packets;
@@ -395,8 +395,8 @@ void test_rekey_crossover()
     CHECK(!b1.initiator);
 
     wg::Transport a(c), b(c);
-    a.set_keypair(a1);
-    b.set_keypair(b1);
+    a.set_keypair(a1, 0);
+    b.set_keypair(b1, 0);
 
     uint8_t pkt[128], got[128];
     bool    valid = false;
@@ -415,7 +415,7 @@ void test_rekey_crossover()
     CHECK(inflight_len > 0);
 
     // b は応答側として世代 2 を受け取る（未確認）。
-    b.set_keypair(b2);
+    b.set_keypair(b2, 0);
     CHECK(b.has_previous());
     CHECK(!b.current_confirmed());
 
@@ -437,7 +437,7 @@ void test_rekey_crossover()
 
     // a が世代 2 に切り替えて（開始側なので確認済み）データを送ると、
     // b はそれを受けて世代 2 を確認済みに昇格させる。
-    a.set_keypair(a2);
+    a.set_keypair(a2, 0);
     CHECK(a.current_confirmed());
     n = a.encrypt(pkt, sizeof(pkt), reinterpret_cast<const uint8_t*>("new"), 3);
     CHECK(n > 0);
@@ -460,16 +460,16 @@ void test_rekey_crossover()
     // 残らず、送信が全損したままピアの送信を待つしかなくなる。
     {
         wg::Transport e(c), peer(c);
-        e.set_keypair(b1);
-        peer.set_keypair(a1);
+        e.set_keypair(b1, 0);
+        peer.set_keypair(a1, 0);
         n = peer.encrypt(pkt, sizeof(pkt), reinterpret_cast<const uint8_t*>("hi"), 2);
         valid = false;
         CHECK(e.decrypt(got, sizeof(got), pkt, n, &valid) == 2);
         CHECK(valid);
         CHECK(e.current_confirmed());
 
-        e.set_keypair(b2);  // msg1 を受けて応答（未確認）
-        e.set_keypair(b3);  // msg2 が落ちてピアが msg1 を再送（また未確認）
+        e.set_keypair(b2, 0);  // msg1 を受けて応答（未確認）
+        e.set_keypair(b3, 0);  // msg2 が落ちてピアが msg1 を再送（また未確認）
         CHECK(!e.current_confirmed());
 
         // 送信は世代 1 のまま。世代 2 で送るとピアには絶対に届かない。
@@ -490,17 +490,17 @@ void test_rekey_crossover()
     // 世代ごとにリプレイウィンドウが独立していること。
     // 共有していると、世代 2 のカウンタ 0 が世代 1 の受信済みと衝突して落ちる。
     wg::Transport d(c), s1(c), s2(c), s3(c);
-    d.set_keypair(b1);
-    s1.set_keypair(a1);
-    s2.set_keypair(a2);
-    s3.set_keypair(a3);
+    d.set_keypair(b1, 0);
+    s1.set_keypair(a1, 0);
+    s2.set_keypair(a2, 0);
+    s3.set_keypair(a3, 0);
     for (int i = 0; i < 5; ++i) {
         n = s1.encrypt(pkt, sizeof(pkt), reinterpret_cast<const uint8_t*>("x"), 1);
         valid = false;
         CHECK(d.decrypt(got, sizeof(got), pkt, n, &valid) == 1);
         CHECK(valid);
     }
-    d.set_keypair(b2);
+    d.set_keypair(b2, 0);
     for (int i = 0; i < 5; ++i) {
         n = s2.encrypt(pkt, sizeof(pkt), reinterpret_cast<const uint8_t*>("y"), 1);
         valid = false;
@@ -512,7 +512,7 @@ void test_rekey_crossover()
     // さらに世代 3 が来たら、世代 1 は落ちる（保持は 1 つ前まで）。
     // 世代 2 は確認済みになっているので、こちらは正しく押し出される。
     CHECK(d.current_confirmed());
-    d.set_keypair(b3);
+    d.set_keypair(b3, 0);
     n = s1.encrypt(pkt, sizeof(pkt), reinterpret_cast<const uint8_t*>("z"), 1);
     valid = false;
     CHECK(d.decrypt(got, sizeof(got), pkt, n, &valid) == 0);
@@ -532,6 +532,84 @@ void test_rekey_crossover()
     valid = false;
     CHECK(s3.decrypt(got, sizeof(got), pkt, n, &valid) == 1);
     CHECK(valid);
+}
+
+// #30: 鍵世代に寿命を持たせる。相手が既に破棄した鍵で送り続けると、
+// 送信は成功するのに届かず、ローカルには何の信号も出ない。
+void test_previous_expires()
+{
+    const auto& c = wg::default_crypto();
+    auto        mk = [](uint8_t seed, uint32_t local, uint32_t remote) {
+        wg::Keypair kp;
+        for (int i = 0; i < 32; ++i) {
+            kp.send[i] = static_cast<uint8_t>(seed + i);
+            kp.recv[i] = static_cast<uint8_t>(seed + 0x80 + i);
+        }
+        kp.local_index  = local;
+        kp.remote_index = remote;
+        kp.initiator    = true;
+        return kp;
+    };
+    auto peer_of = [](const wg::Keypair& k) {
+        wg::Keypair o = k;
+        std::memcpy(o.send, k.recv, 32);
+        std::memcpy(o.recv, k.send, 32);
+        o.local_index  = k.remote_index;
+        o.remote_index = k.local_index;
+        o.initiator    = !k.initiator;
+        return o;
+    };
+    const wg::Keypair a1 = mk(0x10, 1001, 1002), b1 = peer_of(a1);
+    const wg::Keypair a2 = mk(0x40, 2001, 2002), b2 = peer_of(a2);
+
+    constexpr int64_t kSec = 1000000LL;
+    wg::Transport     b(c), a(c);
+    a.set_keypair(a1, 0);
+    b.set_keypair(b1, 0);
+
+    uint8_t pkt[128], got[128];
+    bool    valid = false;
+    size_t  n     = a.encrypt(pkt, sizeof(pkt), reinterpret_cast<const uint8_t*>("hi"), 2);
+    CHECK(b.decrypt(got, sizeof(got), pkt, n, &valid) == 2);
+    CHECK(valid);  // b の世代 1 が確認済みになる
+
+    // 応答側として世代 2 を受け取る（未確認）。世代 1 が「1 つ前」に降格。
+    b.set_keypair(b2, 10 * kSec);
+    CHECK(b.has_previous());
+    CHECK(!b.current_confirmed());
+
+    // 寿命内なら捨てない。送信も 1 つ前で続く。
+    CHECK(!b.expire_previous(100 * kSec));
+    CHECK(b.has_previous());
+    n = b.encrypt(pkt, sizeof(pkt), reinterpret_cast<const uint8_t*>("x"), 1);
+    CHECK(recv_index(pkt) == b1.remote_index);
+
+    // REJECT_AFTER_TIME (180 秒) を越えたら捨てる。**基準は世代 1 が
+    // 生まれた時刻**（0）なので、181 秒で切れる。
+    CHECK(b.expire_previous(181 * kSec));
+    CHECK(!b.has_previous());
+    // 2 度目は false（もう無い）。
+    CHECK(!b.expire_previous(200 * kSec));
+
+    // 捨てたあとは、未確認でも現世代で送るしかない。
+    n = b.encrypt(pkt, sizeof(pkt), reinterpret_cast<const uint8_t*>("y"), 1);
+    CHECK(n > 0);
+    CHECK(recv_index(pkt) == b2.remote_index);
+
+    // 1 つ前が無くても現世代の復号は続く。
+    wg::Transport a2t(c);
+    a2t.set_keypair(a2, 181 * kSec);
+    n     = a2t.encrypt(pkt, sizeof(pkt), reinterpret_cast<const uint8_t*>("z"), 1);
+    valid = false;
+    CHECK(b.decrypt(got, sizeof(got), pkt, n, &valid) == 1);
+    CHECK(valid);
+    CHECK(b.current_confirmed());
+
+    // 1 つ前が無い状態で expire を呼んでも落ちない。
+    wg::Transport fresh(c);
+    CHECK(!fresh.expire_previous(0));
+    fresh.set_keypair(a1, 0);
+    CHECK(!fresh.expire_previous(1000 * kSec));  // prev_ が無いので何もしない
 }
 
 // レビュー指摘の回帰テスト。
@@ -608,6 +686,7 @@ int main()
     test_transport();
     test_replay_window();
     test_rekey_crossover();
+    test_previous_expires();
     test_review_regressions();
     std::printf("ok: %d checks passed\n", g_checks);
     return 0;

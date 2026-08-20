@@ -716,8 +716,8 @@ int cmd_wgtest(int, char**)
 
     // トランスポートの往復とリプレイ拒否
     wg::Transport tx(c), rx(c);
-    tx.set_keypair(ik);
-    rx.set_keypair(rk);
+    tx.set_keypair(ik, esp_timer_get_time());
+    rx.set_keypair(rk, esp_timer_get_time());
     uint8_t      pkt[256], out[256];
     const char*  msg = "wireguard on esp32-p4";
     t0 = esp_timer_get_time();
@@ -1396,8 +1396,8 @@ int cmd_wgloop(int, char**)
 
     // 確定した鍵で実際にパケットを往復させる
     wg::Transport ta(c), tb(c);
-    ta.set_keypair(ka);
-    tb.set_keypair(kb);
+    ta.set_keypair(ka, esp_timer_get_time());
+    tb.set_keypair(kb, esp_timer_get_time());
     const char*  payload = "tunnel payload over loopback";
     const size_t plen    = std::strlen(payload);
     const int64_t t1 = esp_timer_get_time();
@@ -1472,7 +1472,7 @@ int cmd_wgloop(int, char**)
         std::printf("rekey: inflight encrypt failed\n");
     } else {
         sendto(sa, buf, ilen, 0, reinterpret_cast<sockaddr*>(&addr_b), sizeof(addr_b));
-        tb.set_keypair(kb2);  // kb2.initiator == false なので未確認として入る
+        tb.set_keypair(kb2, esp_timer_get_time());  // kb2.initiator == false なので未確認として入る
         valid = false;
         n = recvfrom(sb, buf, sizeof(buf), 0, nullptr, nullptr);
         const size_t g1 =
@@ -1496,7 +1496,7 @@ int cmd_wgloop(int, char**)
         std::printf("  unconfirmed sends on old key: %s\n", pre_ok ? "ok" : "FAILED");
 
         // (3) A も世代 2 に移ってデータを送ると、B は世代 2 を確認済みに昇格させる。
-        ta.set_keypair(ka2);  // ka2.initiator == true なので確認済みで入る
+        ta.set_keypair(ka2, esp_timer_get_time());  // ka2.initiator == true なので確認済みで入る
         bool         post_ok = false;
         const size_t nlen = ta.encrypt(buf, sizeof(buf), reinterpret_cast<const uint8_t*>("new"), 3);
         if (nlen > 0) {
@@ -1526,8 +1526,8 @@ int cmd_wgloop(int, char**)
         // (5) 未確認の世代が 2 連続で来る場合（こちらの msg2 が落ちてピアが msg1 を
         // 再送した状況）。確認済みの世代 2 を押し出してはいけない。押し出すと
         // 「ピアが一度も持っていない世代」で送り続けて上りが全損する。
-        tb.set_keypair(kb3);
-        tb.set_keypair(kb4);
+        tb.set_keypair(kb3, esp_timer_get_time());
+        tb.set_keypair(kb4, esp_timer_get_time());
         bool         retry_ok = false;
         const size_t rtlen = tb.encrypt(buf, sizeof(buf), reinterpret_cast<const uint8_t*>("rty"), 3);
         if (rtlen > 0 && recv_index(buf) == kb2.remote_index) {
