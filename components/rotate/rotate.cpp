@@ -3,18 +3,23 @@
 
 namespace rot {
 
-// M5GFX の rotation 1 は「ネイティブを反時計回りに 90 度回して見る」向き。
-// 横向きの (lx, ly) は、ネイティブでは x = ly、y = (landscape_w - 1 - lx) に対応する。
+// M5GFX の rotation 1 は「ネイティブを時計回りに 90 度回して見る」向き。
+// 横向きの (lx, ly) は、ネイティブでは x = (landscape_h - 1 - ly)、y = lx に対応する。
+//
+// **ここを逆向きにすると 180 度ずれる。** 端末は PPA でこの変換を使って
+// フレームバッファに書き、キーボードは M5GFX の rotation 1 でそのまま描くので、
+// 食い違うと「端末とキーボードの天地が逆」になる。実機の rottest が
+// ピクセルを読み戻して照合するので、変えたら必ず走らせる。
 void landscape_to_native(const Panel& p, int lx, int ly, int* nx, int* ny)
 {
-    if (nx) *nx = ly;
-    if (ny) *ny = p.landscape_w() - 1 - lx;
+    if (nx) *nx = p.landscape_h() - 1 - ly;
+    if (ny) *ny = lx;
 }
 
 void native_to_landscape(const Panel& p, int nx, int ny, int* lx, int* ly)
 {
-    if (lx) *lx = p.landscape_w() - 1 - ny;
-    if (ly) *ly = nx;
+    if (lx) *lx = ny;
+    if (ly) *ly = p.landscape_h() - 1 - nx;
 }
 
 void landscape_rect_to_native(const Panel& p, int lx, int ly, int lw, int lh, int* nx, int* ny,

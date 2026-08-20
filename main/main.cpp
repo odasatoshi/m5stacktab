@@ -1346,7 +1346,9 @@ int cmd_ppatest(int, char**)
     op.out.block_offset_x   = nx;
     op.out.block_offset_y   = ny;
     op.out.srm_cm           = PPA_SRM_COLOR_MODE_RGB565;
-    op.rotation_angle       = PPA_SRM_ROTATION_ANGLE_90;
+    // 定数は TermRenderer に 1 つだけ置いてある（複製すると片方が取り残される）。
+    op.rotation_angle       = static_cast<ppa_srm_rotation_angle_t>(
+        TermRenderer::ppa_rotation_angle());
     op.scale_x              = 1.0f;
     op.scale_y              = 1.0f;
     op.mode                 = PPA_TRANS_MODE_BLOCKING;
@@ -1358,6 +1360,22 @@ int cmd_ppatest(int, char**)
         std::printf("ppa_do_scale_rotate_mirror failed: %s\n", esp_err_to_name(err));
     } else {
         std::printf("ppa rotate 1280x24 -> native(%d,%d) %dx%d: %lld us\n", nx, ny, nw, nh, us);
+
+        // **PPA の回転角が rot の変換と合っているかを画素で判定する。**
+        // rottest は写像だけを見るので、角度を間違えてもすり抜ける
+        // （実際にこのコマンド自身が ANGLE_90 のまま取り残されていた）。
+        // ソースは左半分が赤・右半分が青と非対称なので、180 度回れば入れ替わる。
+        // PPA は転送前に出力窓のキャッシュを無効化するので、読み戻しは PSRAM から来る。
+        display.setRotation(1);
+        const uint16_t left  = display.readPixel(100, kH / 2);
+        const uint16_t right = display.readPixel(kW - 100, kH / 2);
+        const bool     ok    = (left == 0xF800 && right == 0x001F);
+        std::printf("ppa angle check: left %04x (want f800) right %04x (want 001f) %s\n", left,
+                    right, ok ? "ok" : (left == 0x001F && right == 0xF800)
+                                           ? "SWAPPED - rotation_angle が rot と食い違っている"
+                                           : "MISMATCH");
+        if (!ok) err = ESP_FAIL;
+
         // 比較用に M5GFX の pushSprite も測る
         M5Canvas sp(&display);
         sp.setPsram(false);
@@ -1375,6 +1393,147 @@ int cmd_ppatest(int, char**)
     heap_caps_free(src);
     ppa_unregister_client(client);
     return err == ESP_OK ? 0 : 1;
+}
+
+// 画面をシリアル経由で吸い出す。CLAUDE.md が「画面が絡む変更は写真か画面キャプチャ」を
+// 求めているが、遠隔・エージェント実行では写真が撮れない。フレームバッファを読めば
+// キャプチャは作れるし、視差も照明もないぶん写真より正確に判定できる。
+//
+// rotation 1（キーボードが描くのと同じ向き = 物理的に正しい向き）で読むので、
+// 出てくる絵はユーザーが見ているものと同じになる。端末だけが 180 度ずれていれば
+// その通りに写る。
+//
+// 115200 baud なので間引く。step=4 で 320x180、16 進で約 230KB / 20 秒。
+int cmd_screencap(int argc, char** argv)
+{
+    const int step = (argc > 1) ? atoi(argv[1]) : 4;
+    // 範囲を絞れば文字が読める解像度でも現実的な時間で吸い出せる。
+    const int x0 = (argc > 2) ? atoi(argv[2]) : 0;
+    const int y0 = (argc > 3) ? atoi(argv[3]) : 0;
+    const int rw = (argc > 4) ? atoi(argv[4]) : (int)display.width() - x0;
+    const int rh = (argc > 5) ? atoi(argv[5]) : (int)display.height() - y0;
+    if (step < 1 || step > 32 || x0 < 0 || y0 < 0 || rw <= 0 || rh <= 0 ||
+        x0 + rw > (int)display.width() || y0 + rh > (int)display.height()) {
+        std::printf("usage: screencap [step] [x] [y] [w] [h]   (step 1-32, 既定 4 で全画面)\n");
+        return 1;
+    }
+    TermGuard guard;
+    if (!guard.ok()) {
+        std::printf("busy\n");
+        return 1;
+    }
+    // **自分で rotation 1 にする。** コメントで「rotation 1 で読む」と言いながら
+    // 現在の rotation で読んでいると、直前のコマンドが 0 を残していた場合に
+    // 黙って回った PNG が出る（この PR が直したのと同じクラスの失敗）。
+    const uint8_t prev_rotation = display.getRotation();
+    display.setRotation(1);
+    const int w = rw / step;
+    const int h = rh / step;
+    std::printf("SCREENCAP %d %d %d rotation=1\n", w, h, step);
+    // 1 行ぶんをまとめて組んでから出す。1 画素ずつ printf すると桁違いに遅い。
+    static char line[1281 * 4 + 8];
+    for (int y = 0; y < h; ++y) {
+        char* out = line;
+        for (int x = 0; x < w; ++x) {
+            const uint16_t px = display.readPixel(x0 + x * step, y0 + y * step);
+            static const char kHex[] = "0123456789abcdef";
+            *out++ = kHex[(px >> 12) & 0xF];
+            *out++ = kHex[(px >> 8) & 0xF];
+            *out++ = kHex[(px >> 4) & 0xF];
+            *out++ = kHex[px & 0xF];
+        }
+        *out = '\0';
+        std::printf("%s\n", line);
+    }
+    std::printf("SCREENCAP END\n");
+    display.setRotation(prev_rotation);
+    return 0;
+}
+
+// **本番のレンダラ経路を通して**回転を判定する。
+//
+// rottest も ppatest も term_render.cpp の回転を守れない。rottest は純関数の
+// 写像だけを見るし、ppatest は PPA の設定を自前で組む。だから push_row_ppa の
+// 角度だけを 180 度ずらしても、あの 2 つは緑のまま通る（実機で確認済み）。
+// ユーザーが報告した症状を捕まえられるのはこのコマンドだけ。
+//
+// 判定には色つきの背景しか使わない。グリフの形に依存させるとフォントを
+// 変えたときに壊れるし、単色でも 180 度ずれれば位置が変わるので十分捕まる。
+// エスケープは C++ 側で組む。コンソール経由だと argv 分割で剥がれて再現できない。
+int cmd_termcheck(int, char**)
+{
+    TermGuard guard;
+    if (!guard.ok()) {
+        std::printf("busy\n");
+        return 1;
+    }
+    const int cw = renderer->cell_w();
+    const int ch = renderer->cell_h();
+    if (cw <= 0 || ch <= 0 || renderer->cols() < 4 || renderer->rows() < 3) {
+        std::printf("unexpected cell/grid size (%dx%d, %dx%d cells)\n", cw, ch, renderer->cols(),
+                    renderer->rows());
+        return 1;
+    }
+    const int far = renderer->cols() - 2;  // 右端の少し内側（グリッド幅に追随させる）
+
+    // 行 0: セル 0 が赤、セル 1 が緑。行 1: セル 0 が青。ほかは空。
+    term->write("\033[2J\033[H\033[41m \033[42m \033[m\r\n\033[44m \033[m");
+    renderer->render(*term, /*force=*/true);
+
+    // 期待色は kBase16 (xterm 標準 16 色) と同じ変換で作る。
+    const uint16_t red   = display.color565(205, 0, 0);
+    const uint16_t green = display.color565(0, 205, 0);
+    const uint16_t blue  = display.color565(0, 0, 238);
+
+    struct Probe {
+        int         lx, ly;
+        uint16_t    want;
+        const char* what;
+    };
+    const Probe probes[] = {
+        {cw / 2, ch / 2, red, "row0 cell0 = red"},
+        {cw + cw / 2, ch / 2, green, "row0 cell1 = green (red の右)"},
+        // 横方向に反転していれば、ここに赤が来て左端が黒になる。
+        {far * cw + cw / 2, ch / 2, 0x0000, "row0 右端付近 = 黒"},
+        {cw / 2, ch + ch / 2, blue, "row1 cell0 = blue (row0 の下)"},
+        {cw / 2, 2 * ch + ch / 2, 0x0000, "row2 = 黒"},
+    };
+
+    int bad = 0;
+    for (const auto& pr : probes) {
+        const uint16_t got = display.readPixel(pr.lx, pr.ly);
+        const bool     ok  = (got == pr.want);
+        if (!ok) ++bad;
+        std::printf("  (%4d,%3d) want %04x got %04x  %-34s %s\n", pr.lx, pr.ly, pr.want, got,
+                    pr.what, ok ? "ok" : "MISMATCH");
+    }
+    std::printf("render path (vt100 -> sprite -> %s -> framebuffer): %s\n",
+                renderer->ppa_enabled() ? "PPA" : "pushSprite", bad == 0 ? "ok" : "FAILED");
+    return bad == 0 ? 0 : 1;
+}
+
+// 横向き座標の画素を読む。PPA でフレームバッファに直接書いた内容が
+// 正しい位置・正しい向きに出ているかを、目視なしで確かめるために使う。
+int cmd_pix(int argc, char** argv)
+{
+    if (argc < 3 || (argc - 1) % 2 != 0) {
+        std::printf("usage: pix <lx> <ly> [<lx> <ly> ...]   横向き座標の色を読む\n");
+        return 1;
+    }
+    // 横向き座標で読むので rotation 1 が前提。範囲外は readPixel が 0 を返すので、
+    // 座標を間違えたときに「黒」と誤読しないよう rotation も出す。
+    std::printf("  (rotation %d)\n", (int)display.getRotation());
+    TermGuard guard;
+    if (!guard.ok()) {
+        std::printf("busy\n");
+        return 1;
+    }
+    for (int i = 1; i + 1 < argc; i += 2) {
+        const int lx = atoi(argv[i]);
+        const int ly = atoi(argv[i + 1]);
+        std::printf("  (%4d,%4d) = %04x\n", lx, ly, (unsigned)display.readPixel(lx, ly));
+    }
+    return 0;
 }
 
 // 座標変換が M5GFX の setRotation(1) と同じ向きかを実機で照合する。
@@ -1401,28 +1560,50 @@ int cmd_rottest(int, char**)
         {1240, 680, TFT_YELLOW, "bottom-right"},
     };
 
-    // まず横向き (rotation 1) で四隅に印を描く
+    // 目視に頼らず、描いたピクセルを読み戻して判定する。
+    // rotation 1 で置いた色が、変換したネイティブ座標にあるかを確かめる。
+    // ここが合っていないと、端末 (PPA + rot) とキーボード (M5GFX rotation 1) の
+    // 向きが 180 度食い違う。見た目では「天地が逆」になる。
     display.setRotation(1);
     display.fillScreen(TFT_BLACK);
     for (const auto& pt : pts) display.fillCircle(pt.lx, pt.ly, 18, pt.color);
-    display.setFont(&fonts::efontJA_24);
-    display.setTextColor(TFT_WHITE, TFT_BLACK);
-    display.drawString("rotation 1: big circles", 300, 300);
-
-    // 次に rotation 0 に切り替えて、変換した座標に小さい印を描く
     display.setRotation(0);
+    int bad = 0;
     for (const auto& pt : pts) {
         int nx = 0, ny = 0;
         rot::landscape_to_native(panel, pt.lx, pt.ly, &nx, &ny);
-        display.fillCircle(nx, ny, 7, TFT_WHITE);
-        std::printf("  %-13s landscape(%4d,%3d) -> native(%3d,%4d)\n", pt.name, pt.lx, pt.ly, nx,
-                    ny);
+        const uint16_t got = display.readPixel(nx, ny);
+        const bool     ok  = (got == pt.color);
+        if (!ok) ++bad;
+        std::printf("  %-13s landscape(%4d,%3d) -> native(%3d,%4d) want %04x got %04x %s\n",
+                    pt.name, pt.lx, pt.ly, nx, ny, pt.color, got, ok ? "ok" : "MISMATCH");
     }
     display.setRotation(1);
-    display.drawString("white dots inside circles = ok", 300, 340);
-    std::printf("check the screen: white dots must be inside the colored circles\n");
+    if (bad == 0) {
+        std::printf("rotation matches setRotation(1): ok\n");
+    } else {
+        // どの向きなら合うのかも出す。原因を当てる手間が要らなくなる。
+        // 実際に起こる回帰は「90 度を逆向きに取る」= 変換後の点が 180 度ずれる形。
+        // 旧式をハードコードすると、旧式に戻したときに主判定と同じ点を読んで
+        // 情報がゼロになる。変換結果を 180 度回した点を試せば向きに依存しない。
+        std::printf("rotation MISMATCH (%d/4). 180 度回した点を試す:\n", bad);
+        display.setRotation(0);
+        int alt_bad = 0;
+        for (const auto& pt : pts) {
+            int nx = 0, ny = 0;
+            rot::landscape_to_native(panel, pt.lx, pt.ly, &nx, &ny);
+            const int nx2 = panel.native_w - 1 - nx;
+            const int ny2 = panel.native_h - 1 - ny;
+            const uint16_t got = display.readPixel(nx2, ny2);
+            if (got != pt.color) ++alt_bad;
+            std::printf("  %-13s native(%3d,%4d) want %04x got %04x\n", pt.name, nx2, ny2,
+                        pt.color, got);
+        }
+        display.setRotation(1);
+        std::printf("  180 度回した点なら %d/4 一致\n", 4 - alt_bad);
+    }
     std::printf("run `termtest` or type to restore the terminal\n");
-    return 0;
+    return bad == 0 ? 0 : 1;
 }
 
 void register_term_commands()
@@ -1450,6 +1631,11 @@ void register_term_commands()
          &cmd_discoloop, nullptr, nullptr, nullptr},
         {"keytest", "sshkey パーティションの鍵を mbedTLS で直接パースする", nullptr, &cmd_keytest,
          nullptr, nullptr, nullptr},
+        {"screencap", "画面をシリアルに吸い出す（PNG は tools/screencap.py）", "[step]",
+         &cmd_screencap, nullptr, nullptr, nullptr},
+        {"termcheck", "本番のレンダラ経路で描いて画素で回転を判定する", nullptr, &cmd_termcheck,
+         nullptr, nullptr, nullptr},
+        {"pix", "横向き座標の画素の色を読む", "<lx> <ly> ...", &cmd_pix, nullptr, nullptr, nullptr},
         {"rottest", "座標変換が setRotation(1) と一致するか実機で照合", nullptr, &cmd_rottest,
          nullptr, nullptr, nullptr},
         {"ppatest", "PPA でフレームバッファに直接回転転送してみる", nullptr, &cmd_ppatest, nullptr,
@@ -1599,7 +1785,10 @@ extern "C" void app_main(void)
                 last_x   = tp.x;
                 last_y   = tp.y;
                 if (!keyboard->touch_down(tp.x, tp.y)) {
-                    // キーボード外 = 端末領域。縦スワイプでスクロールバックを見る。
+                    // キーボード外 = 端末領域。
+                    // ponytail: スワイプでスクロールバックを見る動作は未実装。
+                    // 今は座標をログに出すだけ（スクロールは `scroll` コマンドから）。
+                    // キーボードが届いて画面を触る頻度が上がったら実装する。
                     ESP_LOGI(TAG, "touch down x=%d y=%d (cell %d,%d)", tp.x, tp.y,
                              tp.x / renderer->cell_w(), tp.y / renderer->cell_h());
                 }

@@ -144,3 +144,85 @@ PR に貼るログは次で採取する。`idf.py monitor` は標準入力が TT
 python tools/serial_log.py --seconds 30 > /tmp/log.txt          # リセットしてから採取
 python tools/serial_log.py --no-reset --seconds 30 > /tmp/l.txt # 動作中の様子を採取
 ```
+
+## 画面の向き
+
+`rottest` はピクセルを読み戻して自動判定するので、目視は要らない。
+
+```sh
+printf 'rottest\r\n' > /dev/cu.usbmodem101
+```
+
+```
+  top-left      landscape(  40, 40) -> native(679,  40) want f800 got f800 ok
+  top-right     landscape(1240, 40) -> native(679,1240) want 07e0 got 07e0 ok
+  bottom-left   landscape(  40,680) -> native( 39,  40) want 001f got 001f ok
+  bottom-right  landscape(1240,680) -> native( 39,1240) want ffe0 got ffe0 ok
+rotation matches setRotation(1): ok
+```
+
+MISMATCH が出たら、逆向き（反時計回り 90 度）で何個一致するかも出るので原因がすぐ分かる。
+
+`rottest` が見ているのは**座標の写像だけ**で、PPA の回転角は見ていない。
+角度の側は `ppatest` が判定する（左半分が赤・右半分が青の非対称なブロックを
+転送して、読み戻した画素で確かめる）。
+
+```sh
+printf 'ppatest\r\n' > /dev/cu.usbmodem101
+```
+
+```
+ppa rotate 1280x24 -> native(696,0) 24x1280: 941 us
+ppa angle check: left f800 (want f800) right 001f (want 001f) ok
+```
+
+角度と写像が食い違っていると `SWAPPED` と出る（意図的に `ANGLE_90` に戻して確認済み）。
+
+```
+ppa angle check: left 001f (want f800) right f800 (want 001f) SWAPPED - rotation_angle が rot と食い違っている
+```
+
+**本番の描画経路**（vt100 → スプライト → PPA → フレームバッファ）は `termcheck` が判定する。
+`rottest` は純関数の写像、`ppatest` は自前の PPA 設定しか見ないので、
+**push_row_ppa の角度がずれてもあの 2 つは緑のまま通る**（実機で確認済み）。
+ユーザーが報告した症状を捕まえられるのは `termcheck` だけ。
+
+エスケープは実機側で組むので、シリアル越しのクォートで壊れることがない。
+
+```sh
+printf 'termcheck\r\n' > /dev/cu.usbmodem101
+```
+
+```
+  (   6, 12) want c800 got c800  row0 cell0 = red                   ok
+  (  18, 12) want 0660 got 0660  row0 cell1 = green (red の右)      ok
+  (1254, 12) want 0000 got 0000  row0 右端付近 = 黒                 ok
+  (   6, 36) want 001d got 001d  row1 cell0 = blue (row0 の下)      ok
+  (   6, 60) want 0000 got 0000  row2 = 黒                          ok
+render path (vt100 -> sprite -> PPA -> framebuffer): ok
+```
+
+角度だけを `ANGLE_90` に戻すと、右端に緑が来て（横方向の反転）`FAILED` になる。
+
+任意の座標の色を見たいときは `pix <lx> <ly> ...`。
+
+## 画面キャプチャ
+
+写真が撮れない状況（遠隔、CI、エージェント実行）でも、フレームバッファを吸い出せば
+画面が絡む変更の証跡を残せる。視差も照明も入らないので写真より正確。
+
+```sh
+# 全画面（間引き 4 → 320x180、約 20 秒）
+python tools/serial_log.py --no-reset --seconds 40 --send screencap > cap.log
+python tools/screencap.py cap.log screen.png
+
+# 文字を読みたいときは範囲を絞って間引きなし
+python tools/serial_log.py --no-reset --seconds 40 --send "screencap 1 0 0 640 48" > cap.log
+python tools/screencap.py cap.log top.png
+```
+
+`screencap [step] [x] [y] [w] [h]`。rotation 1（キーボードが描くのと同じ向き）で読むので、
+出てくる絵は目で見えているものと同じになる。
+
+`docs/screenshots/` に、端末とキーボードの天地が揃っていることを確かめたときの
+キャプチャを置いてある。

@@ -35,6 +35,12 @@ public:
     bool enable_ppa();
     bool ppa_enabled() const { return ppa_ != nullptr; }
 
+    // PPA に渡す回転角。**rot の座標変換と必ず一致していなければならない。**
+    // 以前は term_render と ppatest で定数を複製していて、片方だけ直したせいで
+    // 「ppatest だけ 180 度回っている」状態を作った。定数はここにしか置かない。
+    // 型は driver/ppa.h を持ち込まないよう int で返す（呼び側でキャストする）。
+    static int ppa_rotation_angle();
+
     uint32_t last_render_us() const { return last_us_; }
     int      last_rows_drawn() const { return last_rows_; }
     // 内訳 (最適化の判断用): スプライトへの描画と、パネルへの転送。
