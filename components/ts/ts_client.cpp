@@ -97,7 +97,7 @@ bool Client::fetch_server_key(uint8_t out[32])
     st_.state = ClientStatus::State::kFetchingKey;
     const int fd = connect_tcp(cfg_.host.c_str(), cfg_.port, 5);
     if (fd < 0) {
-        st_.error = "cannot connect for /key";
+        set_error("cannot connect for /key");
         return false;
     }
     char      req[256];
@@ -120,21 +120,51 @@ bool Client::fetch_server_key(uint8_t out[32])
 
     std::string key_str;
     if (!json_find_string(resp, "publicKey", &key_str)) {
-        st_.error = "no publicKey in /key response";
+        set_error("no publicKey in /key response");
         return false;
     }
     if (!key_from_string(key_str, "mkey:", out)) {
-        st_.error = "bad publicKey format";
+        set_error("bad publicKey format");
         return false;
     }
     return true;
+}
+
+ClientStatus Client::snapshot() const
+{
+    std::lock_guard<std::mutex> g(mu_);
+    return st_;
+}
+
+void Client::set_error(std::string e)
+{
+    std::lock_guard<std::mutex> g(mu_);
+    st_.error = std::move(e);
+}
+
+void Client::set_assigned_address(std::string a)
+{
+    std::lock_guard<std::mutex> g(mu_);
+    st_.assigned_address = std::move(a);
+}
+
+void Client::set_domain(std::string d)
+{
+    std::lock_guard<std::mutex> g(mu_);
+    st_.domain = std::move(d);
+}
+
+void Client::reset_status()
+{
+    std::lock_guard<std::mutex> g(mu_);
+    st_ = ClientStatus{};
 }
 
 bool Client::run_once()
 {
     const auto& c = wg::default_crypto();
     stop_         = false;
-    st_           = ClientStatus{};
+    reset_status();
 
     uint8_t server_pub[32];
     if (!fetch_server_key(server_pub)) {
@@ -144,13 +174,13 @@ bool Client::run_once()
 
     Handshake hs(c);
     if (!hs.init(machine_priv_, server_pub, cfg_.capability_version)) {
-        st_.error = "handshake init failed";
+        set_error("handshake init failed");
         st_.state = ClientStatus::State::kFailed;
         return false;
     }
     uint8_t msg1[kInitiationLen];
     if (!hs.create_initiation(msg1)) {
-        st_.error = "create_initiation failed (no entropy?)";
+        set_error("create_initiation failed (no entropy?)");
         st_.state = ClientStatus::State::kFailed;
         return false;
     }
@@ -158,7 +188,7 @@ bool Client::run_once()
     st_.state    = ClientStatus::State::kConnecting;
     const int fd = connect_tcp(cfg_.host.c_str(), cfg_.port, 65);  // long-poll の keepalive より長く
     if (fd < 0) {
-        st_.error = "connect failed";
+        set_error("connect failed");
         st_.state = ClientStatus::State::kFailed;
         return false;
     }
@@ -172,7 +202,7 @@ bool Client::run_once()
     const size_t req_len = build_upgrade_request(req, sizeof(req), cfg_.host.c_str(), msg1,
                                                  sizeof(msg1));
     if (req_len == 0 || !send_all(fd, req, req_len)) {
-        st_.error = "sending upgrade request failed";
+        set_error("sending upgrade request failed");
         st_.state = ClientStatus::State::kFailed;
         return false;
     }
@@ -184,7 +214,7 @@ bool Client::run_once()
         uint8_t       buf[2048];
         const ssize_t r = recv(fd, buf, sizeof(buf), 0);
         if (r <= 0) {
-            st_.error = "closed while reading upgrade response";
+            set_error("closed while reading upgrade response");
             st_.state = ClientStatus::State::kFailed;
             return false;
         }
@@ -192,7 +222,7 @@ bool Client::run_once()
         up = parse_upgrade_response(reinterpret_cast<const char*>(in.data()), in.size());
         if (up.status != UpgradeResult::Status::kIncomplete) break;
         if (in.size() > 16384) {
-            st_.error = "upgrade response too large";
+            set_error("upgrade response too large");
             st_.state = ClientStatus::State::kFailed;
             return false;
         }
@@ -200,7 +230,7 @@ bool Client::run_once()
     if (up.status != UpgradeResult::Status::kOk) {
         char buf[64];
         std::snprintf(buf, sizeof(buf), "upgrade rejected (http %d)", up.http_status);
-        st_.error = buf;
+        set_error(buf);
         st_.state = ClientStatus::State::kFailed;
         return false;
     }
@@ -219,8 +249,8 @@ bool Client::run_once()
                 in.insert(in.end(), buf, buf + r);
             }
             const size_t avail = (in.size() > 3) ? std::min(elen, in.size() - 3) : 0;
-            st_.error = "server rejected the handshake: " +
-                        std::string(reinterpret_cast<const char*>(in.data() + 3), avail);
+            set_error(std::string("server rejected the handshake: ") +
+                      std::string(reinterpret_cast<const char*>(in.data() + 3), avail));
             st_.state = ClientStatus::State::kFailed;
             return false;
         }
@@ -228,7 +258,7 @@ bool Client::run_once()
         uint8_t       buf[2048];
         const ssize_t r = recv(fd, buf, sizeof(buf), 0);
         if (r <= 0) {
-            st_.error = "closed while reading noise response";
+            set_error("closed while reading noise response");
             st_.state = ClientStatus::State::kFailed;
             return false;
         }
@@ -236,7 +266,7 @@ bool Client::run_once()
     }
     Session sess{};
     if (!hs.consume_response(in.data(), sess)) {
-        st_.error = "noise response rejected (capability version mismatch?)";
+        set_error("noise response rejected (capability version mismatch?)");
         st_.state = ClientStatus::State::kFailed;
         return false;
     }
@@ -258,7 +288,7 @@ bool Client::run_once()
             size_t       consumed = 0;
             const size_t got = rec.open(out, sizeof(out), in.data(), in.size(), &consumed);
             if (consumed == SIZE_MAX) {
-                st_.error = "record decrypt failed";
+                set_error("record decrypt failed");
                 return false;
             }
             if (consumed == 0) break;
@@ -273,21 +303,21 @@ bool Client::run_once()
         uint8_t       buf[2048];
         const ssize_t r = recv(fd, buf, sizeof(buf), 0);
         if (r == 0) {
-            st_.error = "connection closed by peer";
+            set_error("connection closed by peer");
             return false;
         }
         if (r < 0) {
             // タイムアウトだけを続行扱いにする。他のエラーで回し続けると
             // 死んだソケットで CPU を焼き、しかも「稼働中」と誤認する。
             if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-                st_.error = std::string("recv failed: ") + std::strerror(errno);
+                set_error(std::string("recv failed: ") + std::strerror(errno));
                 return false;
             }
             return true;
         }
         in.insert(in.end(), buf, buf + r);
         if (in.size() > kMaxBuffered || plain.size() > kMaxBuffered) {
-            st_.error = "receive buffer limit exceeded";
+            set_error("receive buffer limit exceeded");
             return false;
         }
         for (;;) {
@@ -295,7 +325,7 @@ bool Client::run_once()
             size_t       consumed = 0;
             const size_t got = rec.open(out, sizeof(out), in.data(), in.size(), &consumed);
             if (consumed == SIZE_MAX) {
-                st_.error = "record decrypt failed";
+                set_error("record decrypt failed");
                 return false;
             }
             if (consumed == 0) break;
@@ -331,7 +361,7 @@ bool Client::run_once()
         }
         if (r == EarlyNoiseResult::kNotPresent && !plain.empty()) break;  // HTTP/2 が始まっている
         if (!pump(1000)) {
-            st_.error = st_.error.empty() ? "closed after noise handshake" : st_.error;
+            set_error(st_.error.empty() ? "closed after noise handshake" : st_.error);
             st_.state = ClientStatus::State::kFailed;
             return false;
         }
@@ -342,7 +372,7 @@ bool Client::run_once()
         uint8_t      buf[256];
         const size_t n = h2_build_preface(buf, sizeof(buf));
         if (n == 0 || !seal_send(buf, n)) {
-            st_.error = "sending http/2 preface failed";
+            set_error("sending http/2 preface failed");
             st_.state = ClientStatus::State::kFailed;
             return false;
         }
@@ -383,13 +413,13 @@ bool Client::run_once()
                                              f.payload_len);
                         if (f.flags & kFlagEndStream) register_done = true;
                         if (body_register.size() > kMaxBuffered) {
-                            st_.error = "register response too large";
+                            set_error("register response too large");
                             return false;
                         }
                     } else if (f.stream_id == kStreamMap) {
                         map_stream.insert(map_stream.end(), f.payload, f.payload + f.payload_len);
                         if (map_stream.size() > kMaxBuffered) {
-                            st_.error = "netmap buffer limit exceeded";
+                            set_error("netmap buffer limit exceeded");
                             return false;
                         }
                     }
@@ -409,7 +439,7 @@ bool Client::run_once()
                     // 応答ステータスを見る。404/500 を素通りさせると、本文が JSON でないために
                     // 「machine not authorized」のような誤ったエラーになる。
                     if (!h2_headers_is_status_200(f.payload, f.payload_len)) {
-                        st_.error = "control plane returned a non-200 status";
+                        set_error("control plane returned a non-200 status");
                         return false;
                     }
                     if ((f.flags & kFlagEndStream) && f.stream_id == kStreamRegister) {
@@ -419,10 +449,10 @@ bool Client::run_once()
                 case H2Type::kRstStream:
                     // long-poll のストリームを切られたら再接続が必要。放置すると
                     // 何も受け取らないまま「稼働中」を続けてしまう。
-                    st_.error = "server reset the stream";
+                    set_error("server reset the stream");
                     return false;
                 case H2Type::kGoaway:
-                    st_.error = "server sent GOAWAY";
+                    set_error("server sent GOAWAY");
                     return false;
                 default:
                     break;  // WINDOW_UPDATE などは読み捨てて良い
@@ -435,12 +465,12 @@ bool Client::run_once()
     st_.state = ClientStatus::State::kRegistering;
     for (int i = 0; i < 600 && !stop_; ++i) {
         if (!pump(1000)) {
-            if (st_.error.empty()) st_.error = "connection closed";
+            if (st_.error.empty()) set_error("connection closed");
             st_.state = ClientStatus::State::kFailed;
             return false;
         }
         if (!handle_frames()) {
-            if (st_.error.empty()) st_.error = "http/2 error";
+            if (st_.error.empty()) set_error("http/2 error");
             st_.state = ClientStatus::State::kFailed;
             return false;
         }
@@ -459,7 +489,7 @@ bool Client::run_once()
                                            reinterpret_cast<const uint8_t*>(body.data()),
                                            body.size());
             if (n == 0 || !seal_send(buf.data(), n)) {
-                st_.error = "sending register failed";
+                set_error("sending register failed");
                 st_.state = ClientStatus::State::kFailed;
                 return false;
             }
@@ -472,18 +502,18 @@ bool Client::run_once()
         if (!st_.registered && register_done && !body_register.empty()) {
             const auto rr = parse_register_response(body_register);
             if (!rr.error.empty()) {
-                st_.error = "register rejected: " + rr.error;
+                set_error("register rejected: " + rr.error);
                 st_.state = ClientStatus::State::kFailed;
                 return false;
             }
             if (!rr.auth_url.empty()) {
                 // auth key が無い / 無効なとき。対話ログインは実装しない。
-                st_.error = "interactive login required: " + rr.auth_url;
+                set_error("interactive login required: " + rr.auth_url);
                 st_.state = ClientStatus::State::kFailed;
                 return false;
             }
             if (!rr.machine_authorized) {
-                st_.error = "machine not authorized";
+                set_error("machine not authorized");
                 st_.state = ClientStatus::State::kFailed;
                 return false;
             }
@@ -505,7 +535,7 @@ bool Client::run_once()
                                            reinterpret_cast<const uint8_t*>(body.data()),
                                            body.size());
             if (n == 0 || !seal_send(buf.data(), n)) {
-                st_.error = "sending map request failed";
+                set_error("sending map request failed");
                 st_.state = ClientStatus::State::kFailed;
                 return false;
             }
@@ -522,7 +552,7 @@ bool Client::run_once()
                 take_framed_message(map_stream.data(), map_stream.size(), &payload, &plen);
             if (used == 0) break;
             if (used == SIZE_MAX) {
-                st_.error = "bad netmap framing";
+                set_error("bad netmap framing");
                 st_.state = ClientStatus::State::kFailed;
                 return false;
             }
@@ -536,14 +566,14 @@ bool Client::run_once()
                 continue;  // KeepAlive のときは他フィールドを見ない
             }
             std::string addr;
-            if (json_find_first_in_array(msg, "Addresses", &addr)) st_.assigned_address = addr;
+            if (json_find_first_in_array(msg, "Addresses", &addr)) set_assigned_address(addr);
             std::string domain;
-            if (json_find_string(msg, "Domain", &domain)) st_.domain = domain;
+            if (json_find_string(msg, "Domain", &domain)) set_domain(domain);
             if (on_map_) on_map_(msg);
         }
     }
 
-    st_.error = stop_ ? "stopped" : "timed out";
+    set_error(stop_ ? "stopped" : "timed out");
     return st_.state == ClientStatus::State::kMapping;
 }
 

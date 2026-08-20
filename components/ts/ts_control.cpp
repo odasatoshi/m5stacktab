@@ -205,9 +205,16 @@ std::string build_map_request(const MapParams& p)
     // zstd デコーダを載せたくないので圧縮は使わない。
     s += ",\"Compress\":\"\"";
     s += ",\"Hostinfo\":{\"Hostname\":\"" + json_escape(p.hostname) + "\",\"OS\":\"linux\"";
-    if (p.preferred_derp > 0) {
-        s += ",\"NetInfo\":{\"PreferredDERP\":" + std::to_string(p.preferred_derp) + "}";
-    }
+    // NetInfo は **常に入れる**。無いと Headscale が
+    // 「node sent update but has no NetInfo in request or database」として扱い、
+    // ピアに配る netmap にこのノードのエンドポイントが載らない（実機で確認）。
+    // 結果、相手は DISCO の送り先が分からず永久に繋がらない。
+    // DERP は使っていないので PreferredDERP は 0（「DERP ホームなし」の意味）。
+    // PreferredDERP 0 は「DERP ホーム無し / 不明」の意味で、DERP を実装していない
+    // 今はこれが正しい。実装したら値を持たせる（それまで config は増やさない）。
+    // WorkingUDP は測っていない固定値。LinkType は tailcfg の定数
+    // ("wired"/"wifi"/"mobile") のうち Tab5 に当たるもの。
+    s += ",\"NetInfo\":{\"PreferredDERP\":0,\"WorkingUDP\":true,\"LinkType\":\"wifi\"}";
     s += "}";
     if (!p.endpoints.empty()) {
         s += ",\"Endpoints\":[";

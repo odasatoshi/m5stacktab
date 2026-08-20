@@ -396,12 +396,29 @@ void rx_task(void*)
 
 // netif の登録・解除は tcpip スレッドで行う。core locking 無効の構成では
 // 他スレッドから netif_list を触ると、走査中のリストを壊す。
+//
+// **`tcpip_callback` ではなく `tcpip_callback_wait` を使う。** 前者は非同期なので、
+// (1) 直後に netif.name を見ても、まだ登録されていなくて失敗と誤判定する
+//     （実機で `netif up failed: netif_add failed` が出た）、
+// (2) 引数をスタックに置いたまま渡すと、コールバックが走る前に呼び出し元が
+//     戻ってスコープが消える、の 2 つが起きる。
+// down() 側も同じで、非同期だと remove の前にソケットと transport を壊してしまう。
+// どちらもコンソールタスクから呼ばれるので、待って構わない
+// （tcpip スレッド自身から呼ぶとデッドロックするが、その経路は無い）。
+struct AddArgs {
+    ip4_addr_t addr;
+    ip4_addr_t netmask;
+    bool       ok;
+};
+
 void netif_add_cb(void* arg)
 {
-    auto* cfg = static_cast<ip4_addr_t*>(arg);
+    auto*      a = static_cast<AddArgs*>(arg);
     ip4_addr_t gw;
     ip4_addr_set_zero(&gw);
-    if (netif_add(&g_state.netif, &cfg[0], &cfg[1], &gw, nullptr, wg_netif_init, tcpip_input)) {
+    a->ok = netif_add(&g_state.netif, &a->addr, &a->netmask, &gw, nullptr, wg_netif_init,
+                      tcpip_input) != nullptr;
+    if (a->ok) {
         netif_set_up(&g_state.netif);
         netif_set_link_up(&g_state.netif);
     }
@@ -461,8 +478,8 @@ esp_err_t Netif::up(const uint8_t static_priv[kKeyLen], const ip4_addr_t& addr,
     timeval tv{1, 0};
     setsockopt(g_state.sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    ip4_addr_t cfg[2] = {addr, netmask};
-    if (tcpip_callback(netif_add_cb, cfg) != ERR_OK || g_state.netif.name[0] != 'w') {
+    AddArgs args{addr, netmask, false};
+    if (tcpip_callback_wait(netif_add_cb, &args) != ERR_OK || !args.ok) {
         close(g_state.sock);
         g_state.sock = -1;
         last_error_  = "netif_add failed";
@@ -472,7 +489,7 @@ esp_err_t Netif::up(const uint8_t static_priv[kKeyLen], const ip4_addr_t& addr,
     g_state.running = true;
     if (xTaskCreate(&rx_task, "wg_rx", 16384, nullptr, 6, &g_state.rx_task) != pdPASS) {
         g_state.running = false;
-        tcpip_callback(netif_remove_cb, nullptr);
+        tcpip_callback_wait(netif_remove_cb, nullptr);
         close(g_state.sock);
         g_state.sock = -1;
         last_error_  = "rx task create failed";
@@ -482,7 +499,7 @@ esp_err_t Netif::up(const uint8_t static_priv[kKeyLen], const ip4_addr_t& addr,
     if (xTaskCreate(&tx_task, "wg_tx", 4096, nullptr, 6, &g_state.tx_task) != pdPASS) {
         g_state.running = false;
         xSemaphoreTake(g_state.rx_done, pdMS_TO_TICKS(3000));
-        tcpip_callback(netif_remove_cb, nullptr);
+        tcpip_callback_wait(netif_remove_cb, nullptr);
         close(g_state.sock);
         g_state.sock = -1;
         last_error_  = "tx task create failed";
@@ -517,7 +534,7 @@ void Netif::down()
         }
     }
 
-    tcpip_callback(netif_remove_cb, nullptr);
+    tcpip_callback_wait(netif_remove_cb, nullptr);
     if (g_state.sock >= 0) {
         close(g_state.sock);
         g_state.sock = -1;

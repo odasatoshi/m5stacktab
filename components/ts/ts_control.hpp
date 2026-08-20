@@ -60,7 +60,6 @@ struct MapParams {
     std::string              hostname;
     std::vector<std::string> endpoints;  // "192.168.0.29:41641" など
     bool                     stream    = true;
-    int                      preferred_derp = 0;  // 0 なら NetInfo に入れない
 };
 std::string build_map_request(const MapParams& p);
 
