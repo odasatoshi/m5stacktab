@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -62,11 +63,25 @@ public:
     // 実行中に止める。
     void stop() { stop_ = true; }
 
+    // **同じタスクからだけ使うこと。** 中身に std::string があるので、
+    // run_once() が走っているタスク以外から参照で受けると、読んでいる最中に
+    // 代入で旧バッファが解放される（use-after-free）。
     const ClientStatus& status() const { return st_; }
+
+    // 別タスク（コンソールなど）から状態を見るときはこちら。値でコピーを返す。
+    ClientStatus snapshot() const;
 
 private:
     bool fetch_server_key(uint8_t out[32]);
 
+    // st_ の文字列を書くのはこの 4 つだけに集約して mutex で守る。
+    // 数値と enum はワード幅なので、ちぎれて読めても表示が一瞬ずれるだけ。
+    void set_error(std::string e);
+    void set_assigned_address(std::string a);
+    void set_domain(std::string d);
+    void reset_status();
+
+    mutable std::mutex mu_;
     ClientConfig cfg_;
     ClientStatus st_;
     uint8_t      machine_priv_[32] = {};
