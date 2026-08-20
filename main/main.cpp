@@ -149,6 +149,12 @@ int64_t s_last_status_us = 0;
 // 狭すぎるので判定だけ広げる（24px は 3.5mm しかない）。
 constexpr int kStatusTapH = 56;
 
+// 端末領域の縦スワイプでスクロールバックを見る。押した位置と、そのときの
+// view_offset を覚えて、指の移動量から絶対位置を出す（相対だと取りこぼしで
+// ずれていく）。-1 は「端末領域を掴んでいない」。
+int s_swipe_start_y      = -1;
+int s_swipe_start_offset = 0;
+
 // M5GFX はパネル・タッチの判別結果を NVS にキャッシュする。NVS を初期化しておかないと
 // 毎起動でフルプローブ（タッチ IC のファームウェア待ちを含む）が走る。
 void init_nvs()
@@ -534,6 +540,39 @@ int cmd_ssh(int argc, char** argv)
         return 1;
     }
     std::printf("connecting... watch the screen\n");
+    return 0;
+}
+
+// 覚えているホスト鍵を忘れる（#35）。サーバを作り直して鍵が正当に変わったとき、
+// これが無いとそのホストに永久に繋げない。**ハッシュから元のホスト名は復元できない**
+// ので、`ssh` と同じ形（host[:port]）で指定してもらう。
+int cmd_ssh_forget(int argc, char** argv)
+{
+    if (argc < 2) {
+        std::printf("usage: ssh-forget <host>[:<port>]\n");
+        return 1;
+    }
+    std::string host = argv[1];
+    uint16_t    port = 22;
+    if (const size_t colon = host.rfind(':');
+        colon != std::string::npos && host.find(':') == colon) {
+        const int p = atoi(host.c_str() + colon + 1);
+        if (p > 0 && p <= 65535) {
+            port = (uint16_t)p;
+            host.resize(colon);
+        }
+    }
+    const esp_err_t err = ssh_forget_host_key(host.c_str(), port);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        std::printf("no stored host key for %s:%u\n", host.c_str(), (unsigned)port);
+        return 1;
+    }
+    if (err != ESP_OK) {
+        std::printf("failed: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+    std::printf("forgot the host key for %s:%u (next connect will remember the new one)\n",
+                host.c_str(), (unsigned)port);
     return 0;
 }
 
@@ -967,6 +1006,7 @@ void render_term(bool force)
 void set_menu_visible(bool show)
 {
     if (!menu) return;
+    s_swipe_start_y = -1;  // 掴んだままメニューに移ると、次のドラッグが飛ぶ
     menu->set_visible(show);
     // メニューはキーボードの領域を覆わないので、隠さないと指でキーを押せてしまう。
     // ponytail: 端末に戻るときは必ずキーボードを出す（`kbd off` の状態は覚えない）。
@@ -2227,6 +2267,8 @@ void register_term_commands()
         {"ssh", "SSH 接続 (引数なしで保存済み設定)", "[<user> <host> <password> [port]]", &cmd_ssh,
          nullptr, nullptr, nullptr},
         {"sshclose", "SSH セッションを閉じる", nullptr, &cmd_sshclose, nullptr, nullptr, nullptr},
+        {"ssh-forget", "覚えているホスト鍵を忘れる", "<host>[:<port>]", &cmd_ssh_forget, nullptr,
+         nullptr, nullptr},
         {"key", "SSH にキー入力を送る", "<text>", &cmd_key, nullptr, nullptr, nullptr},
         {"conv", "ローマ字→かな→漢字を試す", "<romaji>", &cmd_conv, nullptr, nullptr, nullptr},
         {"keyj", "ローマ字を IME に通して SSH に送る", "<romaji>...", &cmd_keyj, nullptr, nullptr,
@@ -2497,13 +2539,21 @@ extern "C" void app_main(void)
                     // メニュー表示中はキーボードを隠しているので、ここで全部食う。
                     if (menu->touch_down(tp.x, tp.y)) menu->draw();
                 } else if (!keyboard->touch_down(tp.x, tp.y)) {
-                    // キーボード外 = 端末領域。
-                    // ponytail: スワイプでスクロールバックを見る動作は未実装。
-                    // 今は座標をログに出すだけ（スクロールは `scroll` コマンドから）。
-                    // キーボードが届いて画面を触る頻度が上がったら実装する。
-                    ESP_LOGI(TAG, "touch down x=%d y=%d (cell %d,%d)", tp.x, tp.y,
-                             tp.x / renderer->cell_w(), tp.y / renderer->cell_h());
+                    // キーボード外 = 端末領域。縦スワイプでスクロールバックを見る。
+                    s_swipe_start_y      = tp.y;
+                    s_swipe_start_offset = term->view_offset();
                 }
+            } else if (s_swipe_start_y >= 0) {
+                // 端末領域のドラッグ。**下に引いたら過去に戻る**（紙を下に引く感覚）。
+                // 移動量をセル単位に落として絶対位置で当てる。相対で足していくと
+                // 20ms ごとのポーリングの取りこぼしでずれていく。
+                const int cells = (tp.y - s_swipe_start_y) / renderer->cell_h();
+                const int want  = s_swipe_start_offset + cells;
+                if (const int delta = want - term->view_offset(); delta != 0) {
+                    if (term->scroll_view(delta) != 0) render_term();
+                }
+                last_x = tp.x;
+                last_y = tp.y;
             } else {
                 // メニュー表示中はドラッグをキーボードに渡さない（見えていないので）。
                 if (!menu->visible()) keyboard->touch_move(tp.x, tp.y);
@@ -2512,7 +2562,11 @@ extern "C" void app_main(void)
             }
         } else if (touching && touch_guard.ok()) {
             touching = false;
-            if (menu->visible()) {
+            if (s_swipe_start_y >= 0) {
+                ESP_LOGI(TAG, "scrollback offset %d / %d lines", term->view_offset(),
+                         term->scrollback_lines());
+                s_swipe_start_y = -1;
+            } else if (menu->visible()) {
                 // メニュー表示中は押した時点で決まっているので、離すのは無視する。
             } else if (!keyboard->touch_up(last_x, last_y)) {
                 ESP_LOGI(TAG, "touch up");

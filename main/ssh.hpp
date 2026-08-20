@@ -16,6 +16,11 @@ struct SshConfig {
 
 // NVS から接続先を読む / 書く（パスワードも NVS。画面から入力できるまでの手段）。
 esp_err_t ssh_config_load(SshConfig& out);
+
+// 覚えているホスト鍵を忘れる（#35）。サーバを作り直して鍵が正当に変わった場合、
+// これが無いとそのホストに永久に繋げない（TOFU は「変わったら拒否」しかしない）。
+// 見つからなければ ESP_ERR_NOT_FOUND。
+esp_err_t ssh_forget_host_key(const char* host, uint16_t port);
 esp_err_t ssh_config_save(const SshConfig& cfg);
 
 // 接続してリモートシェルを開く。cols/rows は PTY のサイズ。
