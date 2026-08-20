@@ -1422,9 +1422,14 @@ int cmd_screencap(int argc, char** argv)
         std::printf("busy\n");
         return 1;
     }
+    // **自分で rotation 1 にする。** コメントで「rotation 1 で読む」と言いながら
+    // 現在の rotation で読んでいると、直前のコマンドが 0 を残していた場合に
+    // 黙って回った PNG が出る（この PR が直したのと同じクラスの失敗）。
+    const uint8_t prev_rotation = display.getRotation();
+    display.setRotation(1);
     const int w = rw / step;
     const int h = rh / step;
-    std::printf("SCREENCAP %d %d %d\n", w, h, step);
+    std::printf("SCREENCAP %d %d %d rotation=1\n", w, h, step);
     // 1 行ぶんをまとめて組んでから出す。1 画素ずつ printf すると桁違いに遅い。
     static char line[1281 * 4 + 8];
     for (int y = 0; y < h; ++y) {
@@ -1441,6 +1446,7 @@ int cmd_screencap(int argc, char** argv)
         std::printf("%s\n", line);
     }
     std::printf("SCREENCAP END\n");
+    display.setRotation(prev_rotation);
     return 0;
 }
 
@@ -1463,10 +1469,12 @@ int cmd_termcheck(int, char**)
     }
     const int cw = renderer->cell_w();
     const int ch = renderer->cell_h();
-    if (cw <= 0 || ch <= 0 || renderer->cols() < 106) {
-        std::printf("unexpected cell/grid size (%dx%d, cols %d)\n", cw, ch, renderer->cols());
+    if (cw <= 0 || ch <= 0 || renderer->cols() < 4 || renderer->rows() < 3) {
+        std::printf("unexpected cell/grid size (%dx%d, %dx%d cells)\n", cw, ch, renderer->cols(),
+                    renderer->rows());
         return 1;
     }
+    const int far = renderer->cols() - 2;  // 右端の少し内側（グリッド幅に追随させる）
 
     // 行 0: セル 0 が赤、セル 1 が緑。行 1: セル 0 が青。ほかは空。
     term->write("\033[2J\033[H\033[41m \033[42m \033[m\r\n\033[44m \033[m");
@@ -1486,7 +1494,7 @@ int cmd_termcheck(int, char**)
         {cw / 2, ch / 2, red, "row0 cell0 = red"},
         {cw + cw / 2, ch / 2, green, "row0 cell1 = green (red の右)"},
         // 横方向に反転していれば、ここに赤が来て左端が黒になる。
-        {104 * cw + cw / 2, ch / 2, 0x0000, "row0 右端付近 = 黒"},
+        {far * cw + cw / 2, ch / 2, 0x0000, "row0 右端付近 = 黒"},
         {cw / 2, ch + ch / 2, blue, "row1 cell0 = blue (row0 の下)"},
         {cw / 2, 2 * ch + ch / 2, 0x0000, "row2 = 黒"},
     };
@@ -1777,7 +1785,10 @@ extern "C" void app_main(void)
                 last_x   = tp.x;
                 last_y   = tp.y;
                 if (!keyboard->touch_down(tp.x, tp.y)) {
-                    // キーボード外 = 端末領域。縦スワイプでスクロールバックを見る。
+                    // キーボード外 = 端末領域。
+                    // ponytail: スワイプでスクロールバックを見る動作は未実装。
+                    // 今は座標をログに出すだけ（スクロールは `scroll` コマンドから）。
+                    // キーボードが届いて画面を触る頻度が上がったら実装する。
                     ESP_LOGI(TAG, "touch down x=%d y=%d (cell %d,%d)", tp.x, tp.y,
                              tp.x / renderer->cell_w(), tp.y / renderer->cell_h());
                 }
