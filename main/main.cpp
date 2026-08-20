@@ -212,8 +212,7 @@ std::string unescape(const char* src)
 // エージェント実行）で SSH の出力や描画を検証する唯一の手段なので、
 // 見た目ではなくセルの中身をそのまま出す。
 //
-// 出すのはライブ画面（cell）。scroll でスクロールバックを見ている間は
-// 画面に出ているもの（view_cell）とずれる。
+// 出すのは「今画面に見えているもの」（view_offset を反映する）。
 int cmd_termdump(int, char**)
 {
     TermGuard guard;
@@ -221,11 +220,15 @@ int cmd_termdump(int, char**)
         std::printf("busy\n");
         return 1;
     }
-    std::printf("--- term %dx%d cursor=(%d,%d)%s ---\n", term->cols(), term->rows(),
-                term->cursor_x(), term->cursor_y(), term->cursor_visible() ? "" : " hidden");
-    // UTF-8 化は vt100 の row_text に任せる（ホストテストで全角の境界まで固めてある）。
+    std::printf("--- term %dx%d cursor=(%d,%d)%s scrollback=%d/%d ---\n", term->cols(),
+                term->rows(), term->cursor_x(), term->cursor_y(),
+                term->cursor_visible() ? "" : " hidden", term->view_offset(),
+                term->scrollback_lines());
+    // UTF-8 化は vt100 に任せる（ホストテストで全角の境界まで固めてある）。
+    // **view_row_text を使う。** スクロールバックを見ている間、ライブ画面を出すと
+    // 画面と食い違って「dump したのに見えているものと違う」ことになる。
     for (int y = 0; y < term->rows(); ++y) {
-        std::printf("%2d|%s\n", y, term->row_text(y).c_str());
+        std::printf("%2d|%s\n", y, term->view_row_text(y).c_str());
     }
     std::printf("--- end (bell=%u) ---\n", (unsigned)term->bell_count());
     return 0;
@@ -2581,7 +2584,7 @@ extern "C" void app_main(void)
     auto* sb = static_cast<vt::Cell*>(heap_caps_malloc(
         sizeof(vt::Cell) * renderer->cols() * kScrollbackLines, MALLOC_CAP_SPIRAM));
     if (sb) {
-        term->set_scrollback(sb, kScrollbackLines);
+        term->set_scrollback(sb, kScrollbackLines, renderer->cols());
         ESP_LOGI(TAG, "scrollback: %d lines (%u KB in PSRAM)", kScrollbackLines,
                  (unsigned)(sizeof(vt::Cell) * renderer->cols() * kScrollbackLines / 1024));
     } else {

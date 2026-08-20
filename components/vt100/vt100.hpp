@@ -102,7 +102,15 @@ public:
     bool app_cursor_keys() const { return app_cursor_keys_; }
 
     // デバッグ・テスト用: 1 行を UTF-8 文字列にする (末尾の空白は落とす)。
+    // **ライブ画面**を読む。スクロールバックを見ている間は画面に出ているものと違う。
     std::string row_text(int y) const;
+
+    // **今画面に見えているもの**を読む（view_offset を反映する）。
+    // これが無いと履歴の中身をテストで検証できず、行数しか固められない
+    // （追い出した行の代わりに空行を積んでもテストが通ってしまう）。
+    std::string view_row_text(int y) const;
+    // 1 セル単位で見たいとき。view_offset を反映する。
+    const Cell& view_cell(int x, int y) const;
 
     // --- スクロールバック ---
     //
@@ -111,13 +119,17 @@ public:
     // **resize() の扱い**: 桁数が変わったときだけ履歴を破棄する（履歴は cols 単位で
     // 詰めてあるので使い回せない）。行数だけの変更では履歴は残り、行が減って
     // 画面から追い出される分はここに積まれる。view_offset はどちらでも 0 に戻る。
-    void set_scrollback(Cell* buffer, int max_lines);
+    // buffer は cols * max_lines 個。**cols も渡す。** push_scrollback は
+    // 現在の cols_ でストライドするので、確保時と食い違うと呼び出し側の
+    // バッファを踏み越える（今は cols が変わらないので到達しないが、
+    // 黙って踏むより渡してもらって検査する）。cols を省くと現在の cols_ を使う。
+    void set_scrollback(Cell* buffer, int max_lines, int cols = 0);
     int  scrollback_lines() const { return sb_count_; }
     int  view_offset() const { return view_offset_; }
     // 表示位置を動かす (正 = 過去へ)。実際に動いた行数を返す。
     int  scroll_view(int delta);
     // 表示用のセル。スクロールバックを見ている間は履歴を返す。
-    const Cell& view_cell(int x, int y) const;
+
 
 private:
     struct Cursor {
@@ -210,8 +222,10 @@ private:
     int   sb_count_    = 0;   // 保持している行数
     int   sb_head_     = 0;   // 次に書く位置
     int   view_offset_ = 0;   // 0 = 最新
+    int   sb_cols_     = 0;   // 履歴バッファを確保したときの桁数
     const Cell* sb_line(int lines_back) const;
     void  push_scrollback(const Cell* row);
+    std::string row_text_impl(int y, bool use_view) const;
 
     // CSI パラメータの個数上限。無制限だと ";" の連打で際限なくヒープを食う。
     static constexpr size_t kMaxParams = 32;

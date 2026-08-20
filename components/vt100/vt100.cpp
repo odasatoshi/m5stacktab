@@ -132,16 +132,19 @@ const Cell& Terminal::cell(int x, int y) const
     return screen()[static_cast<size_t>(y) * cols_ + x];
 }
 
-std::string Terminal::row_text(int y) const
+// row_text / view_row_text の中身。セルの取り方だけ違うので共有する
+// （2 つ書くと UTF-8 の分岐がずれる）。
+std::string Terminal::row_text_impl(int y, bool use_view) const
 {
     std::string out;
     if (y < 0 || y >= rows_) return out;
-    int last = -1;
+    auto at = [&](int x) -> const Cell& { return use_view ? view_cell(x, y) : cell(x, y); };
+    int  last = -1;
     for (int x = 0; x < cols_; ++x) {
-        if (cell(x, y).ch != ' ' || cell(x, y).width == 0) last = x;
+        if (at(x).ch != ' ' || at(x).width == 0) last = x;
     }
     for (int x = 0; x <= last; ++x) {
-        const Cell& c = cell(x, y);
+        const Cell& c = at(x);
         if (c.width == 0) continue;  // 全角の右半分は出力しない
         uint32_t cp = c.ch;
         if (cp < 0x80) {
@@ -162,6 +165,10 @@ std::string Terminal::row_text(int y) const
     }
     return out;
 }
+
+std::string Terminal::row_text(int y) const { return row_text_impl(y, /*use_view=*/false); }
+
+std::string Terminal::view_row_text(int y) const { return row_text_impl(y, /*use_view=*/true); }
 
 namespace {
 // resize / スクロール後は行全体を描き直す必要があるので、範囲は行全体にする。
@@ -907,10 +914,11 @@ void Terminal::write(const uint8_t* data, size_t len)
 }
 
 
-void Terminal::set_scrollback(Cell* buffer, int max_lines)
+void Terminal::set_scrollback(Cell* buffer, int max_lines, int cols)
 {
     sb_buf_      = (max_lines > 0) ? buffer : nullptr;
     sb_max_      = (buffer && max_lines > 0) ? max_lines : 0;
+    sb_cols_     = (cols > 0) ? cols : cols_;
     sb_count_    = 0;
     sb_head_     = 0;
     view_offset_ = 0;
@@ -919,6 +927,11 @@ void Terminal::set_scrollback(Cell* buffer, int max_lines)
 void Terminal::push_scrollback(const Cell* row)
 {
     if (!sb_buf_ || sb_max_ <= 0) return;
+    // **確保時の桁数と食い違ったら書かない。** 呼び出し側は cols * max_lines で
+    // 確保しているので、桁数が増えたあとに現在の cols_ でストライドすると
+    // バッファを踏み越える。今は cols が変わらないので到達しないが、
+    // 黙って踏むより落とす（履歴が止まるのは resize が捨てるのと同じ扱い）。
+    if (sb_cols_ != cols_) return;
     std::copy(row, row + cols_, sb_buf_ + static_cast<size_t>(sb_head_) * cols_);
     sb_head_ = (sb_head_ + 1) % sb_max_;
     if (sb_count_ < sb_max_) ++sb_count_;
