@@ -46,6 +46,13 @@ jobs:
               components/ime/flick.cpp components/ime/romaji.cpp components/ime/skk_dict.cpp
           /tmp/test_flick
 
+      - name: blake2s / hmac / kdf (RFC 7693 とテストベクタ)
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \
+              -I components/wg -o /tmp/test_wg components/wg/test_wg.cpp \
+              components/wg/blake2s.cpp
+          /tmp/test_wg
+
       - name: wireguard crypto
         run: |
           c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \

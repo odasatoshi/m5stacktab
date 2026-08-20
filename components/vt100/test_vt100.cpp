@@ -514,7 +514,7 @@ void test_scrollback()
 {
     Terminal t(8, 3);
     std::vector<vt::Cell> sb(8 * 10);
-    t.set_scrollback(sb.data(), 10);
+    t.set_scrollback(sb.data(), 10, 8);
 
     for (int i = 0; i < 6; ++i) {
         char buf[32];
@@ -585,7 +585,7 @@ void test_resize_keeps_scrollback()
 {
     vt::Terminal t(10, 3);
     std::vector<vt::Cell> sb(10 * 50);
-    t.set_scrollback(sb.data(), 50);
+    t.set_scrollback(sb.data(), 50, 10);
 
     // 6 行流して 3 行を履歴に落とす。
     t.write("a\r\nb\r\nc\r\nd\r\ne\r\nf");
@@ -611,7 +611,7 @@ void test_resize_keeps_scrollback()
     {
         vt::Terminal t2(10, 5);
         std::vector<vt::Cell> sb2(10 * 50);
-        t2.set_scrollback(sb2.data(), 50);
+        t2.set_scrollback(sb2.data(), 50, 10);
         // 画面は 5 行ちょうど（履歴は空）。
         t2.write("1\r\n2\r\n3\r\n4\r\n5");
         CHECK(t2.scrollback_lines() == 0);
@@ -622,11 +622,21 @@ void test_resize_keeps_scrollback()
         t2.resize(10, 2);
         CHECK(t2.row_text(0) == "4");
         CHECK(t2.row_text(1) == "5");
-        // 1,2,3 が履歴に入った。**履歴 3 + 画面 2 = 元の 5 行**で、
-        // どこにも無い行が生まれていない（穴があいていない）ことがこれで言える。
+        // 1,2,3 が履歴に入った。
         CHECK(t2.scrollback_lines() == 3);
-        // row_text はライブ画面を読むので scroll_view は反映されない。
-        // 履歴の中身は行数と、画面に残った行が 4,5 であることから確定する。
+        // **中身と順序も見る。** 行数だけだと、追い出した行の代わりに空行を
+        // 積むミュータントでもテストが通ってしまう（#47 で view_row_text を
+        // 公開したのでここを固められるようになった）。
+        CHECK(t2.scroll_view(3) == 3);
+        CHECK(t2.view_row_text(0) == "1");
+        CHECK(t2.view_row_text(1) == "2");
+        t2.scroll_view(-1);
+        CHECK(t2.view_row_text(0) == "2");
+        CHECK(t2.view_row_text(1) == "3");
+        t2.scroll_view(-2);  // 最新に戻る
+        CHECK(t2.view_offset() == 0);
+        CHECK(t2.view_row_text(0) == "4");
+        CHECK(t2.view_row_text(1) == "5");
 
         // 広げるときは何も追い出さない。
         const int held = t2.scrollback_lines();
@@ -638,23 +648,54 @@ void test_resize_keeps_scrollback()
     {
         vt::Terminal t3(10, 4);
         std::vector<vt::Cell> sb3(10 * 50);
-        t3.set_scrollback(sb3.data(), 50);
+        t3.set_scrollback(sb3.data(), 50, 10);
         t3.write("\033[?1049h");  // 代替画面へ
         t3.write("a\r\nb\r\nc\r\nd");
         t3.resize(10, 2);
         CHECK(t3.scrollback_lines() == 0);
     }
 
+    // **確保時の桁数と食い違ったら積まない（#45）。** 呼び出し側は cols * max_lines で
+    // 確保しているので、桁数が増えたあとに現在の桁数でストライドすると踏み越える。
+    {
+        vt::Terminal t4(10, 3);
+        std::vector<vt::Cell> sb4(10 * 20);
+        t4.set_scrollback(sb4.data(), 20, 10);  // 10 桁で確保したと伝える
+        t4.write("a\r\nb\r\nc\r\nd");
+        CHECK(t4.scrollback_lines() == 1);
+        // 桁数を増やすと履歴は捨てられ、以後は積まれない（踏み越えない）。
+        t4.resize(14, 3);
+        CHECK(t4.scrollback_lines() == 0);
+        // **踏み越えが実際に起きる回数まで書く。** バッファは 10x20 = 200 Cell で、
+        // 14 桁で書くと h*14+14 > 200 すなわち 15 回目の push から外に出る。
+        // 3 行だけだとカナリアが無傷で、CI の ASan が何も検出しない。
+        for (int i = 0; i < 20; ++i) t4.write("\r\nx");
+        CHECK(t4.scrollback_lines() == 0);
+        // 元の桁数に戻せば再び積む。
+        t4.resize(10, 3);
+        t4.write("\r\nh\r\ni\r\nj");
+        CHECK(t4.scrollback_lines() > 0);
+    }
+
     // 桁数が変わったら捨てる（履歴は cols 単位で詰めてあるので使い回せない）。
     CHECK(t.scrollback_lines() == 4);
     t.resize(12, 4);
     CHECK(t.scrollback_lines() == 0);
-
-    // 同じ寸法なら何もしない（早期 return の経路）。
+    // **桁数が確保時と食い違ったままなので、以後は積まれない（#45）。**
+    // 呼び出し側は 10 桁で確保しているので、12 桁で書くと踏み越える。
     t.write("x\r\ny\r\nz\r\nw\r\nv");
+    CHECK(t.scrollback_lines() == 0);
+
+    // 確保時の桁数に戻せば再び積む。
+    t.resize(10, 4);
+    t.write("\r\np\r\nq\r\nr\r\ns");
     const int held = t.scrollback_lines();
     CHECK(held > 0);
-    t.resize(12, 4);
+
+    // 同じ寸法なら何もしない（早期 return の経路）。
+    // **held > 0 の状態で確かめる。** 0 のまま比べると 0 == 0 の空検査になり、
+    // 早期 return に履歴破棄を仕込んでも落ちない。
+    t.resize(10, 4);
     CHECK(t.scrollback_lines() == held);
 }
 
