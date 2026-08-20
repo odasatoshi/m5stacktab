@@ -1346,9 +1346,9 @@ int cmd_ppatest(int, char**)
     op.out.block_offset_x   = nx;
     op.out.block_offset_y   = ny;
     op.out.srm_cm           = PPA_SRM_COLOR_MODE_RGB565;
-    // rot の対応は時計回り 90 度なので、反時計回りで数える PPA では 270。
-    // rotate.cpp と必ず対で直す（push_row_ppa と同じ組み合わせにする）。
-    op.rotation_angle       = PPA_SRM_ROTATION_ANGLE_270;
+    // 定数は TermRenderer に 1 つだけ置いてある（複製すると片方が取り残される）。
+    op.rotation_angle       = static_cast<ppa_srm_rotation_angle_t>(
+        TermRenderer::ppa_rotation_angle());
     op.scale_x              = 1.0f;
     op.scale_y              = 1.0f;
     op.mode                 = PPA_TRANS_MODE_BLOCKING;
@@ -1393,6 +1393,66 @@ int cmd_ppatest(int, char**)
     heap_caps_free(src);
     ppa_unregister_client(client);
     return err == ESP_OK ? 0 : 1;
+}
+
+// **本番のレンダラ経路を通して**回転を判定する。
+//
+// rottest も ppatest も term_render.cpp の回転を守れない。rottest は純関数の
+// 写像だけを見るし、ppatest は PPA の設定を自前で組む。だから push_row_ppa の
+// 角度だけを 180 度ずらしても、あの 2 つは緑のまま通る（実機で確認済み）。
+// ユーザーが報告した症状を捕まえられるのはこのコマンドだけ。
+//
+// 判定には色つきの背景しか使わない。グリフの形に依存させるとフォントを
+// 変えたときに壊れるし、単色でも 180 度ずれれば位置が変わるので十分捕まる。
+// エスケープは C++ 側で組む。コンソール経由だと argv 分割で剥がれて再現できない。
+int cmd_termcheck(int, char**)
+{
+    TermGuard guard;
+    if (!guard.ok()) {
+        std::printf("busy\n");
+        return 1;
+    }
+    const int cw = renderer->cell_w();
+    const int ch = renderer->cell_h();
+    if (cw <= 0 || ch <= 0 || renderer->cols() < 106) {
+        std::printf("unexpected cell/grid size (%dx%d, cols %d)\n", cw, ch, renderer->cols());
+        return 1;
+    }
+
+    // 行 0: セル 0 が赤、セル 1 が緑。行 1: セル 0 が青。ほかは空。
+    term->write("\033[2J\033[H\033[41m \033[42m \033[m\r\n\033[44m \033[m");
+    renderer->render(*term, /*force=*/true);
+
+    // 期待色は kBase16 (xterm 標準 16 色) と同じ変換で作る。
+    const uint16_t red   = display.color565(205, 0, 0);
+    const uint16_t green = display.color565(0, 205, 0);
+    const uint16_t blue  = display.color565(0, 0, 238);
+
+    struct Probe {
+        int         lx, ly;
+        uint16_t    want;
+        const char* what;
+    };
+    const Probe probes[] = {
+        {cw / 2, ch / 2, red, "row0 cell0 = red"},
+        {cw + cw / 2, ch / 2, green, "row0 cell1 = green (red の右)"},
+        // 横方向に反転していれば、ここに赤が来て左端が黒になる。
+        {104 * cw + cw / 2, ch / 2, 0x0000, "row0 右端付近 = 黒"},
+        {cw / 2, ch + ch / 2, blue, "row1 cell0 = blue (row0 の下)"},
+        {cw / 2, 2 * ch + ch / 2, 0x0000, "row2 = 黒"},
+    };
+
+    int bad = 0;
+    for (const auto& pr : probes) {
+        const uint16_t got = display.readPixel(pr.lx, pr.ly);
+        const bool     ok  = (got == pr.want);
+        if (!ok) ++bad;
+        std::printf("  (%4d,%3d) want %04x got %04x  %-34s %s\n", pr.lx, pr.ly, pr.want, got,
+                    pr.what, ok ? "ok" : "MISMATCH");
+    }
+    std::printf("render path (vt100 -> sprite -> %s -> framebuffer): %s\n",
+                renderer->ppa_enabled() ? "PPA" : "pushSprite", bad == 0 ? "ok" : "FAILED");
+    return bad == 0 ? 0 : 1;
 }
 
 // 横向き座標の画素を読む。PPA でフレームバッファに直接書いた内容が
@@ -1466,21 +1526,24 @@ int cmd_rottest(int, char**)
         std::printf("rotation matches setRotation(1): ok\n");
     } else {
         // どの向きなら合うのかも出す。原因を当てる手間が要らなくなる。
-        std::printf("rotation MISMATCH (%d/4). 逆向き (nx = ly, ny = landscape_w-1-lx) を試す:\n",
-                    bad);
+        // 実際に起こる回帰は「90 度を逆向きに取る」= 変換後の点が 180 度ずれる形。
+        // 旧式をハードコードすると、旧式に戻したときに主判定と同じ点を読んで
+        // 情報がゼロになる。変換結果を 180 度回した点を試せば向きに依存しない。
+        std::printf("rotation MISMATCH (%d/4). 180 度回した点を試す:\n", bad);
         display.setRotation(0);
         int alt_bad = 0;
         for (const auto& pt : pts) {
-            // 反時計回り 90 度（この修正の前に入っていた式）。
-            const int nx2 = pt.ly;
-            const int ny2 = panel.landscape_w() - 1 - pt.lx;
+            int nx = 0, ny = 0;
+            rot::landscape_to_native(panel, pt.lx, pt.ly, &nx, &ny);
+            const int nx2 = panel.native_w - 1 - nx;
+            const int ny2 = panel.native_h - 1 - ny;
             const uint16_t got = display.readPixel(nx2, ny2);
             if (got != pt.color) ++alt_bad;
             std::printf("  %-13s native(%3d,%4d) want %04x got %04x\n", pt.name, nx2, ny2,
                         pt.color, got);
         }
         display.setRotation(1);
-        std::printf("  逆向きなら %d/4 一致\n", 4 - alt_bad);
+        std::printf("  180 度回した点なら %d/4 一致\n", 4 - alt_bad);
     }
     std::printf("run `termtest` or type to restore the terminal\n");
     return bad == 0 ? 0 : 1;
@@ -1510,6 +1573,8 @@ void register_term_commands()
         {"discoloop", "UDP ループバックで DISCO の Ping/Pong を往復させる", nullptr,
          &cmd_discoloop, nullptr, nullptr, nullptr},
         {"keytest", "sshkey パーティションの鍵を mbedTLS で直接パースする", nullptr, &cmd_keytest,
+         nullptr, nullptr, nullptr},
+        {"termcheck", "本番のレンダラ経路で描いて画素で回転を判定する", nullptr, &cmd_termcheck,
          nullptr, nullptr, nullptr},
         {"pix", "横向き座標の画素の色を読む", "<lx> <ly> ...", &cmd_pix, nullptr, nullptr, nullptr},
         {"rottest", "座標変換が setRotation(1) と一致するか実機で照合", nullptr, &cmd_rottest,

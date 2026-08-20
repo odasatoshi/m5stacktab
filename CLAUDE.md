@@ -65,8 +65,13 @@ python tools/serial_log.py --seconds 20      # ログ採取
   実機の `rottest` で M5GFX の rotation 1 と向きが一致することを照合できる
   （ピクセルを読み戻して自動判定する。目視の「白点が円の中にあれば ok」では
   **180 度ずれに気づけなかった**。四隅が対角の色を読んでいても円の中には見える）。
-  ただし **`rottest` は写像だけを見る。PPA の角度は見ていない**ので、
-  角度の側は `ppatest` で確かめる（非対称なブロックを転送して画素で判定する）
+  ただし **`rottest` は写像だけを見る。PPA の角度は見ていない**。
+  角度は `ppatest`、**本番の描画経路は `termcheck`** で確かめる。
+  `termcheck` は vt100 に色つきセルを書いてレンダラを通し、画素を読み戻す。
+  push_row_ppa の角度がずれても rottest と ppatest は緑のまま通るので、
+  実際の症状を捕まえられるのは `termcheck` だけ（実機で実証済み）。
+  PPA の角度の定数は `TermRenderer::ppa_rotation_angle()` にしか置かない
+  （複製すると片方が取り残される。実際に ppatest が取り残された）
 - **`rot` の変換と PPA の `rotation_angle` は必ず対で直す**。PPA の角度は反時計回りなので、
   `landscape_to_native` の時計回り 90 度に対応するのは `PPA_SRM_ROTATION_ANGLE_270`。
   片方だけ変えるとブロックの位置は合うのに中身が 180 度回る。

@@ -182,17 +182,26 @@ ppa angle check: left f800 (want f800) right 001f (want 001f) ok
 ppa angle check: left 001f (want f800) right f800 (want 001f) SWAPPED - rotation_angle が rot と食い違っている
 ```
 
-端末 (PPA 経路) の位置と向きは `pix` で確かめる。
+**本番の描画経路**（vt100 → スプライト → PPA → フレームバッファ）は `termcheck` が判定する。
+`rottest` は純関数の写像、`ppatest` は自前の PPA 設定しか見ないので、
+**push_row_ppa の角度がずれてもあの 2 つは緑のまま通る**（実機で確認済み）。
+ユーザーが報告した症状を捕まえられるのは `termcheck` だけ。
+
+エスケープは実機側で組むので、シリアル越しのクォートで壊れることがない。
 
 ```sh
-printf 'term \\e[2J\\e[H\\e[41m \\e[42m \\e[mT\r\n' > /dev/cu.usbmodem101
-printf 'pix 6 12 18 12 6 40 26 6 26 18\r\n' > /dev/cu.usbmodem101
+printf 'termcheck\r\n' > /dev/cu.usbmodem101
 ```
 
 ```
-  (   6,  12) = c800   セル(0,0) が赤
-  (  18,  12) = 0660   セル(1,0) が緑（赤の右）
-  (   6,  40) = 0000   行 1 は空（行 0 が上）
-  (  26,   6) = e73c   T の横棒はセル上部
-  (  26,  18) = 0000   その下は空
+  (   6, 12) want c800 got c800  row0 cell0 = red                   ok
+  (  18, 12) want 0660 got 0660  row0 cell1 = green (red の右)      ok
+  (1254, 12) want 0000 got 0000  row0 右端付近 = 黒                 ok
+  (   6, 36) want 001d got 001d  row1 cell0 = blue (row0 の下)      ok
+  (   6, 60) want 0000 got 0000  row2 = 黒                          ok
+render path (vt100 -> sprite -> PPA -> framebuffer): ok
 ```
+
+角度だけを `ANGLE_90` に戻すと、右端に緑が来て（横方向の反転）`FAILED` になる。
+
+任意の座標の色を見たいときは `pix <lx> <ly> ...`。
