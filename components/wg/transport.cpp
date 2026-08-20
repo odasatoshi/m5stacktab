@@ -34,7 +34,7 @@ uint32_t load_le32(const uint8_t* p)
 
 }  // namespace
 
-void Transport::set_keypair(const Keypair& kp)
+void Transport::set_keypair(const Keypair& kp, int64_t now_us)
 {
     // 今の世代を 1 つ前に降格する。捨ててしまうと、相手がまだ古い鍵で送っている間の
     // パケットが全部復号できなくなる（rekey が交差すると数秒間そうなる）。
@@ -47,11 +47,21 @@ void Transport::set_keypair(const Keypair& kp)
 
     cur_              = SessionState{};
     cur_.kp           = kp;
+    cur_.born_us      = now_us;
     cur_.valid        = true;
     cur_.confirmed    = kp.initiator;
     cur_.send_counter = 0;
     cur_.recv_max     = 0;
     std::memset(cur_.window, 0, sizeof(cur_.window));
+}
+
+bool Transport::expire_previous(int64_t now_us)
+{
+    if (!prev_.valid) return false;
+    if (now_us - prev_.born_us < kRejectAfterUs) return false;
+    // 相手はもうこの鍵を捨てている。送るのも復号を試すのも無駄。
+    prev_ = SessionState{};
+    return true;
 }
 
 SessionState* Transport::sending_session()
