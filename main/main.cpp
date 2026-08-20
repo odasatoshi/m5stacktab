@@ -2048,8 +2048,10 @@ extern "C" void app_main(void)
     const int keyboard_h = avail - term_rows * renderer->cell_h();
     keyboard->begin(keyboard_h);
     renderer->set_rows(term_rows);
-    ESP_LOGI(TAG, "status %d px, terminal %d rows, keyboard %d px (no gap)", s_status_h, term_rows,
-             keyboard_h);
+    // ここで出すのは「キーボードを出したときの配分」。起動直後はメニューを出して
+    // キーボードを隠すので、実際の行数はこれと違う（下で apply_layout が決める）。
+    ESP_LOGI(TAG, "layout with keyboard: status %d px, terminal %d rows, keyboard %d px (no gap)",
+             s_status_h, term_rows, keyboard_h);
 
     // 回転を PPA に任せる（使えなければ従来の経路にとどまる）。
     if (renderer->enable_ppa()) {
@@ -2151,6 +2153,7 @@ extern "C" void app_main(void)
     // set_menu_visible が全部やる。ここで先に描くと、配分が決まる前の高さで
     // 描いた操作説明が下に取り残される（実機で確認）。
     set_menu_visible(true);
+    ESP_LOGI(TAG, "boot state: menu shown, terminal %dx%d", renderer->cols(), renderer->rows());
 
     // 描画とタッチのポーリング。キーボードが来るまではタッチが唯一の直接入力手段。
     int  last_log_s = 0;
