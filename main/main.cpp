@@ -110,11 +110,19 @@ std::unique_ptr<MenuUi>        menu;
 // ステータスバーに使う高さ。セル 1 行ぶんにして端末のグリッドに合わせる。
 int                            s_status_h = 0;
 
-// キーボードの表示を切り替えたときにメニューの領域を張り直す（定義は下）。
-void update_menu_area();
+// 画面の配分を張り直す（定義は下）。ステータスバー / 端末 / キーボードの
+// 高さの計算はここ 1 箇所しかない。分散させると片方だけ直して重なる。
+void apply_layout();
+// メニューの表示を切り替える。キーボードの表示と端末の行数も一緒に動く。
+void set_menu_visible(bool show);
+// メニュー表示中は端末を描かない（メニューの矩形を上書きしてしまう）。
+void render_term(bool force = false);
 
 // ステータスバーを見に行った最後の時刻。C6 への RPC なので毎フレームは叩かない。
 int64_t s_last_status_us = 0;
+// ステータスバーのタップ判定の高さ。描画は s_status_h (24px) だが、指で当てるには
+// 狭すぎるので判定だけ広げる（24px は 3.5mm しかない）。
+constexpr int kStatusTapH = 56;
 
 // M5GFX はパネル・タッチの判別結果を NVS にキャッシュする。NVS を初期化しておかないと
 // 毎起動でフルプローブ（タッチ IC のファームウェア待ちを含む）が走る。
@@ -202,7 +210,7 @@ int cmd_term(int argc, char** argv)
         return 1;
     }
     term->write(s);
-    renderer->render(*term);
+    render_term();
     // 計測値もロックの中で読む。外に出すとメインループの render に上書きされる。
     std::printf("wrote %d bytes, redrew %d rows in %u us (draw %u / push %u)\n", (int)s.size(),
                 renderer->last_rows_drawn(), (unsigned)renderer->last_render_us(),
@@ -269,7 +277,7 @@ int cmd_termscroll(int, char**)
         std::snprintf(buf, sizeof(buf), "scroll line %d あいう\r\n", i);
         term->write(buf);
     }
-    renderer->render(*term);
+    render_term();
     std::printf("redrew %d rows in %u us (draw %u / push %u)\n", renderer->last_rows_drawn(),
                 (unsigned)renderer->last_render_us(), (unsigned)renderer->last_draw_us(),
                 (unsigned)renderer->last_push_us());
@@ -428,7 +436,7 @@ int cmd_conv(int argc, char** argv)
     {
         TermGuard guard;
         term->write(line);
-        renderer->render(*term);
+        render_term();
     }
     return 0;
 }
@@ -439,7 +447,7 @@ int cmd_scroll(int argc, char** argv)
     const int delta = (argc > 1) ? atoi(argv[1]) : 3;
     TermGuard guard;
     const int moved = term->scroll_view(delta);
-    renderer->render(*term, /*force=*/true);
+    render_term(/*force=*/true);
     std::printf("moved %d (offset %d / %d lines held)\n", moved, term->view_offset(),
                 term->scrollback_lines());
     return 0;
@@ -492,7 +500,7 @@ int cmd_ssh(int argc, char** argv)
         TermGuard guard;
         term->write("\r\n\033[33mconnecting to ");
         term->write(cfg.user + "@" + cfg.host + "...\033[m\r\n");
-        renderer->render(*term);
+        render_term();
     }
 
     esp_err_t err = ssh_connect(cfg, renderer->cols(), renderer->rows());
@@ -541,7 +549,7 @@ int cmd_bench(int, char**)
 {
     // 計測中に別タスクが描画すると値が混ざるので、区間全体を押さえる。
     TermGuard guard;
-    renderer->render(*term, /*force=*/true);
+    render_term(/*force=*/true);
     const uint32_t full_us = renderer->last_render_us();
     const uint32_t full_px = renderer->last_pixels();
 
@@ -549,12 +557,12 @@ int cmd_bench(int, char**)
     uint32_t typing_us = 0, typing_px = 0;
     for (int i = 0; i < 20; ++i) {
         term->write("x");
-        renderer->render(*term);
+        render_term();
         typing_us += renderer->last_render_us();
         typing_px += renderer->last_pixels();
     }
     term->write("\r\n");
-    renderer->render(*term);
+    render_term();
 
     std::printf("full screen: %u us (%u px)\n", (unsigned)full_us, (unsigned)full_px);
     std::printf("20 keystrokes: %u us total, %u us each (%u px each)\n", (unsigned)typing_us,
@@ -565,18 +573,22 @@ int cmd_bench(int, char**)
 int cmd_kbd(int argc, char** argv)
 {
     const bool show = (argc < 2) || (std::string(argv[1]) != "off");
-    TermGuard guard;
+    TermGuard  guard;
+    if (!guard.ok()) {
+        std::printf("busy\n");
+        return 1;
+    }
+    if (menu && menu->visible()) {
+        // メニュー表示中はキーボードを隠している。ここで出すと配分が食い違う。
+        std::printf("menu is shown (menu hide してから)\n");
+        return 1;
+    }
     keyboard->set_visible(show);
-    // 隠したら画面全体を端末に使う。端末側の行数と PTY サイズも合わせる。
-    const int rows = show ? (display.height() - keyboard->height()) / renderer->cell_h()
-                          : renderer->full_rows();
-    renderer->set_rows(rows);
-    term->resize(renderer->cols(), rows);
-    if (ssh_is_connected()) ssh_resize(renderer->cols(), rows);
-    update_menu_area();
+    apply_layout();
+    keyboard->draw();
     renderer->render(*term, /*force=*/true);
-    if (menu && menu->visible()) menu->draw(/*force=*/true);
-    std::printf("keyboard %s, terminal %dx%d\n", show ? "shown" : "hidden", renderer->cols(), rows);
+    std::printf("keyboard %s, terminal %dx%d\n", show ? "shown" : "hidden", renderer->cols(),
+                renderer->rows());
     return 0;
 }
 
@@ -665,7 +677,7 @@ void ts_task(void* arg)
 {
     auto* client = static_cast<ts::Client*>(arg);
     const bool ok = client->run_once();
-    // 同じタスクなので status() を参照で受けて安全。
+    // run_once() から戻ったあとなので、この参照を書き換える者はもういない。
     const auto& st = client->status();
     ESP_LOGI(TAG, "ts finished: %s state=%d registered=%d map_messages=%u", ok ? "ok" : "failed",
              (int)st.state, st.registered ? 1 : 0, (unsigned)st.map_messages);
@@ -678,7 +690,7 @@ void ts_task(void* arg)
         TermGuard guard;
         if (guard.ok()) {
             term->write(line);
-            renderer->render(*term);
+            render_term();
         }
     }
     if (!st.error.empty()) ESP_LOGW(TAG, "ts: %s", st.error.c_str());
@@ -838,7 +850,11 @@ StatusBar::Info gather_status()
     // **値で受ける。** ts タスクが st_ の std::string を書くので、参照のまま
     // c_str() を触ると読んでいる最中に解放され得る。
     const ts::ClientStatus ts = s_ts_client ? s_ts_client->snapshot() : ts::ClientStatus{};
-    info.vpn = ui::vpn_state(s_ts_task != nullptr, ts.registered, nif.is_up(),
+    // **registered は走っている間だけ見る。** st_.registered は false に戻らないので、
+    // そのまま渡すと ts を一度動かしただけで「VPN ...」が永久に黄色のまま残り、
+    // 同じ画面のメニュー側 ("Tailscale: stopped") と食い違う。
+    const bool ts_running = (s_ts_task != nullptr);
+    info.vpn = ui::vpn_state(ts_running, ts_running && ts.registered, nif.is_up(),
                              nif.handshake_done());
     if (!ts.assigned_address.empty()) {
         std::snprintf(info.vpn_ip, sizeof(info.vpn_ip), "%s", ts.assigned_address.c_str());
@@ -846,7 +862,7 @@ StatusBar::Info gather_status()
     return info;
 }
 
-MenuUi::Info gather_menu_info()
+MenuUi::Info gather_menu_info(const StatusBar::Info& si)
 {
     MenuUi::Info mi{};
     SshConfig    cfg;
@@ -866,17 +882,59 @@ MenuUi::Info gather_menu_info()
     std::snprintf(mi.wg_state, sizeof(mi.wg_state), "%s", !nif.is_up() ? "down"
                                                           : nif.handshake_done() ? "up"
                                                                                  : "no handshake");
-    const StatusBar::Info si = gather_status();
     std::snprintf(mi.wifi, sizeof(mi.wifi), "%s", si.wifi_up ? si.ssid : "(未接続)");
     return mi;
 }
 
-// メニューの領域はキーボードの表示に合わせて変わる。
-void update_menu_area()
+// 画面の配分を張り直す。
+//
+// **高さの計算はここだけに置く。** 以前は起動時と `kbd` コマンドで別々に
+// 計算していて、`kbd` 側がステータスバーの分を引いていなかったため、
+// 端末の最下行が IME の候補帯に 24px 重なっていた。
+//
+// メニューを出している間はキーボードを隠す。隠さないと、メニューはキーボードの
+// 領域を覆わないので指でキーを押せてしまい、その出力が端末経由でメニューの
+// 矩形に描かれて表示が崩れる（かつ押した文字は見えないまま端末に入る）。
+void apply_layout()
+{
+    if (!renderer || !keyboard) return;
+    // **キーボードの表示はここで決めない。** 決めると `kbd off` を上書きしてしまう。
+    // 表示を変えたい側（set_menu_visible / cmd_kbd）が先に set_visible してから呼ぶ。
+    const int avail = (int)display.height() - s_status_h;
+    const int rows  = keyboard->visible()
+                          ? (avail - keyboard->height()) / renderer->cell_h()
+                          : avail / renderer->cell_h();
+    renderer->set_rows(rows);
+    if (term) term->resize(renderer->cols(), rows);
+    if (ssh_is_connected()) ssh_resize(renderer->cols(), rows);
+    if (menu) menu->set_area(s_status_h, avail - keyboard->height());
+}
+
+void render_term(bool force)
+{
+    if (!renderer || !term) return;
+    // メニューが開いている間は描かない。term->write は続けるので内容は
+    // 失われず、閉じるときの force render で追いつく。
+    if (menu && menu->visible()) return;
+    renderer->render(*term, force);
+}
+
+void set_menu_visible(bool show)
 {
     if (!menu) return;
-    const int top = s_status_h;
-    menu->set_area(top, (int)display.height() - top - keyboard->height());
+    menu->set_visible(show);
+    // メニューはキーボードの領域を覆わないので、隠さないと指でキーを押せてしまう。
+    // ponytail: 端末に戻るときは必ずキーボードを出す（`kbd off` の状態は覚えない）。
+    // メニューから端末に入る流れでは打ちたいはずなので、今はこれで足りる。
+    keyboard->set_visible(!show);
+    if (show) menu->set_info(gather_menu_info(gather_status()));
+    apply_layout();
+    if (show) {
+        menu->draw(/*force=*/true);
+    } else {
+        keyboard->draw();
+        renderer->render(*term, /*force=*/true);
+    }
 }
 
 // メニューの操作。#15 の純正キーボードが来るまでは、上下や Enter を送る手段が
@@ -896,15 +954,9 @@ int cmd_menu(int argc, char** argv)
     }
     if (a == "show" || a == "hide") {
         const bool show = (a == "show");
-        menu->set_visible(show);
-        if (show) {
-            menu->set_info(gather_menu_info());
-            update_menu_area();
-            menu->draw(/*force=*/true);
-        } else {
-            renderer->render(*term, /*force=*/true);
-        }
-        std::printf("menu %s\n", show ? "shown" : "hidden");
+        set_menu_visible(show);
+        std::printf("menu %s, terminal %dx%d\n", show ? "shown" : "hidden", renderer->cols(),
+                    renderer->rows());
         return 0;
     }
     if (!menu->visible()) {
@@ -922,11 +974,10 @@ int cmd_menu(int argc, char** argv)
         std::printf("usage: menu [show|hide|up|down|enter|esc|left|right]\n");
         return 1;
     }
-    menu->set_info(gather_menu_info());
+    menu->set_info(gather_menu_info(gather_status()));
+    menu->refresh();
     menu->key(k);
     menu->draw();
-    // 動作で端末に移っていたら、端末を描き直す。
-    if (!menu->visible()) renderer->render(*term, /*force=*/true);
     return 0;
 }
 
@@ -1665,6 +1716,8 @@ int cmd_ppatest(int, char**)
     }
     heap_caps_free(src);
     ppa_unregister_client(client);
+    // フレームバッファを直接叩いたのでステータスバーを描き直す。
+    status_bar->draw(gather_status(), /*force=*/true);
     return err == ESP_OK ? 0 : 1;
 }
 
@@ -1751,7 +1804,7 @@ int cmd_termcheck(int, char**)
 
     // 行 0: セル 0 が赤、セル 1 が緑。行 1: セル 0 が青。ほかは空。
     term->write("\033[2J\033[H\033[41m \033[42m \033[m\r\n\033[44m \033[m");
-    renderer->render(*term, /*force=*/true);
+    render_term(/*force=*/true);
 
     // 期待色は kBase16 (xterm 標準 16 色) と同じ変換で作る。
     const uint16_t red   = display.color565(205, 0, 0);
@@ -1782,6 +1835,7 @@ int cmd_termcheck(int, char**)
     }
     std::printf("render path (vt100 -> sprite -> %s -> framebuffer): %s\n",
                 renderer->ppa_enabled() ? "PPA" : "pushSprite", bad == 0 ? "ok" : "FAILED");
+    status_bar->draw(gather_status(), /*force=*/true);
     return bad == 0 ? 0 : 1;
 }
 
@@ -1875,6 +1929,8 @@ int cmd_rottest(int, char**)
         display.setRotation(1);
         std::printf("  180 度回した点なら %d/4 一致\n", 4 - alt_bad);
     }
+    // 画面を塗り潰したのでステータスバーを描き直す（誰も描き直さない）。
+    status_bar->draw(gather_status(), /*force=*/true);
     std::printf("run `termtest` or type to restore the terminal\n");
     return bad == 0 ? 0 : 1;
 }
@@ -2028,17 +2084,17 @@ extern "C" void app_main(void)
         switch (a) {
             case MenuUi::Action::kOpenSsh: {
                 menu->set_visible(false);
-                renderer->render(*term, /*force=*/true);
+                render_term(/*force=*/true);
                 // 保存済みの設定で繋ぐ。無ければ端末にそう出す。
                 SshConfig cfg;
                 if (ssh_config_load(cfg) != ESP_OK || cfg.host.empty()) {
                     term->write("\r\n\033[33mno saved connection: use `ssh <user> <host>`\033[m\r\n");
-                    renderer->render(*term);
+                    render_term();
                     break;
                 }
                 term->write("\r\n\033[33mconnecting to " + cfg.user + "@" + cfg.host +
                             "...\033[m\r\n");
-                renderer->render(*term);
+                render_term();
                 if (esp_err_t err = ssh_connect(cfg, renderer->cols(), renderer->rows());
                     err != ESP_OK) {
                     ESP_LOGE(TAG, "ssh_connect failed: %s (%s)", esp_err_to_name(err),
@@ -2048,7 +2104,7 @@ extern "C" void app_main(void)
             }
             case MenuUi::Action::kShowTerminal:
                 menu->set_visible(false);
-                renderer->render(*term, /*force=*/true);
+                render_term(/*force=*/true);
                 break;
             case MenuUi::Action::kTsConnect:
             case MenuUi::Action::kWgUp:
@@ -2057,9 +2113,9 @@ extern "C" void app_main(void)
                 break;
         }
     });
-    menu->set_info(gather_menu_info());
+    menu->set_info(gather_menu_info(gather_status()));
     menu->set_visible(true);
-    // 描画はキーボードの表示が決まってから（下の update_menu_area で行う）。
+    // 描画はキーボードの表示が決まってから（下の apply_layout で行う）。
 
     keyboard->set_output([](const std::string& s) {
         if (ssh_is_connected()) {
@@ -2067,7 +2123,7 @@ extern "C" void app_main(void)
         } else {
             TermGuard guard;
             term->write(s);
-            renderer->render(*term);
+            render_term();
         }
     });
 
@@ -2080,11 +2136,10 @@ extern "C" void app_main(void)
 
     // 辞書が書き込まれていればキーボードの変換に使う。
     if (dict_open()) keyboard->set_dict(&s_dict);
-    keyboard->set_visible(true);
-    // **キーボードを出したあとにメニューの領域を張り直す。** 先に描いてしまうと、
-    // キーボードが無い前提の高さで描いた操作説明が下に取り残される（実機で確認）。
-    update_menu_area();
-    menu->draw(/*force=*/true);
+    // 電源投入時はメニュー。配分（キーボードを隠す・端末の行数）と描画は
+    // set_menu_visible が全部やる。ここで先に描くと、配分が決まる前の高さで
+    // 描いた操作説明が下に取り残される（実機で確認）。
+    set_menu_visible(true);
 
     // 描画とタッチのポーリング。キーボードが来るまではタッチが唯一の直接入力手段。
     int  last_log_s = 0;
@@ -2093,33 +2148,48 @@ extern "C" void app_main(void)
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(20));
 
+        // **状態集めはロックの外でやる。** gather_status は C6 への SDIO RPC、
+        // gather_menu_info は NVS 読みを含む。s_term_lock を握ったままやると、
+        // コンソール側の描画コマンドが TermGuard の 2 秒タイムアウトに落ちるし、
+        // 同じループでポーリングしているタッチも取りこぼす。
+        const int64_t   now_us = esp_timer_get_time();
+        const bool      poll   = (now_us - s_last_status_us > 1000000);
+        StatusBar::Info si;
+        MenuUi::Info    mi;
+        if (poll) {
+            s_last_status_us = now_us;
+            si               = gather_status();
+            mi               = gather_menu_info(si);
+        }
+
         // リモートからの出力を端末に流す。コンソールタスクも term を触るのでロックする。
         {
             TermGuard guard;
             if (guard.ok()) {
-                uint8_t rx[1024];
-                for (;;) {
+                // **1 フレームで飲み込む量に上限を付ける (#40)。** 上限が無いと、
+                // 高速に流れる出力（`seq 1 20000` など）でこのタスクが数秒 CPU を
+                // 離さず、IDLE0 が回らなくて task_wdt が出る（実機で確認）。
+                // 上限を超えた分は SSH のストリームバッファに残り、ssh タスクが
+                // xStreamBufferSend で待つので**取りこぼしにはならない**（backpressure）。
+                // 1024B x 16 = 16KB/フレーム、50Hz で 800KB/s。端末には十分。
+                uint8_t           rx[1024];
+                constexpr int     kMaxDrainPerFrame = 16;
+                for (int i = 0; i < kMaxDrainPerFrame; ++i) {
                     size_t n = ssh_receive(rx, sizeof(rx));
                     if (n == 0) break;
                     term->write(rx, n);
                 }
-                // ステータスバーは 1 秒に 1 回だけ見る。esp_wifi_sta_get_ap_info は
-                // C6 への SDIO RPC なので、50Hz で叩くと無駄に重い。
                 // 描画は中身が変わったときだけ（PPA は転送のたびに出力側の
                 // キャッシュを無効化するので、毎フレーム描くと端末の描画と競合する）。
-                const int64_t now_us = esp_timer_get_time();
-                if (now_us - s_last_status_us > 1000000) {
-                    s_last_status_us = now_us;
-                    if (status_bar->draw(gather_status()) && menu->visible()) {
-                        // 状態が変わったときだけメニューの表示も作り直す。
-                        menu->set_info(gather_menu_info());
-                        menu->refresh();
-                    }
+                if (poll && status_bar->draw(si) && menu->visible()) {
+                    // 状態が変わったときだけメニューの表示も作り直す。
+                    menu->set_info(mi);
+                    menu->refresh();
                 }
                 if (menu->visible()) {
                     menu->draw();
                 } else if (term->any_dirty()) {
-                    renderer->render(*term);
+                    render_term();
                 }
             }
         }
@@ -2133,22 +2203,14 @@ extern "C" void app_main(void)
                 touching = true;
                 last_x   = tp.x;
                 last_y   = tp.y;
-                if (tp.y < s_status_h) {
+                if (tp.y < kStatusTapH) {
                     // ステータスバーをタップでメニューを開閉する。純正キーボードが
-                    // 来るまで、指だけでメニューに戻れる経路はここだけ。
-                    const bool show = !menu->visible();
-                    menu->set_visible(show);
-                    if (show) {
-                        menu->set_info(gather_menu_info());
-                        update_menu_area();
-                        menu->draw(/*force=*/true);
-                    } else {
-                        renderer->render(*term, /*force=*/true);
-                    }
-                } else if (menu->visible() && menu->touch_down(tp.x, tp.y)) {
-                    menu->draw();
-                    // 選んだ結果メニューが閉じたら端末を描き直す。
-                    if (!menu->visible()) renderer->render(*term, /*force=*/true);
+                    // 来るまで、指だけでメニューに戻れる経路はここだけなので、
+                    // 当たり判定は描画（24px）より広く取る。24px は 3.5mm しかない。
+                    set_menu_visible(!menu->visible());
+                } else if (menu->visible()) {
+                    // メニュー表示中はキーボードを隠しているので、ここで全部食う。
+                    if (menu->touch_down(tp.x, tp.y)) menu->draw();
                 } else if (!keyboard->touch_down(tp.x, tp.y)) {
                     // キーボード外 = 端末領域。
                     // ponytail: スワイプでスクロールバックを見る動作は未実装。

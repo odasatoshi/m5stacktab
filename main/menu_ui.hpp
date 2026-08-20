@@ -28,6 +28,9 @@ public:
     };
 
     explicit MenuUi(M5GFX& gfx) : gfx_(gfx) {}
+    // items_ が自分の labels_ を指しているので、コピーすると原本を指してしまう。
+    MenuUi(const MenuUi&)            = delete;
+    MenuUi& operator=(const MenuUi&) = delete;
 
     // メニューに使う領域。上はステータスバー、下はキーボード（表示中なら）。
     // キーボードの表示を切り替えたら呼び直す。

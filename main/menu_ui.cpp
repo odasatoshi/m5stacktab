@@ -17,6 +17,7 @@ enum : int {
     kIdTs       = 10,
     kIdWg       = 11,
     kIdTerminal = 12,
+    kIdBack     = 99,
 };
 
 }  // namespace
@@ -85,6 +86,9 @@ void MenuUi::rebuild()
             std::snprintf(buf, sizeof(buf), "WireGuard: %s", info_.wg_state);
             add(buf, kIdWg, false);
             add("(接続はシリアルの ts / wg から)", 0, false);
+            // 指だけで戻れる経路。全項目が状態表示だと hit_test が常に -1 になり、
+            // Esc を送る手段（シリアル）が無いと出られない。
+            add("< Back", kIdBack, true);
             break;
         case Screen::kSettings:
             // ponytail: 読み取り専用。編集はキーボード (#15) が来てから。
@@ -94,6 +98,7 @@ void MenuUi::rebuild()
                           info_.ssh_target[0] ? info_.ssh_target : "(未設定)");
             add(buf, 0, false);
             add("(設定はシリアルの wifi / ssh から)", 0, false);
+            add("< Back", kIdBack, true);
             break;
     }
     menu_.set_items(items_, n);
@@ -131,6 +136,7 @@ void MenuUi::activate(int id)
         case kIdWg:
             if (action_) action_(Action::kWgUp);
             break;
+        case kIdBack: enter(Screen::kRoot); break;
         default: break;
     }
 }
@@ -152,7 +158,7 @@ bool MenuUi::touch_down(int x, int y)
 
 void MenuUi::draw(bool force)
 {
-    if (!visible_) return;
+    if (!visible_ || height_ <= 0) return;  // set_area 前に描くとバーの上に出る
     if (!dirty_ && !force) return;
     dirty_ = false;
 

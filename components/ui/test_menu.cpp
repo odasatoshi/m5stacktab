@@ -122,6 +122,40 @@ void test_hit_test()
     CHECK(m2.hit_test(40, 0, 40) == 1);
 }
 
+// MenuUi::refresh() が依存している組み合わせ。set_items で選択が 0 に戻り、
+// set_selected で復元する。復元先が選べない項目なら 0 のまま（黙って化けない）。
+void test_reselect_after_set_items()
+{
+    ui::Menu m;
+    m.set_items(kRoot, 3);
+    m.key(ui::Key::kDown);
+    m.key(ui::Key::kDown);
+    CHECK(m.selected() == 2);
+
+    // 作り直すと先頭に戻る
+    m.set_items(kRoot, 3);
+    CHECK(m.selected() == 0);
+    // 復元できる
+    m.set_selected(2);
+    CHECK(m.selected() == 2);
+
+    // set_items は取り出されていない Enter / Esc を捨てる。
+    // 捨てないと、画面を作り直した直後に前の画面の決定が発火する。
+    m.key(ui::Key::kEnter);
+    m.set_items(kRoot, 3);
+    CHECK(m.take_activated() == -1);
+    m.key(ui::Key::kEsc);
+    m.set_items(kRoot, 3);
+    CHECK(!m.take_back());
+
+    // 復元先が選べない項目なら動かさない
+    const ui::Item items[] = {{"a", 1, true}, {"head", 0, false}};
+    m.set_items(items, 2);
+    CHECK(m.selected() == 0);
+    m.set_selected(1);
+    CHECK(m.selected() == 0);
+}
+
 void test_bounds()
 {
     ui::Menu m;
@@ -176,6 +210,7 @@ int main()
     test_navigation();
     test_disabled_items();
     test_hit_test();
+    test_reselect_after_set_items();
     test_bounds();
     test_vpn_state();
     if (g_fails) {

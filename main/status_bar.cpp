@@ -9,7 +9,10 @@ constexpr uint16_t kBg = 0x2104;  // 端末の黒と区別できる暗い灰
 
 bool StatusBar::Info::operator==(const Info& o) const
 {
-    return wifi_up == o.wifi_up && rssi == o.rssi && vpn == o.vpn &&
+    // **RSSI は 10dBm 単位で比べる。** 1dBm ごとに差分ありと判定すると、
+    // 揺れるだけでほぼ毎秒「状態が変わった」ことになり、呼び出し側が
+    // メニューの全面再描画と C6 への RPC をやり直してしまう。
+    return wifi_up == o.wifi_up && (rssi / 10) == (o.rssi / 10) && vpn == o.vpn &&
            std::strcmp(ssid, o.ssid) == 0 && std::strcmp(ip, o.ip) == 0 &&
            std::strcmp(vpn_ip, o.vpn_ip) == 0;
 }
