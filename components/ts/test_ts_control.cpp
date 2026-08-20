@@ -220,11 +220,16 @@ void test_map_request()
     CHECK(s.find("\"Compress\":\"\"") != std::string::npos);
     CHECK(s.find("\"Endpoints\":[\"192.168.0.29:41641\",\"10.0.0.5:41641\"]") != std::string::npos);
     CHECK(s.find("\"EndpointTypes\":[1,1]") != std::string::npos);
-    // PreferredDERP は 0 なら入れない
-    CHECK(s.find("NetInfo") == std::string::npos);
+    // NetInfo は常に入れる。無いと Headscale がエンドポイントをピアに配らない。
+    CHECK(s.find("\"NetInfo\":{\"PreferredDERP\":0") != std::string::npos);
+    CHECK(s.find("\"WorkingUDP\":true") != std::string::npos);
+    CHECK(s.find("\"LinkType\":\"wifi\"") != std::string::npos);
+    // NetInfo は Hostinfo の中に入っていること（外に出すと無視される）
+    CHECK(s.find("\"Hostinfo\":{") < s.find("\"NetInfo\":"));
+    CHECK(s.find("\"NetInfo\":") < s.find("\"Endpoints\":"));
 
     p.preferred_derp = 12;
-    CHECK(ts::build_map_request(p).find("\"NetInfo\":{\"PreferredDERP\":12}") != std::string::npos);
+    CHECK(ts::build_map_request(p).find("\"NetInfo\":{\"PreferredDERP\":12") != std::string::npos);
 
     // エンドポイントが無ければキー自体を出さない
     p.endpoints.clear();

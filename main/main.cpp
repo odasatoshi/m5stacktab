@@ -642,6 +642,31 @@ int cmd_wgtest(int, char**)
 
 // Tailscale / Headscale の制御プレーンに繋いでみる。
 // 鍵は NVS に保存して再利用する（毎回新しい鍵だとノードが増え続ける）。
+// ts は別タスクで走らせる（下の cmd_ts のコメント参照）。
+TaskHandle_t s_ts_task    = nullptr;
+ts::Client*  s_ts_client  = nullptr;
+int64_t      s_ts_started_us = 0;
+
+void ts_task(void* arg)
+{
+    auto* client = static_cast<ts::Client*>(arg);
+    const bool ok = client->run_once();
+    const auto& st = client->status();
+    ESP_LOGI(TAG, "ts finished: %s state=%d registered=%d map_messages=%u", ok ? "ok" : "failed",
+             (int)st.state, st.registered ? 1 : 0, (unsigned)st.map_messages);
+    if (!st.assigned_address.empty()) {
+        std::string line = "\r\n\033[32mtailscale: " + st.assigned_address + "\033[m\r\n";
+        TermGuard guard;
+        if (guard.ok()) {
+            term->write(line);
+            renderer->render(*term);
+        }
+    }
+    if (!st.error.empty()) ESP_LOGW(TAG, "ts: %s", st.error.c_str());
+    s_ts_task = nullptr;
+    vTaskDelete(nullptr);
+}
+
 int cmd_ts(int argc, char** argv)
 {
     if (argc < 3) {
@@ -689,6 +714,7 @@ int cmd_ts(int argc, char** argv)
     }
 
     static ts::Client client;
+    s_ts_client = &client;
     ts::ClientConfig  cfg;
     cfg.host     = argv[1];
     cfg.auth_key = argv[2];
@@ -718,26 +744,55 @@ int cmd_ts(int argc, char** argv)
         register_disco_peers(map);
     });
 
-    std::printf("connecting to %s:%u (capver %u)...\n", cfg.host.c_str(), cfg.port,
+    // **別タスクで走らせる。** run_once() は map の long-poll を最長 600 秒
+    // 保持する（それが正しい動作で、DISCO の往復はこのストリームが開いている
+    // 間に起きる）。コンソールタスクから呼ぶと 10 分間 REPL が死んで、
+    // ストリームを開けたまま `wg disco` を見ることすらできない。
+    if (s_ts_task) {
+        std::printf("already running (ts-status で状態、ts-stop で停止)\n");
+        return 1;
+    }
+    std::printf("connecting to %s:%u (capver %u) in background...\n", cfg.host.c_str(), cfg.port,
                 cfg.capability_version);
-    const int64_t t0 = esp_timer_get_time();
-    const bool    ok = client.run_once();
-    const auto&   st = client.status();
-    std::printf("result: %s (%lld ms)\n", ok ? "ok" : "failed", (esp_timer_get_time() - t0) / 1000);
-    // REPL タスクのスタックがどこまで減ったか（X25519 と HTTP/2 のバッファが重なる経路）。
-    std::printf("  console task stack headroom: %u bytes\n",
-                (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+    s_ts_started_us = esp_timer_get_time();
+    // X25519 が 1 回で 10KB 近く使い、HTTP/2 のバッファも重なるので広く取る。
+    if (xTaskCreate(&ts_task, "ts", 32768, &client, 5, &s_ts_task) != pdPASS) {
+        s_ts_task = nullptr;
+        std::printf("xTaskCreate failed\n");
+        return 1;
+    }
+    return 0;
+}
+
+// ts の状態を見る。long-poll を保持している間も見られる必要がある。
+int cmd_ts_status(int, char**)
+{
+    if (!s_ts_client) {
+        std::printf("ts: not started\n");
+        return 1;
+    }
+    const auto& st = s_ts_client->status();
+    std::printf("ts: %s (%lld ms)\n", s_ts_task ? "running" : "finished",
+                (esp_timer_get_time() - s_ts_started_us) / 1000);
     std::printf("  state=%d registered=%d map_messages=%u keepalives=%u\n", (int)st.state,
                 st.registered ? 1 : 0, (unsigned)st.map_messages, (unsigned)st.keepalives);
     if (!st.assigned_address.empty()) {
-        std::printf("  >>> assigned address: %s\n", st.assigned_address.c_str());
-        std::string line = "\r\n\033[32mtailscale: " + st.assigned_address + "\033[m\r\n";
-        TermGuard guard;
-        term->write(line);
-        renderer->render(*term);
+        std::printf("  assigned address: %s\n", st.assigned_address.c_str());
     }
+    if (!st.domain.empty()) std::printf("  domain: %s\n", st.domain.c_str());
     if (!st.error.empty()) std::printf("  error: %s\n", st.error.c_str());
-    return ok ? 0 : 1;
+    return 0;
+}
+
+int cmd_ts_stop(int, char**)
+{
+    if (!s_ts_client || !s_ts_task) {
+        std::printf("ts: not running\n");
+        return 1;
+    }
+    s_ts_client->stop();
+    std::printf("stop requested\n");
+    return 0;
 }
 
 // DISCO の Ping/Pong を実機で往復させる。相手機が無くても、自分を peer として登録して
@@ -1727,8 +1782,10 @@ void register_term_commands()
          nullptr, nullptr, nullptr},
         {"ppatest", "PPA でフレームバッファに直接回転転送してみる", nullptr, &cmd_ppatest, nullptr,
          nullptr, nullptr},
-        {"ts", "Tailscale/Headscale の制御プレーンに接続", "<host> <authkey> [port] [capver]",
-         &cmd_ts, nullptr, nullptr, nullptr},
+        {"ts", "Tailscale/Headscale の制御プレーンに接続（別タスク）",
+         "<host> <authkey> [port] [capver]", &cmd_ts, nullptr, nullptr, nullptr},
+        {"ts-status", "ts の状態を見る", nullptr, &cmd_ts_status, nullptr, nullptr, nullptr},
+        {"ts-stop", "ts の long-poll を止める", nullptr, &cmd_ts_stop, nullptr, nullptr, nullptr},
         {"wg", "WireGuard トンネルの netif を操作", "<tunnel-ip> [pubkey] [endpoint] | stat | down",
          &cmd_wg, nullptr, nullptr, nullptr},
     };
