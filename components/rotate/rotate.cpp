@@ -12,12 +12,23 @@ namespace rot {
 // ピクセルを読み戻して照合するので、変えたら必ず走らせる。
 void landscape_to_native(const Panel& p, int lx, int ly, int* nx, int* ny)
 {
+    if (p.flipped) {
+        // 180 度回した横向き。normal に (W-1-lx, H-1-ly) を通すのと同じ。
+        if (nx) *nx = ly;
+        if (ny) *ny = p.landscape_w() - 1 - lx;
+        return;
+    }
     if (nx) *nx = p.landscape_h() - 1 - ly;
     if (ny) *ny = lx;
 }
 
 void native_to_landscape(const Panel& p, int nx, int ny, int* lx, int* ly)
 {
+    if (p.flipped) {
+        if (lx) *lx = p.landscape_w() - 1 - ny;
+        if (ly) *ly = nx;
+        return;
+    }
     if (lx) *lx = ny;
     if (ly) *ly = p.landscape_h() - 1 - nx;
 }
