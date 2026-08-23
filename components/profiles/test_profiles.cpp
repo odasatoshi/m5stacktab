@@ -258,6 +258,29 @@ void test_limits()
     CHECK(!big.error.empty());
 }
 
+// **同じ鍵を 2 つの接続先が参照していることがある**（`via` 構成など）。
+// 畳まないと「取り込んだ本数」が水増しされる。
+void test_referenced_keys()
+{
+    const prof::Config c = prof::parse(kGood);
+    const auto         k = prof::referenced_keys(c);
+    CHECK(k.size() == 3);  // id_rsa_work / wg_hq.key / ts_home.key
+    CHECK(k[0] == "id_rsa_work");
+
+    // 2 つの ssh が同じ鍵を指しても 1 本
+    const prof::Config d = prof::parse(R"({"version":1,"profiles":[
+        {"name":"a","type":"ssh","host":"h","user":"u","key":"same"},
+        {"name":"b","type":"ssh","host":"h2","user":"u","key":"same"},
+        {"name":"c","type":"ssh","host":"h3","user":"u"}]})");
+    CHECK(d.error.empty());
+    CHECK(prof::referenced_keys(d).size() == 1);
+
+    // 鍵を使わない設定なら空
+    const prof::Config e = prof::parse(R"({"version":1,"profiles":[
+        {"name":"a","type":"ssh","host":"h","user":"u","auth":"password","password":"p"}]})");
+    CHECK(prof::referenced_keys(e).empty());
+}
+
 void test_cidr()
 {
     std::string a;
@@ -298,6 +321,7 @@ int main()
     test_tailscale_port_range();
     test_via_is_reported_but_not_fatal();
     test_limits();
+    test_referenced_keys();
     test_cidr();
 
     std::printf("%d checks, %d failed\n", g_checks, g_fails);

@@ -134,6 +134,20 @@ const Profile* find(const Config& cfg, const std::string& name)
     return nullptr;
 }
 
+std::vector<std::string> referenced_keys(const Config& cfg)
+{
+    std::vector<std::string> names;
+    for (const auto& p : cfg.profiles) {
+        for (const std::string* n : {&p.key, &p.private_key, &p.authkey}) {
+            if (n->empty()) continue;
+            bool dup = false;
+            for (const auto& t : names) dup = dup || (t == *n);
+            if (!dup) names.push_back(*n);
+        }
+    }
+    return names;
+}
+
 Config parse(const std::string& json)
 {
     Config cfg;

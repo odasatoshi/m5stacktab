@@ -74,4 +74,8 @@ std::string prefix_to_mask(int prefix);
 
 const char* type_name(Type t);
 
+// 設定が参照している鍵の名前を、重複を畳んで並べる。
+// **成功も失敗も同じ 1 か所で畳む**ために切り出してある（片方だけ畳むと本数が食い違う）。
+std::vector<std::string> referenced_keys(const Config& cfg);
+
 }  // namespace prof
