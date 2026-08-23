@@ -17,6 +17,12 @@ void check(const std::string& got, const std::string& want, const char* what)
     std::printf("\n");
     ++g_fail;
 }
+void checkb(bool got, bool want, const char* what)
+{
+    if (got == want) return;
+    std::printf("NG %s: got %d want %d\n", what, (int)got, (int)want);
+    ++g_fail;
+}
 }  // namespace
 
 int main()
@@ -71,6 +77,17 @@ int main()
     check(kbd_key_to_bytes("Aa", 0, false), "", "Aa は未対応");
     check(kbd_key_to_bytes("fn", kKbdModAlt, false), "", "未対応なら Alt でも空");
     check(kbd_key_to_bytes("", 0, false), "", "空は空");
+
+    // メニューを開くキー (#51)。端末で使う打鍵を潰していないことも見る。
+    checkb(kbd_is_menu_key("m", kKbdModCtrl | kKbdModAlt), true, "ctrl+alt+m");
+    checkb(kbd_is_menu_key("M", kKbdModCtrl | kKbdModAlt), true, "ctrl+alt+M (Aa)");
+    checkb(kbd_is_menu_key("m", kKbdModCtrl), false, "ctrl+m だけでは開かない (= CR)");
+    checkb(kbd_is_menu_key("m", kKbdModAlt), false, "alt+m だけでは開かない");
+    checkb(kbd_is_menu_key("m", 0), false, "素の m は文字");
+    checkb(kbd_is_menu_key("n", kKbdModCtrl | kKbdModAlt), false, "ctrl+alt+n は端末へ");
+    checkb(kbd_is_menu_key("esc", 0), false, "esc は端末へ");
+    // 開くキーは端末にも送れる形を保っている（メニューが無い経路では素通し）。
+    check(kbd_key_to_bytes("m", kKbdModCtrl | kKbdModAlt, false), "\033\r", "ctrl+alt+m の生バイト");
 
     if (g_fail) {
         std::printf("%d checks failed\n", g_fail);

@@ -71,10 +71,23 @@ USB Type-C のシリアルコンソール（`screen /dev/cu.usbmodem101 115200`�
 | `kbdlog [off]` | 打鍵をシリアルに出す |
 | `kbdinject <key-name> [mod]` | 打鍵を合成する（mod: 1=Ctrl 4=Alt）。遠隔で送出経路を確かめる |
 | `flip [0\|1\|on\|off]` | 画面を 180 度反転（純正キーボードを付けた向き） |
+| `menu [show\|hide\|up\|down\|enter\|esc]` | メニューの操作（指なしで検証するため） |
 | `wgtest` | WireGuard の暗号とハンドシェイクを実機で検証 |
 | `wg <tunnel-ip> [pubkey] [host:port]` | WireGuard トンネルの netif |
 | `wg stat` / `wg disco` / `wg down` | 統計・DISCO 状態・停止 |
 | `ts <host> <authkey> [port] [capver]` | Tailscale / Headscale の制御プレーンに接続 |
+
+## 純正キーボードのキー割り当て
+
+| キー | 動作 |
+|---|---|
+| **Ctrl+Alt+M** | メニューを開く／閉じる（端末からもメニューからも往復できる） |
+| Esc / ← | メニューの中で 1 段戻る。最上位なら端末へ戻る |
+| ↑↓ / Enter | メニューの項目の移動と決定 |
+
+**端末に送りたいキーは潰していない。** Esc も Ctrl+C も Ctrl+B（tmux の prefix）も
+そのままリモートへ届く。潰しているのは Ctrl+Alt+M だけで、vim も tmux も既定では使わない。
+キーボードを外しているときはステータスバーのタップでメニューを開く。
 
 ## テスト
 
