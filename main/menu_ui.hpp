@@ -28,6 +28,9 @@ constexpr int kMaxWifiScanRows = ui::Menu::kMaxItems - 3;
 static_assert(kMaxWifiScanRows > 0, "スキャン結果を並べる行が残らない");
 
 class MenuUi {
+private:
+    enum class Screen { kRoot, kSsh, kVpn, kSettings, kWifi, kWifiNet, kWifiScan };
+
 public:
     // メニューから起こす動作。main が実装を差す（この層は描画と選択だけを持つ）。
     enum class Action {
@@ -88,6 +91,9 @@ public:
     void set_wifi_scan(const std::vector<std::string>* v) { wifi_scan_ = v; }
     // WiFi の画面の先頭に出す 1 行（「スキャン中…」「5 件で満杯」など）。空なら出さない。
     void set_wifi_note(const std::string& s);
+    // 今 WiFi の一覧を見ているか。**スキャンの結果に飛ばしてよいかの判定に使う** —
+    // 数秒待つ間に Back で抜けていたら、いきなり飛ばすと画面を奪うことになる。
+    bool on_wifi_list() const { return screen_ == Screen::kWifi; }
     // スキャンが終わったら呼ぶ。結果の画面に移る。
     void show_wifi_scan();
     // 足した / 消したあとに一覧へ戻る。
@@ -101,8 +107,6 @@ public:
     void draw(bool force = false);
 
 private:
-    enum class Screen { kRoot, kSsh, kVpn, kSettings, kWifi, kWifiNet, kWifiScan };
-
     // Esc / "< Back" の戻り先。入れ子が 2 段になった (#56) ので表にする。
     static Screen parent_of(Screen s);
     void enter(Screen s);

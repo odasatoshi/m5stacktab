@@ -140,6 +140,10 @@ python tools/serial_log.py --seconds 20      # ログ採取
   頃の `ssid` / `pass` からは起動時に自動で引き継ぐ。**画面から消したら実際に切断する**ので、
   `s_reconfiguring` を立ててから `esp_wifi_disconnect` を呼ぶ（立てないと切断イベントで
   再接続が走り、消した AP に繋ぎ直しに行く）
+- **WiFi の設定変更と RPC は `wifijob` タスク (8KB) に載せる**。パスワード入力の Enter は
+  **kbd タスク (8KB) の上で、しかも `s_term_lock` を握ったまま**返ってくるので、そこから
+  `nvs_set_blob` と `esp_wifi_set_config` を呼ぶと、スタックも足りないうえ描画ループが
+  TermGuard の 2 秒タイムアウトに落ちる（SSH / VPN を `connect` タスクに逃がしてあるのと同じ理由）
 - **`esp_wifi_scan_start(&cfg, true)` は数秒ブロックする。専用タスクに載せる**。
   メインループや kbd タスク (8KB) の上で走らせると、その間画面が固まる。
   esp-hosted の RPC が深いので **4096 では残り 1696 バイトしかなかった**（実測）。8192 にしてある
@@ -195,6 +199,19 @@ openssl ec -in ssh_key -out key.pem -param_enc named_curve            # 既存�
 
 鍵のパースだけを確かめたいときは実機の `keytest` コマンドを使う。
 失敗理由は文字列で出る（`CONFIG_MBEDTLS_ERROR_STRINGS` は ESP-IDF の既定が `y`。`sdkconfig.defaults` に明示してあるのは意図を残すためで、これを消しても出る）。**`CONFIG_MBEDTLS_ERROR_C` という symbol は存在しない** ので、書いても `sdkconfig` 再生成のときに `unknown kconfig symbol` の警告が出るだけ。
+
+## static_assert の発火を確かめるときの罠
+
+**定数を書き換えて戻すときに `mv file.bak file` を使ってはいけない。** `mv` は元の
+mtime ごと戻すので、**書き換えたまま作られたオブジェクトのほうが新しくなり、ninja が
+再コンパイルを飛ばす**。戻したはずの定数が焼かれていない実行ファイルができる。
+
+実際に踏んだ (#56): `kMaxWifiNets` を 5 → 10 にして static_assert の発火を確かめ、
+`mv wifi.hpp.bak wifi.hpp` で戻したところ、`wifi.cpp.obj` だけ 10 のまま残った。
+`grep` も `git show` も 5 なのに、**実機では 6 件目が保存できる**という形でしか出ない
+（他の .cpp は static_assert でコンパイル自体が失敗したので 5 のまま = 食い違う）。
+
+戻したら **`touch` するか `git checkout -- <file>` を使い、確認の後は `idf.py fullclean`** を挟む。
 
 ## ホストテストで使う mbedTLS
 

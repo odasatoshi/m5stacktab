@@ -30,7 +30,17 @@ bool wifi_status(char* ssid, size_t ssid_len, int* rssi, char* ip, size_t ip_len
 // SD は抜けば誰でも読めるのでパスワードの置き場として弱い。
 constexpr size_t kMaxWifiNets = 5;
 
-// i 番目の SSID。範囲外なら false。**パスワードは返さない**（画面に出す用途しかない）。
+// 一覧に出す 1 件。**パスワードは返さない**（画面に出す用途しかない）。
+struct WifiNetInfo {
+    char ssid[33];
+    bool active;  // 今つながっている
+};
+
+// 一覧をまとめて取る。**1 件ずつ引かないこと** — 引いている間に
+// コンソールの `wifi-del` が走ると、名前と印がずれた並びになる。返り値は件数。
+size_t wifi_net_snapshot(WifiNetInfo* out, size_t max);
+
+// i 番目の SSID。範囲外なら false。
 bool   wifi_net_ssid(size_t i, char* out, size_t len);
 size_t wifi_net_count(void);
 // 今つないでいる設定の index。繋いでいない／消したなら -1。

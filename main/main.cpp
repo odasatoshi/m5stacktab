@@ -3072,29 +3072,62 @@ void start_connect(int index, const std::string& password, bool have_password)
 // --- WiFi の一覧 (#56) ---
 //
 // 表示に使う文字列は main が持つ。**MenuUi は参照しか持たない**ので、
-// 生きている間ずっと差し替えないこと（差し替えるときは下の refresh を通す）。
-// 触るのは「メニューの描画・タッチ・キー」と「スキャンのワーカ」だけで、
-// どれも s_term_lock (TermGuard) の中で動く。
+// 生きている間ずっと差し替えないこと。触るのは「メニューの描画・タッチ・キー」と
+// 下のワーカだけで、どれも s_term_lock (TermGuard) の中で動く。
 std::vector<std::string>   s_wifi_nets;
 std::vector<std::string>   s_wifi_scan_rows;
 std::vector<WifiScanEntry> s_wifi_scan_aps;  // 選ばれたときに SSID を引く
-TaskHandle_t               s_wifi_scan_task = nullptr;
 
 void refresh_wifi_nets()
 {
+    WifiNetInfo  nets[kMaxWifiNets];
+    const size_t n = wifi_net_snapshot(nets, kMaxWifiNets);
     s_wifi_nets.clear();
-    const int cur = wifi_net_current();
-    for (size_t i = 0; i < wifi_net_count(); ++i) {
-        char ssid[33] = {};
-        if (!wifi_net_ssid(i, ssid, sizeof(ssid))) continue;
-        // **繋がっているかも見る。** 選んだだけで印を付けると、繋がっていない
-        // 設定に `*` が残って一覧が嘘になる。
-        const bool active = (static_cast<int>(i) == cur) && wifi_is_connected();
-        s_wifi_nets.emplace_back(std::string(active ? "* " : "  ") + ssid);
+    for (size_t i = 0; i < n; ++i) {
+        s_wifi_nets.emplace_back(std::string(nets[i].active ? "* " : "  ") + nets[i].ssid);
     }
 }
 
-// 足して繋ぐ。満杯や長すぎは理由を端末に出す（メニューは閉じている）。
+// --- WiFi の変更は全部ワーカタスクでやる ---
+//
+// **UI / kbd タスクの上でやってはいけない。** esp-hosted の RPC は深く
+// (scan は 4096B で残り 1696B しかなかった)、kbd タスクもメインループも 8KB しか
+// ない。しかも呼び出し元は s_term_lock を握っているので、そのまま走らせると
+// 描画ループが TermGuard の 2 秒タイムアウトに落ちる。SSH / VPN の接続を
+// `connect` タスクに逃がしてあるのと同じ理由。
+enum class WifiJob { kScan, kAddConnect, kConnect, kRemove };
+
+struct WifiReq {
+    WifiJob     job   = WifiJob::kScan;
+    int         index = -1;
+    std::string ssid;
+    std::string pass;
+};
+WifiReq      s_wifi_req;
+TaskHandle_t s_wifi_task = nullptr;
+
+// ワーカから画面に一言返す。**ロックが取れないと結果が消える**ので少し粘る
+// （黙って諦めると「スキャン中...」が出たまま止まって見える）。
+void wifi_ui_result(const std::string& note, bool show_scan)
+{
+    for (int i = 0; i < 3; ++i) {
+        TermGuard guard;
+        if (!guard.ok()) continue;
+        menu->set_wifi_note(note);
+        refresh_wifi_nets();
+        // **今も一覧に居るときだけ移る。** 数秒待つ間に Back で抜けていたら、
+        // ルートメニューからいきなりスキャン結果へ飛ばすことになる。
+        if (show_scan && menu->visible() && menu->on_wifi_list()) menu->show_wifi_scan();
+        if (menu->visible()) {
+            menu->refresh();
+            menu->draw();
+        }
+        return;
+    }
+    ESP_LOGW(TAG, "wifi: 端末のロックが取れず画面に反映できなかった: %s", note.c_str());
+}
+
+// 足して繋ぐ。**入力は端末でやる**ので、結果も端末に書く（メニューは閉じている）。
 void wifi_add_and_connect(const std::string& ssid, const std::string& pass)
 {
     const esp_err_t err = wifi_net_add(ssid.c_str(), pass.c_str());
@@ -3105,7 +3138,6 @@ void wifi_add_and_connect(const std::string& ssid, const std::string& pass)
                             : "保存できない: " + std::string(esp_err_to_name(err)));
         return;
     }
-    refresh_wifi_nets();
     const int i = wifi_net_find(ssid.c_str());
     if (i < 0) {
         term_note("31", "保存したはずの \"" + ssid + "\" が見つからない");
@@ -3114,84 +3146,112 @@ void wifi_add_and_connect(const std::string& ssid, const std::string& pass)
     term_note("33", "connecting to \"" + ssid + "\"...");
     if (const esp_err_t e = wifi_net_connect(static_cast<size_t>(i)); e != ESP_OK) {
         term_note("31", std::string("connect failed: ") + esp_err_to_name(e));
-        return;
     }
-    refresh_wifi_nets();
+    TermGuard guard;
+    if (guard.ok()) refresh_wifi_nets();
+}
+
+void wifi_worker(void*)
+{
+    const WifiReq req = s_wifi_req;
+    switch (req.job) {
+        case WifiJob::kScan: {
+            WifiScanEntry aps[kMaxWifiScanRows];
+            const int     n = wifi_scan(aps, kMaxWifiScanRows);
+            {
+                TermGuard guard;
+                if (guard.ok()) {
+                    s_wifi_scan_aps.assign(aps, aps + (n > 0 ? n : 0));
+                    s_wifi_scan_rows.clear();
+                    for (int i = 0; i < n; ++i) {
+                        char buf[80];
+                        std::snprintf(buf, sizeof(buf), "%-20s %4d dBm%s", aps[i].ssid,
+                                      aps[i].rssi, aps[i].secure ? "" : "  (open)");
+                        s_wifi_scan_rows.emplace_back(buf);
+                    }
+                }
+            }
+            // **失敗と 0 件を区別して出す。** どちらも空の一覧になるので、
+            // 理由を書かないと「AP が無い」と読める。
+            wifi_ui_result(n < 0 ? "スキャンできない（WiFi が起動していない？）"
+                                 : (n == 0 ? "AP が見つからない" : ""),
+                           /*show_scan=*/n >= 0);
+            break;
+        }
+        case WifiJob::kAddConnect:
+            wifi_add_and_connect(req.ssid, req.pass);
+            break;
+        case WifiJob::kConnect: {
+            const esp_err_t err = wifi_net_connect(static_cast<size_t>(req.index));
+            wifi_ui_result(err == ESP_OK ? "connecting to \"" + req.ssid + "\"..."
+                                         : std::string("connect failed: ") + esp_err_to_name(err),
+                           /*show_scan=*/false);
+            break;
+        }
+        case WifiJob::kRemove: {
+            const esp_err_t err = wifi_net_remove(static_cast<size_t>(req.index));
+            wifi_ui_result(err == ESP_OK ? "削除した: " + req.ssid
+                                         : std::string("削除できない: ") + esp_err_to_name(err),
+                           /*show_scan=*/false);
+            break;
+        }
+    }
+    ESP_LOGI(TAG, "wifi job task stack headroom: %u bytes",
+             (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+    s_wifi_task = nullptr;
+    vTaskDelete(nullptr);
+}
+
+// 走らせる。前のが終わっていなければ何もしない（重ねると RPC が競合する）。
+bool start_wifi_job(const WifiReq& req)
+{
+    if (s_wifi_task) return false;
+    s_wifi_req = req;
+    if (xTaskCreate(&wifi_worker, "wifijob", 8192, nullptr, 4, &s_wifi_task) != pdPASS) {
+        s_wifi_task = nullptr;
+        return false;
+    }
+    return true;
 }
 
 // パスワードを聞いてから足す。オープンな AP は聞かない。
+// **足すのも繋ぐのもワーカに載せる** — Enter は kbd タスク (8KB) の上で、
+// しかも s_term_lock を握ったまま返ってくる。
 void wifi_ask_password(const std::string& ssid, bool secure)
 {
+    auto submit = [](const std::string& id, const std::string& pw) {
+        if (!start_wifi_job({WifiJob::kAddConnect, -1, id, pw})) {
+            term_note("31", "WiFi の処理中（終わるまで待つ）");
+        }
+    };
     if (!secure) {
-        wifi_add_and_connect(ssid, "");
+        submit(ssid, "");
         return;
     }
     start_line_prompt("password for \"" + ssid + "\" (Enter で接続 / Esc で中止):",
                       /*mask=*/true,
-                      [ssid](const std::string& pw) { wifi_add_and_connect(ssid, pw); });
-}
-
-// スキャンは数秒ブロックするうえ通信が一瞬止まる。**専用タスクに載せる** —
-// メインループや kbd タスクの上で走らせると、その間画面が固まる。
-void wifi_scan_worker(void*)
-{
-    WifiScanEntry aps[kMaxWifiScanRows];
-    const int     n = wifi_scan(aps, kMaxWifiScanRows);
-    {
-        // 一覧を作り直す間はメニューの描画と噛み合わせる（同じロックで守る）。
-        TermGuard guard;
-        if (guard.ok()) {
-            s_wifi_scan_aps.clear();
-            s_wifi_scan_rows.clear();
-            for (int i = 0; i < n; ++i) {
-                s_wifi_scan_aps.push_back(aps[i]);
-                char buf[80];
-                std::snprintf(buf, sizeof(buf), "%-20s %4d dBm%s", aps[i].ssid, aps[i].rssi,
-                              aps[i].secure ? "" : "  (open)");
-                s_wifi_scan_rows.emplace_back(buf);
-            }
-            // **失敗と 0 件を区別して出す。** どちらも空の一覧になるので、
-            // 理由を書かないと「AP が無い」と読める。
-            menu->set_wifi_note(n < 0 ? "スキャンできない（WiFi が起動していない？）"
-                                      : (n == 0 ? "AP が見つからない" : ""));
-            // 途中でメニューを閉じていたら移らない（端末の上に描いてしまう）。
-            if (menu->visible()) {
-                menu->show_wifi_scan();
-                menu->draw();
-            }
-        }
-    }
-    ESP_LOGI(TAG, "wifi scan task stack headroom: %u bytes",
-             (unsigned)uxTaskGetStackHighWaterMark(nullptr));
-    s_wifi_scan_task = nullptr;
-    vTaskDelete(nullptr);
-}
-
-void start_wifi_scan()
-{
-    if (s_wifi_scan_task) return;  // 走っている間は放っておく（注記が出たまま）
-    // 4096 では実測で残り 1696 バイトしかなかった（esp-hosted の RPC が深い）。
-    // 稀にしか走らないタスクなので余裕を取る。
-    if (xTaskCreate(&wifi_scan_worker, "wifiscan", 8192, nullptr, 4, &s_wifi_scan_task) != pdPASS) {
-        s_wifi_scan_task = nullptr;
-        menu->set_wifi_note("スキャンできない（メモリ不足）");
-    }
+                      [ssid, submit](const std::string& pw) { submit(ssid, pw); });
 }
 
 // メニューの WiFi の項目から呼ぶ。index の意味は Action ごとに違う。
 void wifi_menu_action(MenuUi::Action a, int index)
 {
+    // 満杯の理由。**パスワードを聞く前に断る**（聞いてから断ると、打った後で捨てる）。
+    const std::string full = "保存済みが " + std::to_string(kMaxWifiNets) +
+                             " 件で満杯。消してから追加する";
+    const char* busy = "WiFi の処理中（終わるまで待つ）";
+
     switch (a) {
         case MenuUi::Action::kWifiScan:
-            // **先に満杯を出して、パスワードを聞く前に断る。** 聞いてから
-            // 断ると、打った後で捨てられる。
             if (wifi_net_count() >= kMaxWifiNets) {
-                menu->set_wifi_note("保存済みが " + std::to_string(kMaxWifiNets) +
-                                    " 件で満杯。消してから追加する");
+                menu->set_wifi_note(full);
                 menu->draw();
                 return;
             }
-            start_wifi_scan();
+            if (!start_wifi_job({WifiJob::kScan, -1, "", ""})) {
+                menu->set_wifi_note(busy);
+                menu->draw();
+            }
             break;
         case MenuUi::Action::kWifiAddScanned: {
             if (index < 0 || index >= static_cast<int>(s_wifi_scan_aps.size())) return;
@@ -3204,8 +3264,7 @@ void wifi_menu_action(MenuUi::Action a, int index)
         }
         case MenuUi::Action::kWifiAddManual:
             if (wifi_net_count() >= kMaxWifiNets) {
-                menu->set_wifi_note("保存済みが " + std::to_string(kMaxWifiNets) +
-                                    " 件で満杯。消してから追加する");
+                menu->set_wifi_note(full);
                 menu->draw();
                 return;
             }
@@ -3220,29 +3279,18 @@ void wifi_menu_action(MenuUi::Action a, int index)
                                   wifi_ask_password(ssid, /*secure=*/true);
                               });
             break;
-        case MenuUi::Action::kWifiConnect: {
-            if (index < 0 || index >= static_cast<int>(wifi_net_count())) return;
-            char ssid[33] = {};
-            wifi_net_ssid(static_cast<size_t>(index), ssid, sizeof(ssid));
-            const esp_err_t err = wifi_net_connect(static_cast<size_t>(index));
-            refresh_wifi_nets();
-            menu->set_wifi_note(err == ESP_OK
-                                    ? std::string("connecting to \"") + ssid + "\"..."
-                                    : std::string("connect failed: ") + esp_err_to_name(err));
-            menu->show_wifi_list();
-            menu->draw();
-            break;
-        }
+        case MenuUi::Action::kWifiConnect:
         case MenuUi::Action::kWifiDelete: {
             if (index < 0 || index >= static_cast<int>(wifi_net_count())) return;
             char ssid[33] = {};
             wifi_net_ssid(static_cast<size_t>(index), ssid, sizeof(ssid));
-            const esp_err_t err = wifi_net_remove(static_cast<size_t>(index));
-            refresh_wifi_nets();
-            menu->set_wifi_note(err == ESP_OK ? std::string("削除した: ") + ssid
-                                              : std::string("削除できない: ") +
-                                                    esp_err_to_name(err));
-            menu->show_wifi_list();
+            const bool del = (a == MenuUi::Action::kWifiDelete);
+            const bool ok  = start_wifi_job(
+                {del ? WifiJob::kRemove : WifiJob::kConnect, index, ssid, ""});
+            menu->set_wifi_note(ok ? (del ? "削除中..." : "接続中...") : busy);
+            // **一覧へ戻してから待つ。** 消したものの詳細画面に残っていると、
+            // 終わった後に「もう無い設定」の接続 / 削除を押せてしまう。
+            if (ok) menu->show_wifi_list();
             menu->draw();
             break;
         }

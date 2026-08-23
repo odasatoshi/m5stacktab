@@ -47,6 +47,21 @@ constexpr const char* kNvsKeyLast = "last";
 
 Net    s_nets[kMaxWifiNets] = {};
 size_t s_net_count          = 0;
+// **配列はコンソールタスクと UI タスクの両方から触られる。**
+// 一覧を開いたままシリアルで `wifi-del` すると、詰め直しの途中を読んでしまう。
+SemaphoreHandle_t s_nets_lock = nullptr;
+
+// 再帰にしてある（wifi_net_add が中で save/load を呼ぶ）。
+struct NetLock {
+    NetLock()
+    {
+        if (!s_nets_lock) s_nets_lock = xSemaphoreCreateRecursiveMutex();
+        if (s_nets_lock) xSemaphoreTakeRecursive(s_nets_lock, portMAX_DELAY);
+    }
+    ~NetLock() { if (s_nets_lock) xSemaphoreGiveRecursive(s_nets_lock); }
+    NetLock(const NetLock&)            = delete;
+    NetLock& operator=(const NetLock&) = delete;
+};
 // 今つないでいる設定。切断しただけでは -1 にしない（再接続の対象なので）。
 // 消したときだけ -1 に戻す。
 int    s_current = -1;
@@ -57,8 +72,16 @@ void load_nets()
     nvs_handle_t nvs;
     if (nvs_open(kNvsNamespace, NVS_READONLY, &nvs) != ESP_OK) return;
     size_t len = sizeof(s_nets);
-    if (nvs_get_blob(nvs, kNvsKeyNets, s_nets, &len) == ESP_OK) {
+    const esp_err_t got = nvs_get_blob(nvs, kNvsKeyNets, s_nets, &len);
+    if (got == ESP_OK) {
         s_net_count = std::min(len / sizeof(Net), kMaxWifiNets);
+    } else if (got == ESP_ERR_NVS_INVALID_LENGTH) {
+        // **上限を下げた後や、上限を上げたビルドで書いた blob。** 黙って
+        // 「設定なし」に落ちると、一覧が空になった理由が読めない。
+        ESP_LOGW(TAG, "nets blob が大きすぎる（上限 %d 件ぶんに収まらない）。無視する",
+                 (int)kMaxWifiNets);
+        nvs_close(nvs);
+        return;
     } else {
         // **1 件しか持てなかった頃の設定を引き継ぐ。** 引き継がないと、
         // 更新した瞬間に今つながっている AP を忘れてオフラインになる。
@@ -224,11 +247,11 @@ int cmd_wifi_list(int, char**)
         std::printf("保存済みなし (`wifi <ssid> [password]`)\n");
         return 0;
     }
-    for (size_t i = 0; i < s_net_count; ++i) {
-        // **繋がっているものだけに印を付ける。** 選んだだけで付けると、
-        // 繋がっていない設定に `*` が残って画面側の一覧と食い違う。
-        const bool active = ((int)i == s_current) && wifi_is_connected();
-        std::printf("%c %d: %s\n", active ? '*' : ' ', (int)i, s_nets[i].ssid);
+    // **画面と同じ経路で並べる。** 別々に数えると片方だけ直したときに食い違う。
+    WifiNetInfo  nets[kMaxWifiNets];
+    const size_t n = wifi_net_snapshot(nets, kMaxWifiNets);
+    for (size_t i = 0; i < n; ++i) {
+        std::printf("%c %d: %s\n", nets[i].active ? '*' : ' ', (int)i, nets[i].ssid);
     }
     return 0;
 }
@@ -366,11 +389,36 @@ bool wifi_is_connected(void)
 
 // --- 保存済みの接続先 (#56) ---
 
-size_t wifi_net_count(void) { return s_net_count; }
-int    wifi_net_current(void) { return s_current; }
+size_t wifi_net_count(void)
+{
+    NetLock lock;
+    return s_net_count;
+}
+
+int wifi_net_current(void)
+{
+    NetLock lock;
+    return s_current;
+}
+
+size_t wifi_net_snapshot(WifiNetInfo* out, size_t max)
+{
+    if (!out || max == 0) return 0;
+    // **1 回のロックで全部取る。** 1 件ずつ引くと、その間に消えて
+    // 「名前は消したもの、印は別の行」という並びが出る。
+    NetLock lock;
+    const size_t n = std::min(s_net_count, max);
+    for (size_t i = 0; i < n; ++i) {
+        std::snprintf(out[i].ssid, sizeof(out[i].ssid), "%s", s_nets[i].ssid);
+        // 繋がっているものだけに印を付ける（選んだだけでは付けない）。
+        out[i].active = ((int)i == s_current) && wifi_is_connected();
+    }
+    return n;
+}
 
 bool wifi_net_ssid(size_t i, char* out, size_t len)
 {
+    NetLock lock;
     if (i >= s_net_count || !out || len == 0) return false;
     std::snprintf(out, len, "%s", s_nets[i].ssid);
     return true;
@@ -378,6 +426,7 @@ bool wifi_net_ssid(size_t i, char* out, size_t len)
 
 esp_err_t wifi_net_add(const char* ssid, const char* pass)
 {
+    NetLock lock;
     if (!pass) pass = "";
     if (!ssid || !ssid[0] || std::strlen(ssid) >= sizeof(s_nets[0].ssid) ||
         std::strlen(pass) >= sizeof(s_nets[0].pass)) {
@@ -405,8 +454,10 @@ esp_err_t wifi_net_add(const char* ssid, const char* pass)
 
 esp_err_t wifi_net_remove(size_t i)
 {
+    NetLock lock;
     if (i >= s_net_count) return ESP_ERR_INVALID_ARG;
     const bool was_current = ((int)i == s_current);
+    const int  prev_current = s_current;
     for (size_t j = i + 1; j < s_net_count; ++j) s_nets[j - 1] = s_nets[j];
     --s_net_count;
     std::memset(&s_nets[s_net_count], 0, sizeof(s_nets[0]));
@@ -417,15 +468,24 @@ esp_err_t wifi_net_remove(size_t i)
 
     const esp_err_t err = save_nets();
     if (err != ESP_OK) {
-        load_nets();  // NVS に書けなかったら RAM を NVS に合わせ直す
+        // NVS に書けなかったら RAM を NVS に合わせ直す。**s_current も戻す** —
+        // 戻さないと、一覧は元に戻るのに `*` だけ別の設定に付く。
+        load_nets();
+        s_current = prev_current;
         return err;
     }
+    // **次回の起動先も詰め直す。** RAM だけ直して NVS の `last` を放っておくと、
+    // 消した位置より後ろに繋いでいたとき、次の起動で別の設定に繋ぐ。
+    save_last(s_current >= 0 ? s_current : 0);
     if (was_current) {
         // **実際に切る。** 消したのに繋がったままだと、一覧と実態が食い違う。
         if (s_retry_timer) esp_timer_stop(s_retry_timer);
         // 切断イベントで再接続が走らないようにしてから切る。
         s_reconfiguring = true;
-        if (wifi_is_connected() && esp_wifi_disconnect() != ESP_OK) s_reconfiguring = false;
+        // **未接続でも呼ぶ。** 繋ぎに行っている最中（リトライ中）に消したとき、
+        // 呼ばないと STA の config に消した SSID が残ったままアソシエーションが
+        // 成功し得る（一覧に無い AP に繋がる）。印も立てっぱなしになる。
+        if (esp_wifi_disconnect() != ESP_OK) s_reconfiguring = false;
         ESP_LOGI(TAG, "removed the active network; disconnected");
     }
     return ESP_OK;
@@ -433,6 +493,7 @@ esp_err_t wifi_net_remove(size_t i)
 
 int wifi_net_find(const char* ssid)
 {
+    NetLock lock;
     if (!ssid) return -1;
     for (size_t i = 0; i < s_net_count; ++i) {
         if (std::strcmp(s_nets[i].ssid, ssid) == 0) return (int)i;
@@ -442,9 +503,15 @@ int wifi_net_find(const char* ssid)
 
 esp_err_t wifi_net_connect(size_t i)
 {
+    NetLock lock;
     if (i >= s_net_count) return ESP_ERR_INVALID_ARG;
-    s_current = (int)i;
-    return connect_with(s_nets[i].ssid, s_nets[i].pass);
+    const int prev  = s_current;
+    s_current       = (int)i;
+    const esp_err_t err = connect_with(s_nets[i].ssid, s_nets[i].pass);
+    // **失敗したら戻す。** 進めたままだと、生きている古い接続が IP を取り直した
+    // ときに「繋がっていない設定」の index を次回起動先として覚えてしまう。
+    if (err != ESP_OK) s_current = prev;
+    return err;
 }
 
 int wifi_scan(WifiScanEntry* out, int max)
