@@ -55,6 +55,7 @@
 #include "profiles.hpp"
 #include "sdcard.hpp"
 #include "status_bar.hpp"
+#include "tap_gesture.hpp"
 #include "noise.hpp"
 #include "transport.hpp"
 #include "term_render.hpp"
@@ -129,6 +130,8 @@ int                            s_status_h = 0;
 // 画面の配分を張り直す（定義は下）。ステータスバー / 端末 / キーボードの
 // 高さの計算はここ 1 箇所しかない。分散させると片方だけ直して重なる。
 void apply_layout();
+// 画面キーボードの出し入れ（コンソールもダブルタップも通す唯一の経路）。
+void set_keyboard_visible(bool show);
 // メニューの表示を切り替える。キーボードの表示と端末の行数も一緒に動く。
 void set_menu_visible(bool show);
 // メニュー表示中は端末を描かない（メニューの矩形を上書きしてしまう）。
@@ -198,6 +201,15 @@ constexpr int kStatusTapH = 56;
 // ずれていく）。-1 は「端末領域を掴んでいない」。
 int s_swipe_start_y      = -1;
 int s_swipe_start_offset = 0;
+
+// 端末領域のダブルタップで画面キーボードを出し入れする (#54)。
+// 判定そのものは tap_gesture.hpp（ホストテスト付き）に置いてある。
+TapState s_tap;
+
+// ユーザが選んだ画面キーボードの表示状態。**メニューから端末へ戻るときはこれに従う。**
+// 以前は無条件で出していたが、指で切り替えられる以上、メニューを 1 回開くたびに
+// 勝手に戻るのは困る。
+bool s_keyboard_wanted = true;
 
 // M5GFX はパネル・タッチの判別結果を NVS にキャッシュする。NVS を初期化しておかないと
 // 毎起動でフルプローブ（タッチ IC のファームウェア待ちを含む）が走る。
@@ -1037,10 +1049,7 @@ int cmd_kbd(int argc, char** argv)
         std::printf("menu is shown (menu hide してから)\n");
         return 1;
     }
-    keyboard->set_visible(show);
-    apply_layout();
-    keyboard->draw();
-    renderer->render(*term, /*force=*/true);
+    set_keyboard_visible(show);
     std::printf("keyboard %s, terminal %dx%d\n", show ? "shown" : "hidden", renderer->cols(),
                 renderer->rows());
     return 0;
@@ -1401,6 +1410,22 @@ void apply_layout()
 // タッチのルーティング。**実タッチと `tap` / `swipe` コマンドで同じ経路を通す。**
 // 分けると「指だと動くがコマンドだと動かない」（または逆）になって、
 // 検証にならない。ロックは呼び出し側が取っている。
+// 画面キーボードを出し入れする。**コンソール (`kbd`) もダブルタップもここを通す** —
+// 分けると「指では消えるがコマンドでは消えない」（またはその逆）になって検証にならない。
+// ロックは呼び出し側が持っている。
+void set_keyboard_visible(bool show)
+{
+    if (!keyboard || !renderer || !term) return;
+    s_keyboard_wanted = show;
+    if (keyboard->visible() == show) return;
+    keyboard->set_visible(show);  // 出すときは KeyboardUi 側が描く
+    apply_layout();
+    // 隠すときはキーボードが居た帯まで端末の行が伸びるので、force で全部塗り直す。
+    renderer->render(*term, /*force=*/true);
+    ESP_LOGI(TAG, "keyboard %s, terminal %dx%d", show ? "shown" : "hidden", renderer->cols(),
+             renderer->rows());
+}
+
 void touch_down_at(int x, int y)
 {
     if (y < kStatusTapH) {
@@ -1415,6 +1440,7 @@ void touch_down_at(int x, int y)
         // キーボード外 = 端末領域。縦スワイプでスクロールバックを見る。
         s_swipe_start_y      = y;
         s_swipe_start_offset = term->view_offset();
+        tap_down(&s_tap, x, y, esp_timer_get_time(), s_swipe_start_offset);
     }
 }
 
@@ -1441,6 +1467,13 @@ void touch_up_at(int x, int y)
         ESP_LOGI(TAG, "scrollback offset %d / %d lines", term->view_offset(),
                  term->scrollback_lines());
         s_swipe_start_y = -1;
+        // **キーボードの帯は数えない。** 帯にはキーの無い隙間（左右の余白と
+        // 上端の候補表示）があり、そこは touch_down が false を返して
+        // ここへ流れてくる。数えると入力中にキーボードが消える。
+        const int keyboard_top = (int)display.height() - keyboard->height();
+        if (tap_up(&s_tap, x, y, esp_timer_get_time(), term->view_offset(), keyboard_top)) {
+            set_keyboard_visible(!keyboard->visible());
+        }
         return;
     }
     if (menu->visible()) return;  // 押した時点で決まっているので、離すのは無視する
@@ -1467,15 +1500,15 @@ void set_menu_visible(bool show)
     s_swipe_start_y = -1;  // 掴んだままメニューに移ると、次のドラッグが飛ぶ
     menu->set_visible(show);
     // メニューはキーボードの領域を覆わないので、隠さないと指でキーを押せてしまう。
-    // ponytail: 端末に戻るときは必ずキーボードを出す（`kbd off` の状態は覚えない）。
-    // メニューから端末に入る流れでは打ちたいはずなので、今はこれで足りる。
-    keyboard->set_visible(!show);
+    // 端末に戻るときは**ユーザが選んだ状態**に戻す（#54 でダブルタップから
+    // 切り替えられるようになったので、開くたびに勝手に出すと選択が消える）。
+    keyboard->set_visible(!show && s_keyboard_wanted);
     if (show) menu->set_info(gather_menu_info(gather_status()));
     apply_layout();
     if (show) {
         menu->draw(/*force=*/true);
     } else {
-        keyboard->draw();
+        // キーボードは set_visible(true) が中で描いている。ここで描くと二度塗り。
         renderer->render(*term, /*force=*/true);
     }
     // ラベルを MENU / CLOSE に切り替える。開閉のたびに必ず描き直す。
