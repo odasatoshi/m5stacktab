@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <utility>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -137,7 +138,11 @@ void apply_layout();
 void set_keyboard_visible(bool show);
 // メニューの表示を切り替える。キーボードの表示と端末の行数も一緒に動く。
 void set_menu_visible(bool show);
-extern bool s_auth_qr_active;  // 対話ログインの QR を出している間 (#59)
+// 対話ログインの QR (#59)。定義は ts の側（ずっと下）。
+extern bool        s_auth_qr_active;  // 出している間 true
+extern std::string s_auth_qr_url;     // 出し直せるように URL は畳んでも残す
+void               hide_auth_qr(bool redraw = true);
+void               show_auth_qr(const std::string& url);
 // メニュー表示中は端末を描かない（メニューの矩形を上書きしてしまう）。
 void render_term(bool force = false);
 // ステータスバーに出す内容を集める（定義は下）。
@@ -1144,6 +1149,7 @@ int cmd_flip(int argc, char** argv)
                 menu->draw(/*force=*/true);
             } else {
                 if (keyboard->visible()) keyboard->draw();
+                hide_auth_qr(/*redraw=*/false);  // 塗り直すので QR は畳む (#59)
                 renderer->render(*term, /*force=*/true);
             }
         }
@@ -1284,6 +1290,15 @@ void ts_task(void* arg)
 {
     auto* client = static_cast<ts::Client*>(arg);
     const bool ok = client->run_once();
+    // **QR を必ず畳む。** 承認されずにタイムアウトした / GOAWAY を食らった場合、
+    // 畳まないと死んだ QR が残り、端末も更新されなくなる (#59)。
+    {
+        TermGuard guard;
+        if (guard.ok()) {
+            s_auth_qr_url.clear();
+            hide_auth_qr();
+        }
+    }
     // run_once() から戻ったあとなので、この参照を書き換える者はもういない。
     const auto& st = client->status();
     ESP_LOGI(TAG, "ts finished: %s state=%d registered=%d map_messages=%u", ok ? "ok" : "failed",
@@ -1308,8 +1323,6 @@ void ts_task(void* arg)
 // Tailscale を上げる。**コンソールもメニューもここを通す** (#49) —
 // 分けると「シリアルからは繋がるのに一覧から選ぶと繋がらない」になる。
 // 対話ログイン (#59) の QR。定義はこの下（ts の状態表示の側）。
-void show_auth_qr(const std::string& url);
-void hide_auth_qr();
 void term_note(const char* color, const std::string& text);
 
 bool ts_start(const std::string& host, const std::string& authkey, uint16_t port, uint16_t capver,
@@ -1527,12 +1540,17 @@ void draw_auth_qr_modules(esp_qrcode_handle_t qr, void* user_data)
     display.setTextColor(TFT_WHITE, TFT_BLACK);
 }
 
-void hide_auth_qr()
+// QR を畳む。**端末領域を全部塗り直す経路は必ずここを通すこと** —
+// 通さずに端末を描くと QR は消えるのにフラグが残り、以後 render_term() が
+// 早期 return し続けて**端末が二度と更新されなくなる**（打鍵も食われ続ける）。
+// redraw=false は「呼び出し側がこの後すぐ描く」場合（二度塗りを避ける）。
+void hide_auth_qr(bool redraw)
 {
     if (!s_auth_qr_active) return;
     s_auth_qr_active = false;
-    s_auth_qr_url.clear();
-    if (renderer && term) renderer->render(*term, /*force=*/true);
+    // **URL は残す。** メニューから戻ったときに出し直せるようにする
+    // （ts::Client は同じ URL では二度と handler を呼ばない）。
+    if (redraw && renderer && term) renderer->render(*term, /*force=*/true);
 }
 
 bool auth_qr_input(const std::string& in)
@@ -1599,6 +1617,9 @@ int cmd_ts_status(int, char**)
         std::printf("  assigned address: %s\n", st.assigned_address.c_str());
     }
     if (!st.domain.empty()) std::printf("  domain: %s\n", st.domain.c_str());
+    // **対話ログインの URL はここから読める。** 画面のロックが取れず QR を
+    // 描けなかったときの唯一の手がかりなので、必ず出す (#59)。
+    if (!st.auth_url.empty()) std::printf("  auth url: %s\n", st.auth_url.c_str());
     if (!st.error.empty()) std::printf("  error: %s\n", st.error.c_str());
     return 0;
 }
@@ -1610,6 +1631,14 @@ int cmd_ts_stop(int, char**)
         return 1;
     }
     s_ts_client->stop();
+    // 対話ログインの QR を出したまま止めると、端末が更新されないまま残る (#59)。
+    {
+        TermGuard guard;
+        if (guard.ok()) {
+            s_auth_qr_url.clear();
+            hide_auth_qr();
+        }
+    }
     std::printf("stop requested\n");
     return 0;
 }
@@ -1700,6 +1729,9 @@ void set_keyboard_visible(bool show)
     if (keyboard->visible() == show) return;
     keyboard->set_visible(show);  // 出すときは KeyboardUi 側が描く
     apply_layout();
+    // **QR は端末領域に描いてある。** 畳まずに塗り直すと、消えたのにフラグが
+    // 残って端末が二度と更新されなくなる。
+    hide_auth_qr(/*redraw=*/false);
     // 隠すときはキーボードが居た帯まで端末の行が伸びるので、force で全部塗り直す。
     renderer->render(*term, /*force=*/true);
     ESP_LOGI(TAG, "keyboard %s, terminal %dx%d", show ? "shown" : "hidden", renderer->cols(),
@@ -1773,7 +1805,6 @@ void render_term(bool force)
 
 void cancel_line_prompt();
 void refresh_wifi_nets();
-void hide_auth_qr();
 
 void set_menu_visible(bool show)
 {
@@ -1782,7 +1813,7 @@ void set_menu_visible(bool show)
     // SSH セッションに届かなくなる（`*` だけが出る）。
     cancel_line_prompt();
     s_swipe_start_y = -1;  // 掴んだままメニューに移ると、次のドラッグが飛ぶ
-    if (show) hide_auth_qr();  // QR とメニューが重なる (#59)
+    if (show) hide_auth_qr(/*redraw=*/false);  // QR とメニューが重なる (#59)
     menu->set_visible(show);
     // メニューはキーボードの領域を覆わないので、隠さないと指でキーを押せてしまう。
     // 端末に戻るときは**ユーザが選んだ状態**に戻す（#54 でダブルタップから
@@ -1798,6 +1829,12 @@ void set_menu_visible(bool show)
     } else {
         // キーボードは set_visible(true) が中で描いている。ここで描くと二度塗り。
         renderer->render(*term, /*force=*/true);
+        // **まだ承認待ちなら QR を出し直す (#59)。** ts::Client は同じ URL では
+        // 二度と handler を呼ばないので、ここで戻さないと二度と出せない。
+        if (!s_auth_qr_url.empty() && s_ts_client &&
+            s_ts_client->snapshot().state == ts::ClientStatus::State::kAuthPending) {
+            show_auth_qr(s_auth_qr_url);
+        }
     }
     // ラベルを MENU / CLOSE に切り替える。開閉のたびに必ず描き直す。
     status_bar->draw(gather_status(), /*force=*/true);
@@ -3791,6 +3828,7 @@ int cmd_termcheck(int, char**)
     // メニュー表示中でも端末を描かないと、メニューの画素を読んで FAILED になる
     // （実機で踏んだ）。終わったらメニューを描き直す。
     const bool menu_was_shown = menu && menu->visible();
+    hide_auth_qr(/*redraw=*/false);
     renderer->render(*term, /*force=*/true);
 
     // 期待色は kBase16 (xterm 標準 16 色) と同じ変換で作る。

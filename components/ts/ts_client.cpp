@@ -1,8 +1,9 @@
 #include <cstdint>
 #include "ts_client.hpp"
 
-#include <cstdio>
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 
 #include <cerrno>
@@ -26,6 +27,12 @@ constexpr uint32_t kStreamRegister = 1;  // 最初の register。以後は +2 �
 // 対話ログインで承認を待つ間、register を投げ直す間隔（秒）。
 // **人間がスマホを取り出して認証するまで分単位かかる**ので、詰めても意味がない。
 constexpr int      kAuthPollSec    = 3;
+// 登録が通るまでの持ち時間。authkey があれば数秒で終わる。
+constexpr int      kRegisterTimeoutSec = 60;
+// 対話ログインで人間の承認を待つ持ち時間。**スマホを取り出して認証するまで分単位**。
+constexpr int      kAuthTimeoutSec     = 300;
+// netmap の long-poll を保持する時間。DISCO の往復はこのストリームが開いている間に起きる。
+constexpr int      kMapTimeoutSec      = 600;
 
 int connect_tcp(const char* host, uint16_t port, int timeout_sec)
 {
@@ -399,7 +406,16 @@ bool Client::run_once()
     auto                 take_sid = [&]() { const uint32_t s = next_sid; next_sid += 2; return s; };
     // 対話ログインで待っている間の状態。
     std::string          shown_auth_url;
-    int                  register_after = 0;  // ループ回数（pump が 1 秒待つので秒とほぼ同じ）
+    // **ループ回数を時計に使わない。** pump() はフレームが届くと即 return する
+    // （サーバの PING や keepalive で起きる）ので、回数は経過時間と比例しない。
+    auto now_s = [] {
+        return static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count());
+    };
+    const int start_s      = now_s();
+    int       register_at  = 0;              // これ以降に register を投げ直す（秒）
+    int       deadline_s   = start_s + kRegisterTimeoutSec;
 
     auto handle_frames = [&]() -> bool {
         size_t off = 0;
@@ -480,7 +496,10 @@ bool Client::run_once()
     };
 
     st_.state = ClientStatus::State::kRegistering;
-    for (int i = 0; i < 600 && !stop_; ++i) {
+    // **登録の待ちと map の long-poll で持ち時間を分ける。** 一緒にすると、
+    // 人間が 5 分かけて承認したときに long-poll へ 5 分しか残らず、
+    // 参加した直後にトンネルが黙って落ちる。
+    while (!stop_ && now_s() < deadline_s) {
         if (!pump(1000)) {
             if (st_.error.empty()) set_error("connection closed");
             st_.state = ClientStatus::State::kFailed;
@@ -494,7 +513,7 @@ bool Client::run_once()
 
         // SETTINGS をやり取りしたら register を送る。
         // 対話ログイン中は register_after 秒だけ空けてから投げ直す。
-        if (!sent_register && i >= register_after) {
+        if (!sent_register && now_s() >= register_at) {
             RegisterParams rp;
             rp.capability_version = cfg_.capability_version;
             rp.node_key           = key_to_string("nodekey:", node_pub_);
@@ -543,13 +562,18 @@ bool Client::run_once()
                 // 承認されるまで投げ直す。**新しいストリームで**投げること
                 // （take_sid が次の奇数を返す）。
                 body_register.clear();
-                register_done  = false;
-                sent_register  = false;
-                register_after = i + kAuthPollSec;
+                register_done = false;
+                sent_register = false;
+                register_at   = now_s() + kAuthPollSec;
+                // 承認を待つ間は別の持ち時間で数える。
+                deadline_s = start_s + kAuthTimeoutSec;
                 continue;
             }
             // 通ったら URL は消す。残すと承認後も QR が出たままになる。
             if (!shown_auth_url.empty()) set_auth_url("");
+            // **ここから long-poll の持ち時間を数え直す。** 承認に何分かかっても
+            // netmap を受け取る時間が削られないようにする。
+            deadline_s = now_s() + kMapTimeoutSec;
             if (!rr.machine_authorized) {
                 set_error("machine not authorized");
                 st_.state = ClientStatus::State::kFailed;
