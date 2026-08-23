@@ -690,6 +690,13 @@ void send_input(const std::string& s)
         }
     }
     TermGuard guard;
+    // **取れなかったら描かない。** render_term は PPA 転送を出すので、
+    // ロックの外で走らせると他の描画とキャッシュを取り合って画面が壊れる。
+    // 打鍵は 1 つ落ちるが、壊れた画面より落ちたエコーの方がまし。
+    if (!guard.ok()) {
+        ESP_LOGW(TAG, "send_input: 端末のロックが取れずエコーを捨てた (%d バイト)", (int)s.size());
+        return;
+    }
     term->write(echo);
     render_term();
 }
@@ -792,7 +799,13 @@ int cmd_kbdhw(int, char**)
         return 1;
     }
     std::printf("キーボード検出 fw=0x%02X\n", kbd_hw::version());
-    xTaskCreate(&kbd_task, "kbd", 8192, nullptr, 4, &s_kbd_task);
+    // **失敗を成功と報告しない。** 立たなかったのに「立てた」と出すと、
+    // 打鍵が来ない理由を配線と I2C の側で探すことになる（内蔵ヒープは狭い）。
+    if (xTaskCreate(&kbd_task, "kbd", 8192, nullptr, 4, &s_kbd_task) != pdPASS) {
+        s_kbd_task = nullptr;
+        std::printf("読み取りタスクを立てられなかった（内蔵メモリ不足）\n");
+        return 1;
+    }
     std::printf("読み取りタスクを立てた（`flip 1` で画面も回せる）\n");
     return 0;
 }
@@ -809,7 +822,17 @@ int cmd_kbdlog(int argc, char** argv)
 int cmd_flip(int argc, char** argv)
 {
     if (argc >= 2) {
-        const bool on = (argv[1][0] != '0');
+        // **`off` も受ける。** 隣に並んでいる `kbd [off]` / `kbdlog [off]` と
+        // 同じ表で README に載っているので、`flip off` は自然に打たれる。
+        // 先頭 1 文字だけ見ていると `off` が「反転を有効にする」になっていた。
+        const std::string a = argv[1];
+        const bool        want_off = (a == "0" || a == "off" || a.empty());
+        const bool        want_on  = (a == "1" || a == "on");
+        if (!want_off && !want_on) {
+            std::printf("usage: flip [0|1] (off/on も可)\n");
+            return 1;
+        }
+        const bool on = want_on;
         if (on != screen::flipped()) {
             TermGuard guard;
             if (!guard.ok()) {
@@ -2948,7 +2971,10 @@ extern "C" void app_main(void)
     // **画面の向きでは判定しない**（`flip` で手で戻した後も読み続ける必要がある）。
     if (kbd_hw::present()) {
         // 打鍵ごとに描画経路（sprite への drawString と PPA 転送）を通るので 8KB 取る。
-        xTaskCreate(&kbd_task, "kbd", 8192, nullptr, 4, &s_kbd_task);
+        if (xTaskCreate(&kbd_task, "kbd", 8192, nullptr, 4, &s_kbd_task) != pdPASS) {
+            s_kbd_task = nullptr;
+            ESP_LOGE(TAG, "キーボードの読み取りタスクを立てられなかった（`kbdhw` で再試行）");
+        }
     }
 
     // WiFi。display.init() が C6 の電源 (IO エクスパンダ経由) を入れているので、必ずこの後。

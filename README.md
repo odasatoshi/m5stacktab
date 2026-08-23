@@ -70,7 +70,7 @@ USB Type-C のシリアルコンソール（`screen /dev/cu.usbmodem101 115200`�
 | `kbdhw` | 純正キーボード (Ext.Port1 I2C) の状態を見る／読み取りを立て直す |
 | `kbdlog [off]` | 打鍵をシリアルに出す |
 | `kbdinject <key-name> [mod]` | 打鍵を合成する（mod: 1=Ctrl 4=Alt）。遠隔で送出経路を確かめる |
-| `flip [0\|1]` | 画面を 180 度反転（純正キーボードを付けた向き） |
+| `flip [0\|1\|on\|off]` | 画面を 180 度反転（純正キーボードを付けた向き） |
 | `wgtest` | WireGuard の暗号とハンドシェイクを実機で検証 |
 | `wg <tunnel-ip> [pubkey] [host:port]` | WireGuard トンネルの netif |
 | `wg stat` / `wg disco` / `wg down` | 統計・DISCO 状態・停止 |
