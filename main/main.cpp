@@ -2836,6 +2836,8 @@ bool connect_vpn_profile(const prof::Profile& p, std::string* err)
 // 打鍵は画面キーボードも純正キーボードも send_input を通るので、そこで横取りする。
 bool        s_prompt_active = false;
 bool        s_prompt_mask   = false;  // 伏せ字にする（肩越しに見えないように）
+// プロンプトの間だけ画面キーボードを abc にするので、元のモードを覚えておく。
+bool        s_prompt_prev_direct = false;
 std::string s_prompt_buf;
 // Enter で呼ぶ。**呼ぶ前にプロンプトを畳む**ので、この中から次の入力を始めてよい
 // （隠し SSID は SSID → パスワードと 2 回続けて聞く）。
@@ -2855,6 +2857,7 @@ void cancel_line_prompt()
     // **続きの処理も捨てる。** 残すと、次に別のプロンプトを開いたときに
     // 前回の続きが動く（SSID を聞いていたつもりが VPN に繋ぎに行く）。
     s_prompt_done = nullptr;
+    if (keyboard) keyboard->set_direct(s_prompt_prev_direct);
     // **畳んだことを端末に書く。** 伏せ字だけが残っていると、入力が
     // まだ続いているように見える（実際には次の打鍵は端末へ流れる）。
     term_note("33", "canceled");
@@ -2863,6 +2866,12 @@ void cancel_line_prompt()
 void start_line_prompt(const std::string& label, bool mask,
                        std::function<void(const std::string&)> done)
 {
+    // **かな（フリック）のままでは打てない。** パスワードも SSID も英数なので、
+    // 開いている間だけ abc にして、終わったら元のモードへ戻す。
+    if (keyboard && !s_prompt_active) {
+        s_prompt_prev_direct = keyboard->direct();
+        keyboard->set_direct(true);
+    }
     s_prompt_active = true;
     s_prompt_mask   = mask;
     s_prompt_buf.clear();
@@ -2889,6 +2898,10 @@ bool line_prompt_input(const std::string& in)
             s_prompt_mask   = false;
             s_prompt_buf.clear();
             s_prompt_done = nullptr;
+            // **続きが次のプロンプトを開くなら、その中でまた abc にする。**
+            // ここで戻しておかないと、2 段目 (SSID → パスワード) を抜けたときに
+            // 元のモードが失われる。
+            if (keyboard) keyboard->set_direct(s_prompt_prev_direct);
             term->write("\r\n");
             render_term();
             if (done) done(line);
@@ -3255,6 +3268,14 @@ void wifi_menu_action(MenuUi::Action a, int index)
             break;
         case MenuUi::Action::kWifiAddScanned: {
             if (index < 0 || index >= static_cast<int>(s_wifi_scan_aps.size())) return;
+            // **ここでも見る。** スキャン結果を開いたままシリアルの `wifi` で
+            // 埋まると、聞いてから断ることになる（既に保存済みなら差し替えなので通す）。
+            if (wifi_net_count() >= kMaxWifiNets &&
+                wifi_net_find(s_wifi_scan_aps[index].ssid) < 0) {
+                menu->set_wifi_note(full);
+                menu->draw();
+                return;
+            }
             const std::string ssid(s_wifi_scan_aps[index].ssid);
             const bool        secure = s_wifi_scan_aps[index].secure;
             // 入力は端末に出るので、先に端末へ移る。

@@ -27,6 +27,15 @@ public:
     bool touch_move(int x, int y);
     bool touch_up(int x, int y);
 
+    // 英数直接入力 (abc) かどうか。**パスワード入力の間だけ切り替える**ために公開する
+    // （かな＝フリックのままだと WPA のパスフレーズが打てない）。
+    bool direct() const { return ime_.mode() == ime::Mode::kDirect; }
+    void set_direct(bool v)
+    {
+        ime_.set_direct(v);
+        if (visible_) draw();
+    }
+
     // リモートへ送る文字列が確定したときに呼ばれる。
     void set_output(std::function<void(const std::string&)> fn) { output_ = std::move(fn); }
 
