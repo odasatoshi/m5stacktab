@@ -20,6 +20,82 @@ void check(bool cond, const char* expr, int line)
 }
 #define CHECK(cond) check((cond), #cond, __LINE__)
 
+// 180 度反転 (#15)。**normal に 180 度回した座標を通したものと一致すること**を
+// 不変量にする (両方を手で書くと片方だけ直して 180 度ずれる)。
+void test_flip()
+{
+    rot::Panel n;  // normal
+    rot::Panel f;
+    f.flipped = true;
+
+    for (int ly = 0; ly < n.landscape_h(); ly += 37) {
+        for (int lx = 0; lx < n.landscape_w(); lx += 53) {
+            int fx = 0, fy = 0, ex = 0, ey = 0;
+            rot::landscape_to_native(f, lx, ly, &fx, &fy);
+            // 期待値: normal に 180 度回した座標を通す
+            rot::landscape_to_native(n, n.landscape_w() - 1 - lx, n.landscape_h() - 1 - ly, &ex,
+                                     &ey);
+            CHECK(fx == ex);
+            CHECK(fy == ey);
+            // 範囲に収まる
+            CHECK(fx >= 0 && fx < n.native_w);
+            CHECK(fy >= 0 && fy < n.native_h);
+            // 往復する
+            int rx = 0, ry = 0;
+            rot::native_to_landscape(f, fx, fy, &rx, &ry);
+            CHECK(rx == lx);
+            CHECK(ry == ly);
+        }
+    }
+    // 四隅: 反転すると横向きの左上はネイティブの左下側へ行く
+    int nx = 0, ny = 0;
+    rot::landscape_to_native(f, 0, 0, &nx, &ny);
+    CHECK(nx == 0);
+    CHECK(ny == 1279);
+    rot::landscape_to_native(f, 1279, 719, &nx, &ny);
+    CHECK(nx == 719);
+    CHECK(ny == 0);
+}
+
+// **矩形の変換も反転で確かめる。** present() が実際に呼ぶのはこれで、符号を間違えると
+// PPA の出力先ブロックがフレームバッファの外に出る (転送が ESP_ERR_INVALID_ARG で
+// 落ちて何も映らないが、点の変換のテストは緑のまま通る)。
+// 点と同じ不変量: 反転の矩形 == normal の「180 度回した矩形」。
+void test_flip_rect()
+{
+    rot::Panel n;
+    rot::Panel f;
+    f.flipped = true;
+
+    struct Rect {
+        int x, y, w, h;
+    };
+    // 全画面、中央寄せ (既定の 960x700)、**キーボードを出したときの非対称な位置**
+    const Rect rects[] = {{0, 0, 1280, 720}, {160, 10, 960, 700}, {320, 0, 640, 400},
+                          {0, 0, 1, 1},      {1279, 719, 1, 1},   {320, 160, 640, 400}};
+    for (const Rect& r : rects) {
+        int fx = 0, fy = 0, fw = 0, fh = 0;
+        rot::landscape_rect_to_native(f, r.x, r.y, r.w, r.h, &fx, &fy, &fw, &fh);
+        // 期待値: normal に 180 度回した矩形を通す
+        int ex = 0, ey = 0, ew = 0, eh = 0;
+        rot::landscape_rect_to_native(n, n.landscape_w() - r.x - r.w, n.landscape_h() - r.y - r.h,
+                                      r.w, r.h, &ex, &ey, &ew, &eh);
+        CHECK(fx == ex);
+        CHECK(fy == ey);
+        CHECK(fw == ew);
+        CHECK(fh == eh);
+        // **フレームバッファの外に出ない。** ここが本命 (PPA が弾く条件)
+        CHECK(fx >= 0);
+        CHECK(fy >= 0);
+        CHECK(fw > 0 && fh > 0);
+        CHECK(fx + fw <= n.native_w);
+        CHECK(fy + fh <= n.native_h);
+        // 90 度回るので幅と高さが入れ替わる
+        CHECK(fw == r.h);
+        CHECK(fh == r.w);
+    }
+}
+
 void test_dimensions()
 {
     rot::Panel p;  // 720x1280
@@ -142,6 +218,8 @@ void test_rect()
 
 int main()
 {
+    test_flip();
+    test_flip_rect();
     test_dimensions();
     test_corners();
     test_non_square_panel();

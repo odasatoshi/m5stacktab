@@ -15,6 +15,9 @@ namespace rot {
 struct Panel {
     int native_w = 720;
     int native_h = 1280;
+    // **180 度反転** (#15)。物理キーボードを付けると本体の向きが逆になる。
+    // PPA の角度と M5GFX の rotation も対で変える (片方だけだと 180 度ずれる)。
+    bool flipped = false;
 
     // 横向きで見たときの画面サイズ。
     int landscape_w() const { return native_h; }

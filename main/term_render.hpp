@@ -9,6 +9,17 @@
 
 #include "vt100.hpp"
 
+// 画面の 180 度反転。純正キーボードを付けると本体の向きが逆さになるので、
+// 端末 (PPA) とキーボード・メニュー (M5GFX の rotation) を対で回す。
+// **触るのは 4 箇所（PPA の角度 / rot::Panel::flipped / setRotation / 読み戻し）で、
+// 片方だけ変えると位置は合うのに中身が 180 度ずれ、目視では気づけない。**
+namespace screen {
+bool    flipped();
+void    set_flipped(bool on);
+// M5GFX の setRotation に渡す値。**1 を決め打ちしない**（反転時に鏡像になる）。
+uint8_t rotation();
+}  // namespace screen
+
 class TermRenderer {
 public:
     explicit TermRenderer(M5GFX& gfx) : gfx_(gfx), row_(&gfx) {}

@@ -103,7 +103,21 @@ void append_utf8(std::string& out, uint32_t cp)
 
 // PPA の角度は反時計回りで数える。rot の対応は時計回り 90 度なので 270。
 // rotate.cpp の landscape_to_native と対で意味を持つので、変えるときは両方見る。
-int TermRenderer::ppa_rotation_angle() { return PPA_SRM_ROTATION_ANGLE_270; }
+namespace screen {
+namespace {
+// コンソールのタスクが書いて描画のタスクが読むので volatile。
+volatile bool s_flipped = false;
+}  // namespace
+bool    flipped() { return s_flipped; }
+void    set_flipped(bool on) { s_flipped = on; }
+uint8_t rotation() { return s_flipped ? 3 : 1; }
+}  // namespace screen
+
+// PPA の角度は反時計回り。通常の時計回り 90 度が 270、その 180 度反転が 90。
+int TermRenderer::ppa_rotation_angle()
+{
+    return screen::flipped() ? PPA_SRM_ROTATION_ANGLE_90 : PPA_SRM_ROTATION_ANGLE_270;
+}
 
 void TermRenderer::set_origin_y(int origin_y)
 {
@@ -179,6 +193,7 @@ bool TermRenderer::push_row_ppa(int y, int x_from, int x_to)
     }
 
     rot::Panel rp;
+    rp.flipped = screen::flipped();
     rp.native_w = fb_w_;
     rp.native_h = fb_h_;
     int nx = 0, ny = 0, nw = 0, nh = 0;

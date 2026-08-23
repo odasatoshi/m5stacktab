@@ -68,6 +68,12 @@ jobs:
               components/ui/menu.cpp
           /tmp/test_menu
 
+      - name: Tab5 keyboard key names -> terminal bytes
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \
+              -I main -o /tmp/test_kbd_keys main/test_kbd_keys.cpp
+          /tmp/test_kbd_keys
+
       - name: landscape/native coordinate rotation
         run: |
           c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \

@@ -47,6 +47,8 @@
 #include "ts_control.hpp"
 #include "wg_netif.hpp"
 #include "blake2s.hpp"
+#include "kbd_hw.hpp"
+#include "kbd_keys.hpp"
 #include "kbd_ui.hpp"
 #include "menu_ui.hpp"
 #include "status_bar.hpp"
@@ -65,19 +67,23 @@ const char* TAG = "boot";
 // 保護しないと画面が壊れるうえ、描画時間の計測値も混ざって信用できなくなる。
 SemaphoreHandle_t s_term_lock = nullptr;
 
+// **再帰ミューテックス。** 画面に触る経路は入れ子になる: タッチのループが
+// ロックを持ったまま touch_up_at -> 画面キーボードの emit -> send_input と降りてきて、
+// その先でもう一度 TermGuard を取る。非再帰だと自分のロックを 2 秒待って諦め、
+// **ロック無しで端末を書いて描く**（ロックを入れた目的がそのまま再発する）。
 class TermGuard {
 public:
     TermGuard()
     {
         if (!s_term_lock) return;
-        taken_ = xSemaphoreTake(s_term_lock, pdMS_TO_TICKS(2000)) == pdTRUE;
+        taken_ = xSemaphoreTakeRecursive(s_term_lock, pdMS_TO_TICKS(2000)) == pdTRUE;
         if (!taken_) {
             // 黙って通すと、ロックを入れた目的（画面の破壊と計測値の混入）がそのまま再発する。
             // 呼び出し側は ok() を見て中断する。
             ESP_LOGE(TAG, "terminal lock timeout - skipping this operation");
         }
     }
-    ~TermGuard() { if (taken_) xSemaphoreGive(s_term_lock); }
+    ~TermGuard() { if (taken_) xSemaphoreGiveRecursive(s_term_lock); }
     bool ok() const { return taken_; }
 
 private:
@@ -124,6 +130,14 @@ void apply_layout();
 void set_menu_visible(bool show);
 // メニュー表示中は端末を描かない（メニューの矩形を上書きしてしまう）。
 void render_term(bool force = false);
+// ステータスバーに出す内容を集める（定義は下）。
+StatusBar::Info gather_status();
+// 入力を SSH（未接続なら端末）へ送る（定義は下）。
+void send_input(const std::string& s);
+// 打鍵の行き先（`kbdinject` の報告と、未対応キーの警告を分けるため）。
+enum class KeyResult { kMenu, kSent, kUnknown };
+// 打鍵を 1 つ処理する（定義は下）。実キーも `kbdinject` もここを通す。
+KeyResult kbd_handle_key(const std::string& name, uint8_t mod);
 // 実タッチの生座標をログに出すか。四隅の照合（描画側とタッチ側の回転が
 // 一致しているか）を指で取るときに使う。既定は off（毎タップでログが出ると邪魔）。
 bool s_touch_log = false;
@@ -624,6 +638,227 @@ int cmd_key(int argc, char** argv)
     return 0;
 }
 
+// 打鍵を合成する。**遠隔ではキーを打てない**ので、I2C の読み以外（メニューへの分岐、
+// キー名の変換、DECCKM の切り替え、SSH / 端末への送出）を実キーと同じ関数で確かめる。
+// バイト列まで見たいときは `kbdlog` を on にしてから呼ぶ。
+int cmd_kbdinject(int argc, char** argv)
+{
+    if (argc < 2) {
+        std::printf("usage: kbdinject <key-name> [mod]   mod: 1=Ctrl 4=Alt\n");
+        return 1;
+    }
+    const uint8_t mod = (argc > 2) ? (uint8_t)std::strtoul(argv[2], nullptr, 0) : 0;
+    switch (kbd_handle_key(argv[1], mod)) {
+        case KeyResult::kUnknown:
+            std::printf("未対応のキー名: \"%s\"\n", argv[1]);
+            return 1;
+        case KeyResult::kMenu:
+            std::printf("\"%s\" はメニューが処理した\n", argv[1]);
+            return 0;
+        case KeyResult::kSent:
+            std::printf("\"%s\" mod=0x%02X を送った (%s)\n", argv[1], mod,
+                        ssh_is_connected() ? "SSH へ" : "端末へエコー");
+            return 0;
+    }
+    return 0;
+}
+
+// 入力を送る唯一の経路。画面キーボードも純正キーボードもここを通す。
+// 未接続なら端末にエコーして、繋がなくても打鍵の確認ができるようにする。
+void send_input(const std::string& s)
+{
+    if (s.empty()) return;
+    if (ssh_is_connected()) {
+        ssh_send(s.data(), s.size());
+        return;
+    }
+    // **未接続のエコーだけ手当てする。** リモートへ送るバイトは正しい
+    // （Enter = CR、Backspace = DEL 0x7F）。それをそのまま端末に書くと、
+    // CR は行頭に戻るだけで改行せず、DEL は VT の仕様どおり無視されるので、
+    // 「Enter で次の行に行かない」「Backspace が効かない」に見える。
+    // 普段は端末エミュレータの外（リモートの pty の ICRNL と行編集）がやっている仕事。
+    // ponytail: 桁 0 より前へは消し戻さない。エコーの見た目だけの話なので足りている。
+    std::string echo;
+    echo.reserve(s.size() + 4);
+    for (char c : s) {
+        if (c == '\r') {
+            echo += "\r\n";
+        } else if (c == '\x7F') {
+            echo += "\b \b";
+        } else {
+            echo += c;
+        }
+    }
+    TermGuard guard;
+    // **取れなかったら描かない。** render_term は PPA 転送を出すので、
+    // ロックの外で走らせると他の描画とキャッシュを取り合って画面が壊れる。
+    // 打鍵は 1 つ落ちるが、壊れた画面より落ちたエコーの方がまし。
+    if (!guard.ok()) {
+        ESP_LOGW(TAG, "send_input: 端末のロックが取れずエコーを捨てた (%d バイト)", (int)s.size());
+        return;
+    }
+    term->write(echo);
+    render_term();
+}
+
+// 打鍵をログに出すか（`kbdlog`）。**読み手は kbd タスクひとつに保つ** —
+// I2C の FIFO を 2 つのタスクで取り合うと、イベントが片方に吸われて
+// 「打っても出ないことがある」という再現しない形になる。
+bool         s_kbd_log  = false;
+TaskHandle_t s_kbd_task = nullptr;
+
+// 純正キーボードを読んで送る。**INT (G50) は使わずポーリングしている。**
+// 打鍵の間隔に対して 15ms は十分速く、GPIO の ISR と I2C の排他を足す理由がない。
+// ponytail: 取りこぼしや消費電力が問題になったら INT の立ち下がりで起こす。
+// メニューが出ている間はキーをメニューへ回す。**端末に流してはいけない** —
+// メニュー表示中は render_term が描かないので、押した分が見えないまま溜まり、
+// メニューを閉じた瞬間にまとめて噴き出す。
+// 消費したら true（未対応のキーもメニュー中は捨てる）。
+bool menu_consumed_key(const std::string& name)
+{
+    if (!menu || !menu->visible()) return false;
+    ui::Key k;
+    if (kbd_name_is(name, "up")) {
+        k = ui::Key::kUp;
+    } else if (kbd_name_is(name, "down")) {
+        k = ui::Key::kDown;
+    } else if (kbd_name_is(name, "enter")) {
+        k = ui::Key::kEnter;
+    } else if (kbd_name_is(name, "esc")) {
+        k = ui::Key::kEsc;
+    } else if (kbd_name_is(name, "left")) {
+        k = ui::Key::kLeft;
+    } else if (kbd_name_is(name, "right")) {
+        k = ui::Key::kRight;
+    } else {
+        return true;
+    }
+    // 項目の文字列はメインループが定期的に作り直しているので、ここでは触らない
+    // （set_info の材料集めは NVS と C6 への RPC を含むので、ロックの中でやらない）。
+    TermGuard guard;
+    if (!guard.ok()) return true;
+    menu->key(k);
+    menu->draw();
+    return true;
+}
+
+// 打鍵を 1 つ処理する。**タスクも `kbdinject` もここを通す** —
+// 分けると「合成では通るのに実キーでは通らない」（またはその逆）になって検証にならない。
+// 送るものが無い（未対応のキー名）なら false。
+KeyResult kbd_handle_key(const std::string& name, uint8_t mod)
+{
+    if (menu_consumed_key(name)) {
+        if (s_kbd_log) std::printf("kbd: \"%s\" -> メニュー\n", name.c_str());
+        return KeyResult::kMenu;
+    }
+    // 矢印の形は端末のモード (DECCKM) で変わる。vim や less がこれを切り替える。
+    const bool        app_cursor = term && term->app_cursor_keys();
+    const std::string out        = kbd_key_to_bytes(name, mod, app_cursor);
+    if (s_kbd_log) {
+        std::printf("kbd: \"%s\" mod=0x%02X ->", name.c_str(), mod);
+        for (char c : out) std::printf(" %02X", (unsigned char)c);
+        std::printf("\n");
+    }
+    if (out.empty()) return KeyResult::kUnknown;
+    send_input(out);
+    return KeyResult::kSent;
+}
+
+void kbd_task(void*)
+{
+    for (;;) {
+        char    buf[16] = {};
+        uint8_t mod     = 0;
+        const int n     = kbd_hw::poll(buf, sizeof(buf) - 1, &mod);
+        if (n <= 0) {
+            vTaskDelay(pdMS_TO_TICKS(15));
+            continue;
+        }
+        if (kbd_handle_key(std::string(buf, n), mod) == KeyResult::kUnknown) {
+            ESP_LOGW(TAG, "未対応のキー名: \"%s\" (mod=0x%02X)", buf, mod);
+        }
+    }
+}
+
+// 純正キーボードの状態を見る。**ここでは読まない** — 読むのは kbd タスクだけ。
+// 後から挿したときはここでタスクを立て直せる。
+int cmd_kbdhw(int, char**)
+{
+    // **タスクが動いているならバスに触らない。** `lgfx::i2c` はポートごとの状態を
+    // 持っていて再入できないので、別タスクと START/STOP を混ぜると転送が壊れる。
+    // begin() はモードを書き直して FIFO も捨てるので、打鍵も黙って消える。
+    if (s_kbd_task) {
+        std::printf("キーボード fw=0x%02X、読み取りタスクは動いている"
+                    "（打鍵を見るなら `kbdlog`）\n",
+                    kbd_hw::version());
+        return 0;
+    }
+    if (!kbd_hw::begin()) {
+        std::printf("キーボードが見つからない (0x6D)。バスを舐める:\n");
+        kbd_hw::scan();
+        return 1;
+    }
+    std::printf("キーボード検出 fw=0x%02X\n", kbd_hw::version());
+    // **失敗を成功と報告しない。** 立たなかったのに「立てた」と出すと、
+    // 打鍵が来ない理由を配線と I2C の側で探すことになる（内蔵ヒープは狭い）。
+    if (xTaskCreate(&kbd_task, "kbd", 8192, nullptr, 4, &s_kbd_task) != pdPASS) {
+        s_kbd_task = nullptr;
+        std::printf("読み取りタスクを立てられなかった（内蔵メモリ不足）\n");
+        return 1;
+    }
+    std::printf("読み取りタスクを立てた（`flip 1` で画面も回せる）\n");
+    return 0;
+}
+
+// 打鍵をシリアルに出す。画面を見られないときの証跡。
+int cmd_kbdlog(int argc, char** argv)
+{
+    s_kbd_log = (argc < 2) || (std::string(argv[1]) != "off");
+    std::printf("kbd log: %s\n", s_kbd_log ? "on" : "off");
+    return 0;
+}
+
+// 画面の向きを手で変える（キーボードを後から挿した / 検出に失敗したとき）。
+int cmd_flip(int argc, char** argv)
+{
+    if (argc >= 2) {
+        // **`off` も受ける。** 隣に並んでいる `kbd [off]` / `kbdlog [off]` と
+        // 同じ表で README に載っているので、`flip off` は自然に打たれる。
+        // 先頭 1 文字だけ見ていると `off` が「反転を有効にする」になっていた。
+        const std::string a = argv[1];
+        const bool        want_off = (a == "0" || a == "off" || a.empty());
+        const bool        want_on  = (a == "1" || a == "on");
+        if (!want_off && !want_on) {
+            std::printf("usage: flip [0|1] (off/on も可)\n");
+            return 1;
+        }
+        const bool on = want_on;
+        if (on != screen::flipped()) {
+            TermGuard guard;
+            if (!guard.ok()) {
+                std::printf("busy\n");
+                return 1;
+            }
+            screen::set_flipped(on);
+            display.setRotation(screen::rotation());
+            display.fillScreen(TFT_BLACK);
+            // 全部描き直す。**同じロックの中でやる**（PPA は転送のたびに出力側の
+            // キャッシュを潰すので、端末とキーボードを別々に走らせてはいけない）。
+            status_bar->draw(gather_status(), /*force=*/true);
+            if (menu->visible()) {
+                menu->draw(/*force=*/true);
+            } else {
+                if (keyboard->visible()) keyboard->draw();
+                renderer->render(*term, /*force=*/true);
+            }
+        }
+    }
+    std::printf("画面: %s (rotation %d)\n", screen::flipped() ? "180 度反転" : "通常",
+                (int)screen::rotation());
+    return 0;
+}
+
+
 // 差分転送の効き目を測る。1 文字ずつ書いたときの再描画コストを見る。
 int cmd_bench(int, char**)
 {
@@ -1107,10 +1342,12 @@ void set_menu_visible(bool show)
 int cmd_touchmap(int, char**)
 {
     rot::Panel panel;  // 既定値が 720x1280
+    panel.flipped = screen::flipped();
 
     const uint8_t prev = display.getRotation();
-    display.setRotation(1);
-    std::printf("M5GFX の convertRawXY と components/rotate を照合 (rotation 1):\n");
+    display.setRotation(screen::rotation());
+    std::printf("M5GFX の convertRawXY と components/rotate を照合 (rotation %d):\n",
+                (int)screen::rotation());
 
     // **ビット一致は要求しない。** タッチ側は float のアフィン変換を通り
     // （`_affine[0] * (float)x + ...` を int32 に切り捨てる）、そのあとの
@@ -2220,6 +2457,7 @@ int cmd_ppatest(int, char**)
     }
 
     rot::Panel rp;
+    rp.flipped = screen::flipped();
     int nx = 0, ny = 0, nw = 0, nh = 0;
     rot::landscape_rect_to_native(rp, 0, 0, kW, kH, &nx, &ny, &nw, &nh);
 
@@ -2259,7 +2497,7 @@ int cmd_ppatest(int, char**)
         // （実際にこのコマンド自身が ANGLE_90 のまま取り残されていた）。
         // ソースは左半分が赤・右半分が青と非対称なので、180 度回れば入れ替わる。
         // PPA は転送前に出力窓のキャッシュを無効化するので、読み戻しは PSRAM から来る。
-        display.setRotation(1);
+        display.setRotation(screen::rotation());
         const uint16_t left  = display.readPixel(100, kH / 2);
         const uint16_t right = display.readPixel(kW - 100, kH / 2);
         const bool     ok    = (left == 0xF800 && right == 0x001F);
@@ -2275,10 +2513,11 @@ int cmd_ppatest(int, char**)
         sp.setColorDepth(16);
         if (sp.createSprite(kW, kH)) {
             sp.fillSprite(TFT_GREEN);
-            display.setRotation(1);
+            display.setRotation(screen::rotation());
             const int64_t t1 = esp_timer_get_time();
             sp.pushSprite(0, kH);
-            std::printf("m5gfx pushSprite same size (rotation 1): %lld us\n",
+            std::printf("m5gfx pushSprite same size (rotation %d): %lld us\n",
+                        (int)screen::rotation(),
                         esp_timer_get_time() - t1);
             sp.deleteSprite();
         }
@@ -2321,10 +2560,10 @@ int cmd_screencap(int argc, char** argv)
     // 現在の rotation で読んでいると、直前のコマンドが 0 を残していた場合に
     // 黙って回った PNG が出る（この PR が直したのと同じクラスの失敗）。
     const uint8_t prev_rotation = display.getRotation();
-    display.setRotation(1);
+    display.setRotation(screen::rotation());
     const int w = rw / step;
     const int h = rh / step;
-    std::printf("SCREENCAP %d %d %d rotation=1\n", w, h, step);
+    std::printf("SCREENCAP %d %d %d rotation=%d\n", w, h, step, (int)screen::rotation());
     // 1 行ぶんをまとめて組んでから出す。1 画素ずつ printf すると桁違いに遅い。
     static char line[1281 * 4 + 8];
     for (int y = 0; y < h; ++y) {
@@ -2457,6 +2696,7 @@ int cmd_rottest(int, char**)
         return 1;
     }
     rot::Panel panel;
+    panel.flipped  = screen::flipped();
     panel.native_w = 720;
     panel.native_h = 1280;
 
@@ -2472,7 +2712,7 @@ int cmd_rottest(int, char**)
     // rotation 1 で置いた色が、変換したネイティブ座標にあるかを確かめる。
     // ここが合っていないと、端末 (PPA + rot) とキーボード (M5GFX rotation 1) の
     // 向きが 180 度食い違う。見た目では「天地が逆」になる。
-    display.setRotation(1);
+    display.setRotation(screen::rotation());
     display.fillScreen(TFT_BLACK);
     for (const auto& pt : pts) display.fillCircle(pt.lx, pt.ly, 18, pt.color);
     display.setRotation(0);
@@ -2486,9 +2726,9 @@ int cmd_rottest(int, char**)
         std::printf("  %-13s landscape(%4d,%3d) -> native(%3d,%4d) want %04x got %04x %s\n",
                     pt.name, pt.lx, pt.ly, nx, ny, pt.color, got, ok ? "ok" : "MISMATCH");
     }
-    display.setRotation(1);
+    display.setRotation(screen::rotation());
     if (bad == 0) {
-        std::printf("rotation matches setRotation(1): ok\n");
+        std::printf("rotation matches setRotation(%d): ok\n", (int)screen::rotation());
     } else {
         // どの向きなら合うのかも出す。原因を当てる手間が要らなくなる。
         // 実際に起こる回帰は「90 度を逆向きに取る」= 変換後の点が 180 度ずれる形。
@@ -2507,7 +2747,7 @@ int cmd_rottest(int, char**)
             std::printf("  %-13s native(%3d,%4d) want %04x got %04x\n", pt.name, nx2, ny2,
                         pt.color, got);
         }
-        display.setRotation(1);
+        display.setRotation(screen::rotation());
         std::printf("  180 度回した点なら %d/4 一致\n", 4 - alt_bad);
     }
     // 画面を塗り潰したのでステータスバーを描き直す（誰も描き直さない）。
@@ -2538,6 +2778,13 @@ void register_term_commands()
          nullptr},
         {"bench", "描画コストを測る (全画面 vs 1 文字)", nullptr, &cmd_bench, nullptr, nullptr,
          nullptr},
+        {"flip", "画面を 180 度反転する (純正キーボード用)", "[0|1]", &cmd_flip, nullptr,
+         nullptr, nullptr},
+        {"kbdinject", "打鍵を合成して送出経路を確かめる", "<key-name> [mod]", &cmd_kbdinject,
+         nullptr, nullptr, nullptr},
+        {"kbdhw", "純正キーボード (Ext.Port1 I2C) の状態を見る／読み取りを立て直す", nullptr,
+         &cmd_kbdhw, nullptr, nullptr, nullptr},
+        {"kbdlog", "打鍵をシリアルに出す", "[off]", &cmd_kbdlog, nullptr, nullptr, nullptr},
         {"kbd", "画面キーボードの表示切り替え", "[off]", &cmd_kbd, nullptr, nullptr, nullptr},
         {"menu", "初期メニューの操作", "[show|hide|up|down|enter|esc|left|right]", &cmd_menu,
          nullptr, nullptr, nullptr},
@@ -2589,7 +2836,7 @@ extern "C" void app_main(void)
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
-    s_term_lock = xSemaphoreCreateMutex();
+    s_term_lock = xSemaphoreCreateRecursiveMutex();
     if (!s_term_lock) {
         ESP_LOGE(TAG, "could not create the terminal lock");
         return;
@@ -2602,8 +2849,14 @@ extern "C" void app_main(void)
         ESP_LOGE(TAG, "display.init() failed");
         return;
     }
+    // 純正キーボードを付けると本体の向きが逆さになるので、挿さっていれば画面を 180 度回す。
+    // **display.init() の後に見る**（Ext.Port1 の 5V は M5GFX の Tab5 初期化が入れている）。
+    if (kbd_hw::begin()) {
+        ESP_LOGI(TAG, "キーボード検出 (fw=0x%02X): 画面を 180 度反転する", kbd_hw::version());
+        screen::set_flipped(true);
+    }
     // ターミナル用途なので横向き固定。パネルはネイティブ縦 (720x1280) で来る。
-    display.setRotation(1);
+    display.setRotation(screen::rotation());
     ESP_LOGI(TAG, "board=%d panel=%dx%d colordepth=%d init=%lldms",
              (int)display.getBoard(), (int)display.width(), (int)display.height(),
              (int)display.getColorDepth(), (esp_timer_get_time() - t0) / 1000);
@@ -2712,15 +2965,17 @@ extern "C" void app_main(void)
     menu->set_visible(true);
     // 描画はキーボードの表示が決まってから（下の apply_layout で行う）。
 
-    keyboard->set_output([](const std::string& s) {
-        if (ssh_is_connected()) {
-            ssh_send(s.data(), s.size());
-        } else {
-            TermGuard guard;
-            term->write(s);
-            render_term();
+    keyboard->set_output(send_input);
+
+    // 純正キーボードが挿さっていれば読み取りタスクを立てる（起動時に検出済み）。
+    // **画面の向きでは判定しない**（`flip` で手で戻した後も読み続ける必要がある）。
+    if (kbd_hw::present()) {
+        // 打鍵ごとに描画経路（sprite への drawString と PPA 転送）を通るので 8KB 取る。
+        if (xTaskCreate(&kbd_task, "kbd", 8192, nullptr, 4, &s_kbd_task) != pdPASS) {
+            s_kbd_task = nullptr;
+            ESP_LOGE(TAG, "キーボードの読み取りタスクを立てられなかった（`kbdhw` で再試行）");
         }
-    });
+    }
 
     // WiFi。display.init() が C6 の電源 (IO エクスパンダ経由) を入れているので、必ずこの後。
     if (esp_err_t err = wifi_start(); err != ESP_OK) {
