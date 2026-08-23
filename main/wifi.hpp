@@ -21,3 +21,48 @@ bool wifi_is_connected(void);
 // ステータスバー用。接続していなければ false を返し、出力は触らない。
 // esp_wifi のヘッダを main.cpp に持ち込まないためにここに置く。
 bool wifi_status(char* ssid, size_t ssid_len, int* rssi, char* ip, size_t ip_len);
+
+// --- 保存済みの接続先 (#56) ---
+//
+// **NVS に blob 1 つ**（`wifi/nets`）で持つ。1 件ごとにキーを切ると、消したときの
+// 詰め直しで穴が空いた状態を作りかねない。全体を書き直すほうが小さくて確実。
+// SD の profiles.json (#49) には混ぜない — SD を読む前に繋ぎたいし、
+// SD は抜けば誰でも読めるのでパスワードの置き場として弱い。
+constexpr size_t kMaxWifiNets = 5;
+
+// 一覧に出す 1 件。**パスワードは返さない**（画面に出す用途しかない）。
+struct WifiNetInfo {
+    char ssid[33];
+    bool active;  // 今つながっている
+};
+
+// 一覧をまとめて取る。**1 件ずつ引かないこと** — 引いている間に
+// コンソールの `wifi-del` が走ると、名前と印がずれた並びになる。返り値は件数。
+size_t wifi_net_snapshot(WifiNetInfo* out, size_t max);
+
+// i 番目の SSID。範囲外なら false。
+bool   wifi_net_ssid(size_t i, char* out, size_t len);
+size_t wifi_net_count(void);
+// 今つないでいる設定の index。繋いでいない／消したなら -1。
+int    wifi_net_current(void);
+
+// 足す。**同じ SSID があればパスワードを差し替える**（打ち直しで枠を食わない）。
+// 満杯なら ESP_ERR_NO_MEM、SSID が空か長すぎれば ESP_ERR_INVALID_ARG。
+esp_err_t wifi_net_add(const char* ssid, const char* pass);
+// 消す。**今つながっている設定なら実際に切断する**（一覧と実態が食い違わないように）。
+esp_err_t wifi_net_remove(size_t i);
+// i 番目に繋ぎ直す。次回の起動でもこれを使う。
+esp_err_t wifi_net_connect(size_t i);
+// SSID から index を引く。無ければ -1（足した直後に繋ぐときに使う）。
+int wifi_net_find(const char* ssid);
+
+struct WifiScanEntry {
+    char   ssid[33];
+    int8_t rssi;
+    bool   secure;
+};
+
+// AP を探す。**数秒かかるうえ通信が一瞬止まる。専用タスクから呼ぶこと**
+// （メインループや kbd タスクから呼ぶと画面が固まる）。
+// 見つかった件数（SSID の重複は電波の強いほうだけ残す）、失敗なら負。
+int wifi_scan(WifiScanEntry* out, int max);

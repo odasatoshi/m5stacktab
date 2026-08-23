@@ -19,10 +19,24 @@ enum : int {
     kIdTerminal = 12,
     kIdSavedSsh = 13,  // NVS に保存した 1 件（SD が無いときの経路）
     kIdReload   = 14,
+    kIdWifi     = 15,  // Settings から WiFi の一覧へ (#56)
+    kIdWifiNew  = 20,
+    kIdWifiConn = 21,
+    kIdWifiDel  = 22,
+    kIdWifiMan  = 23,
     kIdBack     = 99,
+    // **index を埋めて返す帯域。互いに重ならないように離してある。**
+    // 下の static_assert が、上限を上げたときの食い込みを止める。
+    kIdWifiNet     = 200,   // 保存済みの N 番目
+    kIdWifiScanned = 400,   // スキャン結果の N 番目
     // SD の接続先。id から profiles の index を戻せるようにしておく (#49)。
     kIdProfile  = 1000,
 };
+
+static_assert(kIdWifiNet + (int)kMaxWifiNets < kIdWifiScanned,
+              "保存済みの id がスキャン結果の帯域に食い込む");
+static_assert(kIdWifiScanned + kMaxWifiScanRows < kIdProfile,
+              "スキャン結果の id が SD の接続先の帯域に食い込む");
 
 }  // namespace
 
@@ -105,9 +119,9 @@ void MenuUi::rebuild()
             add("< Back", kIdBack, true);
             break;
         case Screen::kSettings:
-            // ponytail: 読み取り専用。編集はコンソールから（`wifi` / `ssh`）。
+            // ponytail: WiFi 以外は読み取り専用。編集はコンソールから（`ssh`）。
             std::snprintf(buf, sizeof(buf), "WiFi: %s", info_.wifi);
-            add(buf, 0, false);
+            add(buf, kIdWifi, true);
             std::snprintf(buf, sizeof(buf), "SSH: %s",
                           info_.ssh_target[0] ? info_.ssh_target : "(未設定)");
             add(buf, 0, false);
@@ -116,9 +130,71 @@ void MenuUi::rebuild()
             add("SD を読み直す", kIdReload, true);
             add("< Back", kIdBack, true);
             break;
+        case Screen::kWifi:
+            // 注記は「スキャン中…」「5 件で満杯」など。**画面に理由を出す唯一の場所**
+            // （端末に書いてもメニューを出している間は描かれない）。
+            if (wifi_note_[0]) add(wifi_note_, 0, false);
+            if (wifi_nets_) {
+                for (size_t i = 0; i < wifi_nets_->size() && i < kMaxWifiNets; ++i) {
+                    add((*wifi_nets_)[i].c_str(), kIdWifiNet + static_cast<int>(i), true);
+                }
+            }
+            if (!wifi_nets_ || wifi_nets_->empty()) add("(保存済みなし)", 0, false);
+            add("Create new wifi setting", kIdWifiNew, true);
+            add("< Back", kIdBack, true);
+            break;
+        case Screen::kWifiNet:
+            if (wifi_nets_ && wifi_sel_ >= 0 &&
+                wifi_sel_ < static_cast<int>(wifi_nets_->size())) {
+                add((*wifi_nets_)[wifi_sel_].c_str(), 0, false);
+            }
+            add("接続", kIdWifiConn, true);
+            add("削除", kIdWifiDel, true);
+            add("< Back", kIdBack, true);
+            break;
+        case Screen::kWifiScan: {
+            if (wifi_note_[0]) add(wifi_note_, 0, false);
+            int shown = 0;
+            if (wifi_scan_) {
+                for (size_t i = 0; i < wifi_scan_->size() && shown < kMaxWifiScanRows; ++i) {
+                    add((*wifi_scan_)[i].c_str(), kIdWifiScanned + static_cast<int>(i), true);
+                    ++shown;
+                }
+            }
+            if (shown == 0) add("(AP が見つからない)", 0, false);
+            // 隠し SSID はスキャンに出ないので、打つ逃げ道を残す。
+            add("SSID を手入力", kIdWifiMan, true);
+            add("< Back", kIdBack, true);
+            break;
+        }
     }
     menu_.set_items(items_, n);
 }
+
+// **戻り先を 1 か所にまとめる。** 入れ子が 2 段になったので、"< Back" と Esc が
+// 別々に kRoot へ飛ぶと、WiFi の中から一気に最上位まで戻ってしまう。
+MenuUi::Screen MenuUi::parent_of(Screen s)
+{
+    switch (s) {
+        case Screen::kWifi:     return Screen::kSettings;
+        case Screen::kWifiNet:  return Screen::kWifi;
+        case Screen::kWifiScan: return Screen::kWifi;
+        default:                return Screen::kRoot;
+    }
+}
+
+void MenuUi::set_wifi_note(const std::string& s)
+{
+    std::snprintf(wifi_note_, sizeof(wifi_note_), "%s", s.c_str());
+    if (screen_ == Screen::kWifi || screen_ == Screen::kWifiScan) {
+        // 選択位置は保たない。注記が増減すると行がずれるので、先頭から選び直す。
+        rebuild();
+        dirty_ = true;
+    }
+}
+
+void MenuUi::show_wifi_scan() { enter(Screen::kWifiScan); }
+void MenuUi::show_wifi_list() { enter(Screen::kWifi); }
 
 // 接続先を並べる。**id に index を埋めて返す**ので、並び順が変わっても
 // 選んだ項目と繋ぐ先がずれない。
@@ -178,7 +254,7 @@ bool MenuUi::key(ui::Key k)
             if (action_) action_(Action::kShowTerminal, -1);
             return true;
         }
-        enter(Screen::kRoot);
+        enter(parent_of(screen_));
         return true;
     }
     const int id = menu_.take_activated();
@@ -191,6 +267,17 @@ void MenuUi::activate(int id)
     // SD の接続先。id に埋めた index をそのまま渡す。
     if (id >= kIdProfile) {
         if (action_) action_(Action::kConnectProfile, id - kIdProfile);
+        return;
+    }
+    // **上から順に見る。** 帯域が広いほうから判定しないと、スキャン結果の id が
+    // 保存済みの条件に先に引っかかる。
+    if (id >= kIdWifiScanned) {
+        if (action_) action_(Action::kWifiAddScanned, id - kIdWifiScanned);
+        return;
+    }
+    if (id >= kIdWifiNet) {
+        wifi_sel_ = id - kIdWifiNet;
+        enter(Screen::kWifiNet);
         return;
     }
     switch (id) {
@@ -212,7 +299,26 @@ void MenuUi::activate(int id)
         case kIdReload:
             if (action_) action_(Action::kReloadProfiles, -1);
             break;
-        case kIdBack: enter(Screen::kRoot); break;
+        case kIdWifi:
+            wifi_note_[0] = '\0';
+            enter(Screen::kWifi);
+            break;
+        case kIdWifiNew:
+            // スキャンは数秒かかる。**先に「探している」と出してから**呼び出し側に渡す
+            // （何も出さないと固まったように見える）。
+            set_wifi_note("スキャン中...");
+            if (action_) action_(Action::kWifiScan, -1);
+            break;
+        case kIdWifiConn:
+            if (action_) action_(Action::kWifiConnect, wifi_sel_);
+            break;
+        case kIdWifiDel:
+            if (action_) action_(Action::kWifiDelete, wifi_sel_);
+            break;
+        case kIdWifiMan:
+            if (action_) action_(Action::kWifiAddManual, -1);
+            break;
+        case kIdBack: enter(parent_of(screen_)); break;
         default: break;
     }
 }
@@ -247,6 +353,9 @@ void MenuUi::draw(bool force)
         case Screen::kSsh: title = "SSH"; break;
         case Screen::kVpn: title = "VPN"; break;
         case Screen::kSettings: title = "Settings"; break;
+        case Screen::kWifi:
+        case Screen::kWifiNet: title = "WiFi"; break;
+        case Screen::kWifiScan: title = "WiFi scan"; break;
         case Screen::kRoot: break;
     }
     gfx_.setTextColor(TFT_CYAN, kBg);
