@@ -20,6 +20,7 @@ terminal     : 106x16 (cell 12x24) + 画面キーボード 640x304
 1 文字の再描画: 224us / 849px
 全画面書き換え : 67ms
 WiFi         : ESP32-C6 経由 (esp-hosted / SDIO)、切断時は指数バックオフで再接続
+               接続先を 5 件まで NVS に保存し、画面から追加・選択・削除できる
 SSH          : RSA (PEM) 秘密鍵で認証、PTY 106x16
 かな漢字変換  : にほんご→日本語 160us / かんじ→12 候補 272us
 WireGuard    : netif 100.64.0.0/10 mtu 1280、keepalive と rekey 実装
@@ -56,7 +57,10 @@ USB Type-C のシリアルコンソール（`screen /dev/cu.usbmodem101 115200`�
 
 | コマンド | 用途 |
 |---|---|
-| `wifi <ssid> [password]` | WiFi 設定（NVS に保存して以後自動接続） |
+| `wifi <ssid> [password]` | WiFi 設定（NVS に保存して接続。最大 5 件） |
+| `wifi-list` | 保存済みの WiFi（`*` = 接続中） |
+| `wifi-del <index>` | 保存済みの WiFi を消す |
+| `wifi-scan` | 周りの AP を探す |
 | `wifi-status` | 接続状態 |
 | `ssh <user> <host>` | 秘密鍵で SSH 接続（`sshkey` パーティションの鍵を使う） |
 | `ssh <user> <host> <password> [port]` | パスワードで SSH 接続 |
@@ -79,6 +83,26 @@ USB Type-C のシリアルコンソール（`screen /dev/cu.usbmodem101 115200`�
 | `wg <tunnel-ip> [pubkey] [host:port]` | WireGuard トンネルの netif |
 | `wg stat` / `wg disco` / `wg down` | 統計・DISCO 状態・停止 |
 | `ts <host> <authkey> [port] [capver]` | Tailscale / Headscale の制御プレーンに接続 |
+
+## WiFi の接続先
+
+`Settings → WiFi` に保存済みが並ぶ（**最大 5 件**、`*` が今つながっているもの）。
+選ぶと `接続` / `削除`、`Create new wifi setting` でスキャンして足す。
+
+- **SSID はスキャンから選ぶ。** 打つのはパスワードだけ（画面キーボードはフリック主体なので、
+  SSID を 1 文字ずつ打つ UI は実用に耐えない）。オープンな AP はパスワードも聞かない
+- **隠し SSID は `SSID を手入力`** から。スキャン結果には出ない
+- **今つながっている設定を消すと実際に切断する。** 消したのに繋がったままだと一覧が嘘になる
+- 5 件埋まっているときは**パスワードを聞く前に断る**（打った後で捨てない）
+- **パスワードは純正キーボード (A164) かコンソールから打つ。** 画面キーボードは
+  かな（フリック）専用で ASCII 配列を持っていない（`abc` キーはかな漢字変換を
+  止めるだけで、キーの面は変わらない）
+- 認証方式は入力させない。`threshold.authmode` はパスワードの有無だけで決めていて、
+  実際の方式は esp_wifi が AP に合わせる
+- 保存先は **NVS**。SD の `profiles.json` には混ぜない — SD を読む前に繋ぎたいし、
+  SD は抜けば誰でも読めるのでパスワードの置き場として弱い
+- 起動時は**前回つながったもの**に繋ぐ。繋がらない場所へ移ったら一覧から選ぶ
+  （総当たりはしない）
 
 ## 接続先（SSH / VPN）の設定
 

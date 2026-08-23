@@ -51,6 +51,8 @@ python tools/serial_log.py --seconds 20      # ログ採取
 
 画面の証跡は実機の `screencap` + `tools/screencap.py` で PNG にできる
 （フレームバッファを読むので、写真が撮れない環境でも「画面キャプチャ」の要件を満たせる）。
+**PNG は `docs/screens/` にコミットして PR から参照する** — `gh` は PR 本文に画像を
+上げられないので、リポジトリに置かないと「添付した」がチェックだけになる。
 
 ## ハード由来のハマりどころ
 
@@ -136,6 +138,24 @@ python tools/serial_log.py --seconds 20      # ログ採取
      **1 に決め打ちすると反転時に四隅が入れ替わって偽の NG になる**
   - **物理的な向きはホストからは観測できない。** 読み戻しの経路が全部同じ rotation を
     通るので、画素は反転前後で同じに見える。**実機を見た人の報告が要る**
+- **画面キーボードは かな 専用。ASCII 配列を持っていない**（実機で確認: `abc` にしても
+  キーの面はかなのままで、タップすると「あ」が出る）。`abc` キーの実体も
+  `ime_.set_direct()` だけ。**英数を打たせる UI は純正キーボードかコンソールが前提**になる
+- **`esp_wifi_scan_start` は接続試行と重なると 0 件で返る**（実機で確認）。繋がっている
+  ときは問題ない。**保存済みの AP が無い場所で「新規追加」を開くと必ずリトライ中**なので、
+  リトライを止めてから探して、探し終わったら戻す（戻さないと、スキャンしただけで
+  元の AP に繋ぎ直さなくなる）
+- **WiFi の設定は 5 件まで NVS の blob 1 つ**（`wifi/nets`）に持つ (#56)。1 件しか持てなかった
+  頃の `ssid` / `pass` からは起動時に自動で引き継ぐ。**画面から消したら実際に切断する**ので、
+  `s_reconfiguring` を立ててから `esp_wifi_disconnect` を呼ぶ（立てないと切断イベントで
+  再接続が走り、消した AP に繋ぎ直しに行く）
+- **WiFi の設定変更と RPC は `wifijob` タスク (8KB) に載せる**。パスワード入力の Enter は
+  **kbd タスク (8KB) の上で、しかも `s_term_lock` を握ったまま**返ってくるので、そこから
+  `nvs_set_blob` と `esp_wifi_set_config` を呼ぶと、スタックも足りないうえ描画ループが
+  TermGuard の 2 秒タイムアウトに落ちる（SSH / VPN を `connect` タスクに逃がしてあるのと同じ理由）
+- **`esp_wifi_scan_start(&cfg, true)` は数秒ブロックする。専用タスクに載せる**。
+  メインループや kbd タスク (8KB) の上で走らせると、その間画面が固まる。
+  esp-hosted の RPC が深いので **4096 では残り 1696 バイトしかなかった**（実測）。8192 にしてある
 - **SD カード (SDMMC 4 線, CLK=G43 / CMD=G44 / D0-D3=G39-42) は on-chip LDO の VO4 を
   開けないと一切応答しない**（`sd_pwr_ctrl_new_on_chip_ldo`）。実装は `main/sdcard.cpp`
 - **FatFs の長いファイル名は既定で無効**。`CONFIG_FATFS_LFN_NONE` のままだと 8.3 形式しか
@@ -188,6 +208,19 @@ openssl ec -in ssh_key -out key.pem -param_enc named_curve            # 既存�
 
 鍵のパースだけを確かめたいときは実機の `keytest` コマンドを使う。
 失敗理由は文字列で出る（`CONFIG_MBEDTLS_ERROR_STRINGS` は ESP-IDF の既定が `y`。`sdkconfig.defaults` に明示してあるのは意図を残すためで、これを消しても出る）。**`CONFIG_MBEDTLS_ERROR_C` という symbol は存在しない** ので、書いても `sdkconfig` 再生成のときに `unknown kconfig symbol` の警告が出るだけ。
+
+## static_assert の発火を確かめるときの罠
+
+**定数を書き換えて戻すときに `mv file.bak file` を使ってはいけない。** `mv` は元の
+mtime ごと戻すので、**書き換えたまま作られたオブジェクトのほうが新しくなり、ninja が
+再コンパイルを飛ばす**。戻したはずの定数が焼かれていない実行ファイルができる。
+
+実際に踏んだ (#56): `kMaxWifiNets` を 5 → 10 にして static_assert の発火を確かめ、
+`mv wifi.hpp.bak wifi.hpp` で戻したところ、`wifi.cpp.obj` だけ 10 のまま残った。
+`grep` も `git show` も 5 なのに、**実機では 6 件目が保存できる**という形でしか出ない
+（他の .cpp は static_assert でコンパイル自体が失敗したので 5 のまま = 食い違う）。
+
+戻したら **`touch` するか `git checkout -- <file>` を使い、確認の後は `idf.py fullclean`** を挟む。
 
 ## ホストテストで使う mbedTLS
 
