@@ -39,6 +39,13 @@ public:
     void set_visible(bool v);
 
     void set_info(const Info& info) { info_ = info; }
+    // 純正キーボードが挿さっているか。操作説明の文言を変えるだけに使う (#51)。
+    void set_has_keyboard(bool v)
+    {
+        if (has_kbd_ == v) return;
+        has_kbd_ = v;
+        dirty_   = true;
+    }
     // set_info のあとに呼ぶと、項目の文字列を作り直して次の draw で反映する。
     void refresh();
     void set_action(std::function<void(Action)> fn) { action_ = std::move(fn); }
@@ -66,6 +73,7 @@ private:
     int      row_h_   = 48;
     int      list_top_ = 0;
     bool     dirty_   = true;
+    bool     has_kbd_ = false;
     Info     info_{};
     // 画面ごとの項目。label は下の文字列バッファを指すので、寿命はこのクラスと同じ。
     ui::Item items_[ui::Menu::kMaxItems]{};

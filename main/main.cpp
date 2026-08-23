@@ -747,6 +747,20 @@ bool menu_consumed_key(const std::string& name)
 // 送るものが無い（未対応のキー名）なら false。
 KeyResult kbd_handle_key(const std::string& name, uint8_t mod)
 {
+    // **メニューの開閉はキーボードだけで往復できる必要がある (#51)。**
+    // ステータスバーのタップは残す（キーボードを外したときの唯一の手段）。
+    if (kbd_is_menu_key(name, mod)) {
+        // **menu の null は見る。** 隣の menu_consumed_key も cmd_kbdhw も見ているし、
+        // set_menu_visible 自身も見ている。ここだけ素で引くと不変条件が食い違う。
+        if (!menu) return KeyResult::kMenu;
+        TermGuard guard;
+        if (!guard.ok()) return KeyResult::kMenu;
+        set_menu_visible(!menu->visible());
+        if (s_kbd_log) {
+            std::printf("kbd: menu %s\n", menu->visible() ? "open" : "close");
+        }
+        return KeyResult::kMenu;
+    }
     if (menu_consumed_key(name)) {
         if (s_kbd_log) std::printf("kbd: \"%s\" -> メニュー\n", name.c_str());
         return KeyResult::kMenu;
@@ -806,6 +820,7 @@ int cmd_kbdhw(int, char**)
         std::printf("読み取りタスクを立てられなかった（内蔵メモリ不足）\n");
         return 1;
     }
+    if (menu) menu->set_has_keyboard(true);  // 操作説明をキーの案内に切り替える (#51)
     std::printf("読み取りタスクを立てた（`flip 1` で画面も回せる）\n");
     return 0;
 }
@@ -2931,8 +2946,9 @@ extern "C" void app_main(void)
     menu->set_action([](MenuUi::Action a) {
         switch (a) {
             case MenuUi::Action::kOpenSsh: {
-                menu->set_visible(false);
-                render_term(/*force=*/true);
+                // 端末に移るのは set_menu_visible の仕事（画面キーボードの再表示と
+                // 行数の張り直しがここにある）。直に set_visible すると隠れたままになる。
+                set_menu_visible(false);
                 // 保存済みの設定で繋ぐ。無ければ端末にそう出す。
                 SshConfig cfg;
                 if (ssh_config_load(cfg) != ESP_OK || cfg.host.empty()) {
@@ -2951,8 +2967,10 @@ extern "C" void app_main(void)
                 break;
             }
             case MenuUi::Action::kShowTerminal:
-                menu->set_visible(false);
-                render_term(/*force=*/true);
+                // **set_menu_visible を通す。** menu->set_visible(false) を直に呼ぶと
+                // 画面キーボードが隠れたまま・配分もメニューのまま・スワイプの
+                // 掴み位置も残る（ステータスバーのタップとの食い違いになる）。
+                set_menu_visible(false);
                 break;
             case MenuUi::Action::kTsConnect:
             case MenuUi::Action::kWgUp:
@@ -2962,6 +2980,8 @@ extern "C" void app_main(void)
         }
     });
     menu->set_info(gather_menu_info(gather_status()));
+    // 操作説明をキーボードの有無で変える (#51)。挿さっていないのにキーを案内すると嘘になる。
+    menu->set_has_keyboard(kbd_hw::present());
     menu->set_visible(true);
     // 描画はキーボードの表示が決まってから（下の apply_layout で行う）。
 
