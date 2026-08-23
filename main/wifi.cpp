@@ -159,10 +159,12 @@ void retry_timer_cb(void*)
     // esp_wifi_connect() を叩き続ける。
     if (wifi_is_connected()) return;
     esp_err_t err = esp_wifi_connect();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(err));
-        schedule_reconnect();
-    }
+    if (err == ESP_OK) return;
+    // **既に繋ぎに行っている最中なら降りる。** 失敗すれば切断イベントが改めて
+    // スケジュールするので、1 秒ごとに叩き直す意味がない（実機で 3 連発した）。
+    if (err == ESP_ERR_WIFI_CONN) return;
+    ESP_LOGE(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(err));
+    schedule_reconnect();
 }
 
 void on_wifi_event(void*, esp_event_base_t base, int32_t id, void* data)
