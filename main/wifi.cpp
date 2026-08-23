@@ -30,8 +30,14 @@ EventGroupHandle_t  s_events   = nullptr;
 constexpr int       kConnected = BIT0;
 bool                s_started  = false;
 int                 s_retry    = 0;
-// 自分で切ったときの切断イベントで再接続を走らせないための印。
-bool                s_reconfiguring = false;
+// **消したときだけ立てる掛け金。** 自動再接続を止める。次に明示的に繋ぐまで下りない。
+//
+// 以前は「自分で切ったぶんの切断イベントを 1 回だけ飲む」印だったが、
+// **未接続のときの `esp_wifi_disconnect()` はイベントを出さない**ので、印が残ったまま
+// 次に来る「新しい接続の失敗」を飲んでしまい、**再接続が一度もスケジュールされず
+// 端末が黙って永久にオフラインになる**（実機のログで確認: `hiden` を足した直後の
+// reason=201 に `reconnect in` が続かず 39 秒間なにもしていなかった）。
+bool                s_no_auto_reconnect = false;
 esp_timer_handle_t  s_retry_timer   = nullptr;
 
 // --- 保存済みの接続先 (#56) ---
@@ -148,6 +154,10 @@ void schedule_reconnect()
 
 void retry_timer_cb(void*)
 {
+    // **既に繋がっているなら何もしない。** 繋ぎ直しの取りこぼしを拾うために
+    // 余分にスケジュールされることがあるので、ここで止めないと接続中に
+    // esp_wifi_connect() を叩き続ける。
+    if (wifi_is_connected()) return;
     esp_err_t err = esp_wifi_connect();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(err));
@@ -162,9 +172,9 @@ void on_wifi_event(void*, esp_event_base_t base, int32_t id, void* data)
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         auto* e = static_cast<wifi_event_sta_disconnected_t*>(data);
         if (s_events) xEventGroupClearBits(s_events, kConnected);
-        if (s_reconfiguring) {
-            // 設定変更で自分から切ったぶん。次の connect は呼び出し側が出している。
-            s_reconfiguring = false;
+        if (s_no_auto_reconnect) {
+            // 消したぶん。**掛け金は下ろさない** — 明示的に繋ぐまで再接続しない。
+            ESP_LOGI(TAG, "disconnected (reason=%d), auto reconnect disabled", e->reason);
             return;
         }
         ESP_LOGW(TAG, "disconnected (reason=%d)", e->reason);
@@ -192,9 +202,8 @@ esp_err_t connect_with(const char* ssid, const char* pass)
     cfg.sta.threshold.authmode = pass[0] ? WIFI_AUTH_WPA_PSK : WIFI_AUTH_OPEN;
 
     s_retry = 0;
-    // 削除で立てた印が残っていることがある。明示的に繋ぐ時点で必ず落とす
-    // （残すと、この接続が切れたときの再接続が 1 回だけ黙って飛ぶ）。
-    s_reconfiguring = false;
+    // 明示的に繋ぐので掛け金を下ろす。
+    s_no_auto_reconnect = false;
     // **「繋がっている」印もここで落とす。** 別の設定へ移る時点で前の接続は
     // 手放しているのに、切断イベントが来るまで印が残る。その間に一覧を出すと
     // **繋がっていない設定に `*` が付く**（実機で確認）。
@@ -205,13 +214,12 @@ esp_err_t connect_with(const char* ssid, const char* pass)
         ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi_start");  // STA_START で connect する
         s_started = true;
     } else {
-        // 自分で切った切断イベントで再接続ハンドラが動くと、この connect を潰してしまう。
-        s_reconfiguring = true;
-        esp_err_t err   = esp_wifi_disconnect();
-        if (err != ESP_OK) {
-            s_reconfiguring = false;
-            ESP_LOGW(TAG, "esp_wifi_disconnect: %s", esp_err_to_name(err));
-        }
+        // **切断イベントを飲まない。** 飲むと、未接続でここに来たときに
+        // 「新しい接続の失敗」を飲んでリトライが始まらなくなる。
+        // このあと切断イベントで余分に 1 回スケジュールされ得るが、
+        // retry_timer_cb が繋がっていれば何もしないので害はない。
+        const esp_err_t derr = esp_wifi_disconnect();
+        if (derr != ESP_OK) ESP_LOGW(TAG, "esp_wifi_disconnect: %s", esp_err_to_name(derr));
         ESP_RETURN_ON_ERROR(esp_wifi_connect(), TAG, "connect");
     }
     ESP_LOGI(TAG, "connecting to \"%s\"", ssid);
@@ -484,12 +492,12 @@ esp_err_t wifi_net_remove(size_t i)
     if (was_current) {
         // **実際に切る。** 消したのに繋がったままだと、一覧と実態が食い違う。
         if (s_retry_timer) esp_timer_stop(s_retry_timer);
-        // 切断イベントで再接続が走らないようにしてから切る。
-        s_reconfiguring = true;
+        // 掛け金を立ててから切る。**明示的に繋ぐまで自動再接続しない。**
+        s_no_auto_reconnect = true;
         // **未接続でも呼ぶ。** 繋ぎに行っている最中（リトライ中）に消したとき、
         // 呼ばないと STA の config に消した SSID が残ったままアソシエーションが
-        // 成功し得る（一覧に無い AP に繋がる）。印も立てっぱなしになる。
-        if (esp_wifi_disconnect() != ESP_OK) s_reconfiguring = false;
+        // 成功し得る（一覧に無い AP に繋がる）。
+        esp_wifi_disconnect();
         ESP_LOGI(TAG, "removed the active network; disconnected");
     }
     return ESP_OK;
@@ -537,7 +545,7 @@ int wifi_scan(WifiScanEntry* out, int max)
     const bool was_retrying = !wifi_is_connected() && s_current >= 0;
     if (was_retrying) {
         if (s_retry_timer) esp_timer_stop(s_retry_timer);
-        s_reconfiguring = true;  // この切断で再接続を走らせない
+        s_no_auto_reconnect = true;  // この切断で再接続を走らせない
         esp_wifi_disconnect();
         vTaskDelay(pdMS_TO_TICKS(100));  // 切断イベントが流れるのを待つ
     }
@@ -554,7 +562,7 @@ int wifi_scan(WifiScanEntry* out, int max)
             if (!on) return;
             // **バックオフは引き継ぐ。** 0 に戻すと、スキャンするたびに 500ms から
             // やり直しになって指数バックオフが育たない。
-            s_reconfiguring = false;
+            s_no_auto_reconnect = false;
             // **失敗を拾う。** ここで諦めると、リトライタイマは既に止めてあり、
             // 接続が始まらない以上 DISCONNECTED も来ないので**再武装する者が
             // 誰もいなくなる** — このコミットが防ごうとした「スキャンしただけで
