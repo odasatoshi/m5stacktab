@@ -62,8 +62,9 @@ USB Type-C のシリアルコンソール（`screen /dev/cu.usbmodem101 115200`�
 | `ssh <user> <host> <password> [port]` | パスワードで SSH 接続 |
 | `key <text>` | SSH にキー入力を送る（`\e` = ESC。キーボードが無いときの入力手段） |
 | `sshclose` | SSH 切断 |
-| `profiles [reload]` | SD の接続先を一覧する／読み直す（飛ばした項目の理由も出る） |
-| `connect <name\|index>` | SD の接続先に繋ぐ（メニューから選ぶのと同じ経路） |
+| `profiles [reload\|import\|clear]` | 接続先 (NVS) の一覧／SD からの取り込み／消去 |
+| `connect <name\|index>` | 接続先に繋ぐ（メニューから選ぶのと同じ経路） |
+| `nvsstat` | NVS の使用量と中身を見る |
 | `conv <romaji>` | ローマ字→かな→漢字を試す |
 | `term <text>` / `termtest` / `termscroll` | 端末描画の確認（`\e` でエスケープを送れる） |
 | `bench` | 描画コストの実測（全画面 vs 1 文字） |
@@ -79,34 +80,45 @@ USB Type-C のシリアルコンソール（`screen /dev/cu.usbmodem101 115200`�
 | `wg stat` / `wg disco` / `wg down` | 統計・DISCO 状態・停止 |
 | `ts <host> <authkey> [port] [capver]` | Tailscale / Headscale の制御プレーンに接続 |
 
-## 接続先を SD カードに置く
+## 接続先（SSH / VPN）の設定
 
-接続先（SSH / VPN）は SD カードの JSON に書く。メニューの `SSH` / `VPN` に一覧が出て、
-選んでから繋ぐ。SD が無ければ従来どおり NVS に保存した 1 件（`ssh` コマンド）を使う。
+接続先と鍵は **NVS に保存する**。SD カードは PC で書いた設定を**取り込むための入力**で、
+取り込んだ後は挿していなくてよい。メニューの `SSH` / `VPN` に一覧が出て、選んでから繋ぐ。
 
-```
-/sdcard/tab5/profiles.json   設定本体（上限 64KB / 32 プロファイル）
-/sdcard/tab5/keys/           鍵ファイル（SSH の PEM、WireGuard の秘密鍵、Tailscale の authkey）
+```sh
+# SD に置いて（PC 側で）
+#   /sdcard/tab5/profiles.json  （NVS に置くので 8KB まで）
+#   /sdcard/tab5/keys/          鍵ファイル（SSH の PEM / WireGuard の秘密鍵 / authkey）
+# 端末で取り込む
+tab5> profiles import
+取り込んだ: 7 件、鍵 3 本（SD は抜いてよい）
+
+tab5> profiles          # NVS の中身を見る
+tab5> profiles clear    # 取り込んだものを全部消す
 ```
 
 `docs/profiles.example.json` をコピーして書き換える。
 
-- **`name` が一覧に出る名前で、`via` の参照先でもある。** 重複したら読み込みごと失敗する
+- **`name` が一覧に出る名前で、`via` の参照先でもある。** 重複したら取り込みごと失敗する
   （どちらに繋がったのか分からないのが一番困るため）
 - **鍵と authkey は JSON に埋めない。** `keys/` 配下の**ファイル名だけ**を書く
-  （ディレクトリを含む名前は拒否する）
+  （ディレクトリを含む名前は拒否する）。**NVS のキー名の都合で 13 文字まで**
 - パスワードは書けるが既定にしない。`"auth": "password"` で `password` を書かなければ、
   繋ぐときに画面から入力させる（入力中はエコーしない）
 - 鍵の形式の制約は `sshkey` パーティションと同じ（**PEM のみ。OpenSSH 形式と ed25519 は不可**。
   ECDSA は named curve）
-- 未知のキーは黙って無視、未知の `type` や必須項目の欠けは**その項目だけ**飛ばす
-  （`profiles` コマンドで飛ばした理由が見られる）
+- 未知のキーは黙って無視、未知の `type`・必須項目の欠け・**鍵の取り込み失敗**は
+  **その項目だけ**飛ばす（理由が `profiles import` と画面に出る）
+- **`profiles import` は毎回「消してから書く」。** 鍵の名前を変えたり接続先を消したりしても、
+  古い秘密鍵が NVS に residue として残らない
 
-> **秘密鍵を SD に置くのは `sshkey` パーティションより弱い。抜き取られたら終わり。**
-> 持ち歩く端末なので、失っても困らない鍵（用途を限った専用鍵）を置くこと。
+> **NVS はフラッシュを吸えば読める。** SD より強いのは「抜き差しできない」ぶんだけで、
+> 秘密鍵を置いている以上、端末を失ったら失効させること。
+> 持ち歩く端末には用途を限った専用鍵を置く。
 
 WireGuard は netif のアドレス 1 本ぶんしか経路を持てないので、`allowed_ips` は
-**先頭の 1 本だけ**をネットマスクとして使う。
+**先頭の 1 本だけ**をネットマスクとして使う。`peer.endpoint` は名前を引けないので
+リテラルの IPv4 で書く。
 
 ## タッチの割り当て
 
