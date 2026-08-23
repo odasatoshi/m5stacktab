@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "profiles": [
+    {
+      "name": "bastion",
+      "type": "ssh",
+      "host": "10.0.0.5",
+      "port": 22,
+      "user": "oda",
+      "auth": "key",
+      "key": "id_rsa_work",
+      "via": "hq"
+    },
+    {
+      "name": "laptop",
+      "type": "ssh",
+      "host": "192.168.0.101",
+      "user": "oda",
+      "auth": "password"
+    },
+    {
+      "name": "hq",
+      "type": "wireguard",
+      "address": "10.9.0.2/32",
+      "private_key": "wg_hq.key",
+      "peer": {
+        "pubkey": "SGVsbG8gV2lyZUd1YXJkIHB1YmxpYyBrZXkhIQ=",
+        "endpoint": "203.0.113.10:51820",
+        "allowed_ips": ["10.0.0.0/8"]
+      }
+    },
+    {
+      "name": "home",
+      "type": "tailscale",
+      "control": "headscale.example.com",
+      "port": 8080,
+      "authkey": "ts_home.key"
+    }
+  ]
+}

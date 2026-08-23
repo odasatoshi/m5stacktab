@@ -129,6 +129,13 @@ jobs:
               components/ts/ts_control.cpp -lmbedcrypto
           /tmp/test_ctrl
 
+      - name: SD の接続先 (profiles.json) パーサ
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \
+              -I components/profiles -I/usr/include/cjson -o /tmp/test_prof \
+              components/profiles/test_profiles.cpp components/profiles/profiles.cpp -lcjson
+          /tmp/test_prof
+
       - name: netmap parser
         run: |
           c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \

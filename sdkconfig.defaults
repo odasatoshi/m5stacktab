@@ -69,3 +69,11 @@ CONFIG_MBEDTLS_CHACHAPOLY_C=y
 # mbedTLS のエラー文字列。無効だと mbedtls_strerror が何も返さず、
 # 鍵のパース失敗などの原因が分からない（#17 の調査で必要になった）。
 CONFIG_MBEDTLS_ERROR_STRINGS=y
+
+# --- SD カードの接続先 (#49) ---
+# **長いファイル名を有効にしないと profiles.json が見えない。** 既定は
+# CONFIG_FATFS_LFN_NONE で 8.3 形式しか読めず、stat が ENOENT を返す
+# （実機で踏んだ: カードには置いてあるのに「が無い」と出た）。
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_MAX_LFN=255
+CONFIG_FATFS_API_ENCODING_UTF_8=y

@@ -17,7 +17,11 @@ enum : int {
     kIdTs       = 10,
     kIdWg       = 11,
     kIdTerminal = 12,
+    kIdSavedSsh = 13,  // NVS に保存した 1 件（SD が無いときの経路）
+    kIdReload   = 14,
     kIdBack     = 99,
+    // SD の接続先。id から profiles の index を戻せるようにしておく (#49)。
+    kIdProfile  = 1000,
 };
 
 }  // namespace
@@ -29,6 +33,9 @@ void MenuUi::set_area(int top, int height)
     row_h_    = 48;
     // 見出し 1 行ぶん下げてから項目を並べる。
     list_top_ = top_ + 56;
+    // 操作説明の 1 行ぶん (32px) を残して、入るだけ並べる。
+    // **32 件のプロファイルは画面に入らない**ので、窓からはみ出す分はスクロールする。
+    menu_.set_visible_rows((top_ + height_ - 40 - list_top_) / row_h_);
     dirty_    = true;
     if (menu_.count() == 0) rebuild();
 }
@@ -70,7 +77,7 @@ void MenuUi::rebuild()
         ++n;
     };
 
-    char buf[72];
+    char buf[96];
     switch (screen_) {
         case Screen::kRoot:
             add("SSH", kIdSsh, true);
@@ -78,30 +85,84 @@ void MenuUi::rebuild()
             add("Settings", kIdSettings, true);
             add("Terminal", kIdTerminal, true);
             break;
+        case Screen::kSsh:
+            add_profiles(/*ssh=*/true, &n);
+            // NVS の 1 件はいつでも残す。SD が読めなくても繋げる経路が要る。
+            std::snprintf(buf, sizeof(buf), "保存済み: %s",
+                          info_.ssh_target[0] ? info_.ssh_target : "(未設定)");
+            add(buf, kIdSavedSsh, info_.ssh_target[0] != '\0');
+            add("< Back", kIdBack, true);
+            break;
         case Screen::kVpn:
-            // ponytail: 接続先の設定を NVS に持っていないので、今は状態表示だけ。
-            // 保存できるようにしたら enabled にして繋ぐ動作を足す（#39 の続き）。
             std::snprintf(buf, sizeof(buf), "Tailscale: %s", info_.ts_state);
-            add(buf, kIdTs, false);
+            add(buf, 0, false);
             std::snprintf(buf, sizeof(buf), "WireGuard: %s", info_.wg_state);
-            add(buf, kIdWg, false);
-            add("(接続はシリアルの ts / wg から)", 0, false);
+            add(buf, 0, false);
+            add_profiles(/*ssh=*/false, &n);
             // 指だけで戻れる経路。全項目が状態表示だと hit_test が常に -1 になり、
             // Esc を送る手段（シリアル）が無いと出られない。
             add("< Back", kIdBack, true);
             break;
         case Screen::kSettings:
-            // ponytail: 読み取り専用。編集はキーボード (#15) が来てから。
+            // ponytail: 読み取り専用。編集はコンソールから（`wifi` / `ssh`）。
             std::snprintf(buf, sizeof(buf), "WiFi: %s", info_.wifi);
             add(buf, 0, false);
             std::snprintf(buf, sizeof(buf), "SSH: %s",
                           info_.ssh_target[0] ? info_.ssh_target : "(未設定)");
             add(buf, 0, false);
-            add("(設定はシリアルの wifi / ssh から)", 0, false);
+            std::snprintf(buf, sizeof(buf), "SD: %s", info_.sd);
+            add(buf, 0, false);
+            add("SD を読み直す", kIdReload, true);
             add("< Back", kIdBack, true);
             break;
     }
     menu_.set_items(items_, n);
+}
+
+// 接続先を並べる。**id に index を埋めて返す**ので、並び順が変わっても
+// 選んだ項目と繋ぐ先がずれない。
+void MenuUi::add_profiles(bool ssh, int* n)
+{
+    auto add = [&](const char* text, int id, bool enabled) {
+        if (*n >= ui::Menu::kMaxItems) return;
+        std::snprintf(labels_[*n], sizeof(labels_[*n]), "%s", text);
+        items_[*n].label   = labels_[*n];
+        items_[*n].id      = id;
+        items_[*n].enabled = enabled;
+        ++(*n);
+    };
+
+    if (!profiles_) return;
+    if (!profiles_->error.empty()) {
+        // **読めなかった理由を画面に出す。** 黙って空にすると
+        // 「SD を挿し忘れた」のか「JSON を壊した」のか分からない。
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "SD: %s", profiles_->error.c_str());
+        add(buf, 0, false);
+        return;
+    }
+    int shown = 0;
+    for (size_t i = 0; i < profiles_->profiles.size(); ++i) {
+        const prof::Profile& p = profiles_->profiles[i];
+        const bool is_ssh = (p.type == prof::Type::kSsh);
+        if (is_ssh != ssh) continue;
+        char buf[96];
+        if (is_ssh) {
+            // via があれば「先に張る VPN」も見せる。繋いだ後で気づくと遅い。
+            char via[24] = {};
+            if (!p.via.empty()) std::snprintf(via, sizeof(via), " via %s", p.via.c_str());
+            std::snprintf(buf, sizeof(buf), "%s  %s@%s:%u%s", p.name.c_str(), p.user.c_str(),
+                          p.host.c_str(), (unsigned)p.port, via);
+        } else {
+            std::snprintf(buf, sizeof(buf), "%s  %s  %s", p.name.c_str(), prof::type_name(p.type),
+                          p.type == prof::Type::kTailscale ? p.control.c_str()
+                                                           : p.peer.endpoint.c_str());
+        }
+        add(buf, kIdProfile + static_cast<int>(i), true);
+        ++shown;
+    }
+    if (shown == 0) add(ssh ? "(SD に ssh のプロファイルが無い)"
+                            : "(SD に VPN のプロファイルが無い)", 0, false);
 }
 
 bool MenuUi::key(ui::Key k)
@@ -113,7 +174,7 @@ bool MenuUi::key(ui::Key k)
         // 最上位の Esc / ← は端末へ戻る。**指を使わずメニューから出る経路がここしかない**
         // （Terminal の項目まで下りて Enter でも出られるが、Esc で閉じるほうが速い）。
         if (screen_ == Screen::kRoot) {
-            if (action_) action_(Action::kShowTerminal);
+            if (action_) action_(Action::kShowTerminal, -1);
             return true;
         }
         enter(Screen::kRoot);
@@ -126,20 +187,29 @@ bool MenuUi::key(ui::Key k)
 
 void MenuUi::activate(int id)
 {
+    // SD の接続先。id に埋めた index をそのまま渡す。
+    if (id >= kIdProfile) {
+        if (action_) action_(Action::kConnectProfile, id - kIdProfile);
+        return;
+    }
     switch (id) {
-        case kIdSsh:
-            if (action_) action_(Action::kOpenSsh);
-            break;
+        case kIdSsh: enter(Screen::kSsh); break;
         case kIdVpn: enter(Screen::kVpn); break;
         case kIdSettings: enter(Screen::kSettings); break;
         case kIdTerminal:
-            if (action_) action_(Action::kShowTerminal);
+            if (action_) action_(Action::kShowTerminal, -1);
+            break;
+        case kIdSavedSsh:
+            if (action_) action_(Action::kOpenSsh, -1);
             break;
         case kIdTs:
-            if (action_) action_(Action::kTsConnect);
+            if (action_) action_(Action::kTsConnect, -1);
             break;
         case kIdWg:
-            if (action_) action_(Action::kWgUp);
+            if (action_) action_(Action::kWgUp, -1);
+            break;
+        case kIdReload:
+            if (action_) action_(Action::kReloadProfiles, -1);
             break;
         case kIdBack: enter(Screen::kRoot); break;
         default: break;
@@ -173,6 +243,7 @@ void MenuUi::draw(bool force)
 
     const char* title = "m5stacktab";
     switch (screen_) {
+        case Screen::kSsh: title = "SSH"; break;
         case Screen::kVpn: title = "VPN"; break;
         case Screen::kSettings: title = "Settings"; break;
         case Screen::kRoot: break;
@@ -180,8 +251,12 @@ void MenuUi::draw(bool force)
     gfx_.setTextColor(TFT_CYAN, kBg);
     gfx_.drawString(title, 24, top_ + 16);
 
-    for (int i = 0; i < menu_.count(); ++i) {
-        const int  y   = list_top_ + i * row_h_;
+    // 窓の中だけ描く。**hit_test と同じ first_visible を使う**（片方だけ直すと
+    // 押した行と繋ぐ先がずれる）。
+    const int first = menu_.first_visible();
+    const int rows  = (menu_.visible_rows() > 0) ? menu_.visible_rows() : menu_.count();
+    for (int i = first; i < menu_.count() && i < first + rows; ++i) {
+        const int  y   = list_top_ + (i - first) * row_h_;
         // 選べない項目には目印を付けない。全部が状態表示の画面（VPN / Settings）で
         // 先頭に > が付くと、選べるように見えて紛らわしい。
         const bool sel = (i == menu_.selected()) && menu_.item(i).enabled;
@@ -192,6 +267,18 @@ void MenuUi::draw(bool force)
         // 選択の目印。指で触るときも「今どこか」が分かるようにする。
         gfx_.drawString(sel ? ">" : " ", 24, y + (row_h_ - 24) / 2);
         gfx_.drawString(it.label, 56, y + (row_h_ - 24) / 2);
+    }
+
+    // 窓の外にまだ項目があることを示す。出さないと「4 件しかない」と読める。
+    if (first + rows < menu_.count() || first > 0) {
+        char more[48];
+        std::snprintf(more, sizeof(more), "%d-%d / %d", first + 1,
+                      (first + rows < menu_.count()) ? first + rows : menu_.count(),
+                      menu_.count());
+        gfx_.setTextColor(kHint, kBg);
+        gfx_.setTextDatum(textdatum_t::top_right);
+        gfx_.drawString(more, gfx_.width() - 24, top_ + 16);
+        gfx_.setTextDatum(textdatum_t::top_left);
     }
 
     gfx_.setTextColor(kHint, kBg);
