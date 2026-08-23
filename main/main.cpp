@@ -52,6 +52,7 @@
 #include "kbd_keys.hpp"
 #include "kbd_ui.hpp"
 #include "menu_ui.hpp"
+#include "nvs_store.hpp"
 #include "profiles.hpp"
 #include "sdcard.hpp"
 #include "status_bar.hpp"
@@ -546,45 +547,38 @@ int cmd_scroll(int argc, char** argv)
     return 0;
 }
 
-// keys/ 配下の 1 ファイルを読む。**ファイル名だけを受ける**（パーサが
-// ディレクトリ入りの名前を弾いているので、ここで組み立てても外へは出ない）。
-bool read_key_file(const std::string& name, size_t max_bytes, std::string* out, std::string* err)
+// 鍵を読む。**正式な置き場は NVS** (#57) — SD は取り込み元でしかないので、
+// ここでは SD を見ない（挿していなくても繋がる必要がある）。
+bool read_key(const std::string& name, std::string* out, std::string* err)
 {
     if (name.empty()) {
         *err = "鍵のファイル名が空";
         return false;
     }
-    const std::string path = std::string(kKeysDir) + name;
-    switch (esp_err_t e = sd_read_file(path.c_str(), max_bytes, out)) {
+    switch (esp_err_t e = nvs_key_load(name, out)) {
         case ESP_OK: return true;
-        case ESP_ERR_NOT_FOUND: *err = path + " が無い"; return false;
-        case ESP_ERR_INVALID_SIZE: *err = path + " が大きすぎる"; return false;
-        case ESP_ERR_INVALID_STATE: *err = "SD がマウントされていない"; return false;
-        default: *err = path + ": " + esp_err_to_name(e); return false;
+        case ESP_ERR_NVS_NOT_FOUND:
+            *err = "鍵 \"" + name + "\" が取り込まれていない（`profiles import`）";
+            return false;
+        case ESP_ERR_INVALID_ARG:
+            *err = "鍵の名前が長すぎる: \"" + name + "\" (" +
+                   std::to_string(kNvsKeyNameMax) + " 文字まで)";
+            return false;
+        default: *err = std::string("鍵 \"") + name + "\": " + esp_err_to_name(e); return false;
     }
 }
 
-// SD の profiles.json を読み直す。**落ちないこと**が第一で、読めない理由は
+// NVS の接続先を読み直す。**落ちないこと**が第一で、読めない理由は
 // s_profiles_status に残して画面にもコンソールにも出す。
 void load_profiles()
 {
     s_profiles = prof::Config{};
-    if (esp_err_t err = sd_mount(); err != ESP_OK) {
-        std::snprintf(s_profiles_status, sizeof(s_profiles_status), "SD なし (%s)",
-                      esp_err_to_name(err));
-        return;
-    }
     std::string json;
-    switch (esp_err_t err = sd_read_file(kProfilesPath, prof::kMaxFileBytes, &json)) {
+    switch (esp_err_t err = nvs_profiles_load(&json)) {
         case ESP_OK: break;
-        case ESP_ERR_NOT_FOUND:
+        case ESP_ERR_NVS_NOT_FOUND:
             std::snprintf(s_profiles_status, sizeof(s_profiles_status),
-                          "%s が無い", kProfilesPath);
-            return;
-        case ESP_ERR_INVALID_SIZE:
-            std::snprintf(s_profiles_status, sizeof(s_profiles_status),
-                          "profiles.json が大きすぎる (上限 %uKB)",
-                          (unsigned)(prof::kMaxFileBytes / 1024));
+                          "未設定 (`profiles import` で SD から取り込む)");
             return;
         default:
             std::snprintf(s_profiles_status, sizeof(s_profiles_status), "読めない (%s)",
@@ -603,12 +597,137 @@ void load_profiles()
     for (const auto& w : s_profiles.warnings) ESP_LOGW(TAG, "profiles: %s", w.c_str());
 }
 
+// NVS に置ける profiles.json の大きさ。**パーサの上限 (64KB) ではなく NVS の天井で見る** —
+// パーティションは 24KB しかないので、64KB を通してから nvs_set_blob で
+// ESP_ERR_NVS_NOT_ENOUGH_SPACE を出しても、ユーザーには生のエラー名しか見えない。
+constexpr size_t kMaxImportBytes = 8 * 1024;
+
+// SD から NVS へ取り込む本体。**SD のマウントは呼び出し側が畳む。**
+int import_from_sd()
+{
+    std::string json;
+    switch (esp_err_t err = sd_read_file(kProfilesPath, kMaxImportBytes, &json)) {
+        case ESP_OK: break;
+        case ESP_ERR_NOT_FOUND: std::printf("%s が無い\n", kProfilesPath); return 1;
+        case ESP_ERR_INVALID_SIZE:
+            std::printf("profiles.json が大きすぎる (NVS に置ける上限 %uKB)\n",
+                        (unsigned)(kMaxImportBytes / 1024));
+            return 1;
+        default: std::printf("読めない: %s\n", esp_err_to_name(err)); return 1;
+    }
+    // **書き込む前に検証する。** 壊れた JSON をそのまま NVS に入れると、
+    // 次の起動から「読めない」状態が居座る（SD を抜いても直せない）。
+    const prof::Config cfg = prof::parse(json);
+    if (!cfg.error.empty()) {
+        std::printf("取り込まない: %s\n", cfg.error.c_str());
+        return 1;
+    }
+    for (const auto& w : cfg.warnings) std::printf("  ! %s\n", w.c_str());
+
+    // **NVS に触る前に、要るものを全部メモリに読む。** 途中で失敗したときに
+    // 「新しい鍵 + 古い接続先」という食い違った状態を残さないため。
+    std::vector<std::pair<std::string, std::string>> keys;
+    int                                              missing = 0;
+    for (const auto& name : prof::referenced_keys(cfg)) {
+        if (name.size() > kNvsKeyNameMax) {
+            std::printf("  ! 鍵の名前が長すぎる: \"%s\" (%u 文字まで)。飛ばした\n", name.c_str(),
+                        (unsigned)kNvsKeyNameMax);
+            ++missing;
+            continue;
+        }
+        const std::string path = std::string(kKeysDir) + name;
+        std::string       data;
+        // 秘密鍵は 8KB もあれば足りる（RSA 4096 の PEM で約 3.2KB）。
+        if (esp_err_t e = sd_read_file(path.c_str(), 8192, &data); e != ESP_OK) {
+            // **既に NVS にある鍵なら、消す前に諦める。** カードの一時的な不調で
+            // 読めなかっただけのときに、正常な写しごと消してしまわないように。
+            std::string have;
+            if (nvs_key_load(name, &have) == ESP_OK) {
+                std::printf("鍵 \"%s\" を SD から読めない (%s)。**NVS には入っている**ので、"
+                            "消さずに中止した\n",
+                            name.c_str(), esp_err_to_name(e));
+                return 1;
+            }
+            std::printf("  ! %s: %s。飛ばした\n", path.c_str(), esp_err_to_name(e));
+            ++missing;
+            continue;
+        }
+        keys.emplace_back(name, std::move(data));
+    }
+
+    // **消す前に「入るか」を見る。** 書いている途中で NVS が尽きると、
+    // 消した後なので接続先が全部無くなり、**もう一度 import しても同じ所で落ちて戻せない**。
+    // ここでは今 prof が使っている分を空きに数えない（消せば増えるぶんは見込まない）ので
+    // 厳しめに出る。断られたら `profiles clear` してから取り込めば通る。
+    size_t need = nvs_entries_for(json.size());
+    for (const auto& [name, data] : keys) need += nvs_entries_for(data.size());
+    const size_t have = nvs_free_entries();
+    // **成功時も数字を出す。** 出さないと「検査が走ったか」を後から確かめられない。
+    ESP_LOGI(TAG, "import: %u エントリ要る / 空き %u", (unsigned)need, (unsigned)have);
+    if (need > have) {
+        std::printf("NVS が足りない: %u エントリ要るが空きは %u（1 エントリ 32B）\n",
+                    (unsigned)need, (unsigned)have);
+        std::printf("  `profiles clear` してから取り込むか、鍵を減らす（`nvsstat` で内訳）\n");
+        return 1;
+    }
+
+    // **先に消してから書く。** 上書きだけだと、鍵の名前を変えたり接続先を消したりした
+    // ときに古い秘密鍵が NVS に residue として残り続ける（`profiles` の一覧にも出る）。
+    // 24KB しかないので容量も食う。**入るかは上で確かめてある**ので、ここから先で
+    // 容量不足に落ちることは無い（SD の読みも全部終わっている）。
+    if (esp_err_t e = nvs_profiles_clear(); e != ESP_OK) {
+        std::printf("古い設定を消せない: %s\n", esp_err_to_name(e));
+        return 1;
+    }
+    auto no_space = [](esp_err_t e) {
+        if (e != ESP_ERR_NVS_NOT_ENOUGH_SPACE) return;
+        std::printf("  NVS が足りない。`nvsstat` で使用量を見て、要らないものを減らす\n");
+    };
+    for (const auto& [name, data] : keys) {
+        if (esp_err_t e = nvs_key_store(name, data); e != ESP_OK) {
+            std::printf("鍵 \"%s\" を保存できない: %s\n", name.c_str(), esp_err_to_name(e));
+            no_space(e);
+            return 1;
+        }
+    }
+    if (esp_err_t e = nvs_profiles_store(json); e != ESP_OK) {
+        std::printf("profiles.json を保存できない: %s\n", esp_err_to_name(e));
+        no_space(e);
+        return 1;
+    }
+    load_profiles();
+    std::printf("取り込んだ: %u 件、鍵 %u 本", (unsigned)cfg.profiles.size(),
+                (unsigned)keys.size());
+    if (missing) std::printf("（%d 本は取り込めなかった。上の ! を見る）", missing);
+    std::printf("（SD は抜いてよい）\n");
+    return 0;
+}
+
+// SD から NVS へ取り込む (#57)。**取り込んだら SD は抜ける。**
+int import_profiles()
+{
+    if (esp_err_t err = sd_mount(); err != ESP_OK) {
+        std::printf("SD をマウントできない: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+    const int rc = import_from_sd();
+    // **必ず畳む。** sd_mount() は「もう開いている」と即 ESP_OK を返すので、
+    // 畳まないままカードを差し替えると、次の import が死んだ VFS を読みに行く
+    // （再起動するまで直らない）。
+    sd_unmount();
+    return rc;
+}
+
 // SD の接続先を見る／読み直す。**飛ばした理由をここで出す** — 画面には
 // 1 行しか出ないので、書き損じを直すにはこれが要る。
 int cmd_profiles(int argc, char** argv)
 {
-    if (argc > 2 || (argc == 2 && std::string(argv[1]) != "reload")) {
-        std::printf("usage: profiles [reload]\n");
+    const std::string sub = (argc > 1) ? argv[1] : "";
+    if (argc > 2 || (argc == 2 && sub != "reload" && sub != "import" && sub != "clear")) {
+        std::printf("usage: profiles [reload|import|clear]\n");
+        std::printf("  import: SD の %s と keys/ を NVS に取り込む（以後 SD は不要）\n",
+                    kProfilesPath);
+        std::printf("  clear : 取り込んだ接続先と鍵を全部消す\n");
         return 1;
     }
     // **ロックを取る。** load_profiles は s_profiles を作り直すので、
@@ -619,8 +738,20 @@ int cmd_profiles(int argc, char** argv)
         std::printf("busy\n");
         return 1;
     }
-    if (argc == 2) load_profiles();
-    std::printf("%s: %s\n", kProfilesPath, s_profiles_status);
+    if (sub == "import") {
+        if (import_profiles() != 0) return 1;
+    } else if (sub == "clear") {
+        if (esp_err_t e = nvs_profiles_clear(); e != ESP_OK) {
+            std::printf("消せない: %s\n", esp_err_to_name(e));
+            return 1;
+        }
+        load_profiles();
+        std::printf("消した\n");
+        return 0;
+    } else if (sub == "reload") {
+        load_profiles();
+    }
+    std::printf("NVS: %s\n", s_profiles_status);
     for (size_t i = 0; i < s_profiles.profiles.size(); ++i) {
         const prof::Profile& p = s_profiles.profiles[i];
         std::printf("  [%u] %-16s %-10s ", (unsigned)i, p.name.c_str(),
@@ -642,6 +773,11 @@ int cmd_profiles(int argc, char** argv)
         std::printf("\n");
     }
     for (const auto& w : s_profiles.warnings) std::printf("  ! %s\n", w.c_str());
+    if (const auto names = nvs_key_names(); !names.empty()) {
+        std::printf("  鍵:");
+        for (const auto& n : names) std::printf(" %s", n.c_str());
+        std::printf("\n");
+    }
     return 0;
 }
 
@@ -2634,14 +2770,14 @@ bool connect_vpn_profile(const prof::Profile& p, std::string* err)
 {
     if (p.type == prof::Type::kTailscale) {
         std::string authkey;
-        if (!read_key_file(p.authkey, 4096, &authkey, err)) return false;
+        if (!read_key(p.authkey, &authkey, err)) return false;
         // ファイルなので末尾の改行が付く。そのまま送るとヘッダが壊れる。
         while (!authkey.empty() && (authkey.back() == '\n' || authkey.back() == '\r' ||
                                     authkey.back() == ' ')) {
             authkey.pop_back();
         }
         if (authkey.empty()) {
-            *err = std::string(kKeysDir) + p.authkey + " が空";
+            *err = "authkey \"" + p.authkey + "\" が空";
             return false;
         }
         if (!ts_start(p.control, authkey, p.port, 131)) {
@@ -2653,10 +2789,10 @@ bool connect_vpn_profile(const prof::Profile& p, std::string* err)
 
     // WireGuard。
     std::string priv_text;
-    if (!read_key_file(p.private_key, 4096, &priv_text, err)) return false;
+    if (!read_key(p.private_key, &priv_text, err)) return false;
     uint8_t priv[32];
     if (!decode_key32(priv_text, priv)) {
-        *err = std::string(kKeysDir) + p.private_key + " が 32 バイトの鍵ではない";
+        *err = "鍵 \"" + p.private_key + "\" が 32 バイトの鍵ではない";
         return false;
     }
     uint8_t peer_pub[32];
@@ -2762,7 +2898,16 @@ bool password_prompt_input(const std::string& in)
     return true;
 }
 
-void connect_ssh_profile(const prof::Profile& p, int index)
+// via の解決結果。**s_profiles をロックの外で引かない**ために、呼び出し側が
+// ロックの中でコピーして渡す（`profiles import` / `clear` が同じ vector を
+// 再代入するので、参照のまま持つと読んでいる最中に解放され得る）。
+struct ViaTarget {
+    bool          present = false;  // via が指定されていて、解決できた
+    bool          named   = false;  // via が指定されていた
+    prof::Profile profile;
+};
+
+void connect_ssh_profile(const prof::Profile& p, int index, const ViaTarget& via)
 {
     if (p.ask_password) {
         start_password_prompt(index, p.user, p.host);
@@ -2770,12 +2915,12 @@ void connect_ssh_profile(const prof::Profile& p, int index)
     }
     // 先に VPN を張る（`via`）。**張れなければ繋ぎに行かない** —
     // VPN 越しの相手に素の経路で繋ぎに行くと、無関係の相手に当たり得る。
-    if (!p.via.empty()) {
-        const prof::Profile* v = prof::find(s_profiles, p.via);
-        if (!v || v->type == prof::Type::kSsh) {
+    if (via.named) {
+        if (!via.present) {
             term_note("31", "via \"" + p.via + "\" が見つからない");
             return;
         }
+        const prof::Profile* v = &via.profile;
         // **Tailscale だけ「動いていれば飛ばす」。** ts::Client は実体が 1 つで、
         // 走行中に設定を差し替えると use-after-free になる。WireGuard 側は
         // wg_bring_up が食い違いを見るので、そのまま通してよい。
@@ -2797,8 +2942,7 @@ void connect_ssh_profile(const prof::Profile& p, int index)
     cfg.password = p.password;
     if (!p.key.empty()) {
         std::string err;
-        // 秘密鍵は 8KB もあれば足りる（RSA 4096 の PEM で約 3.2KB）。
-        if (!read_key_file(p.key, 8192, &cfg.key_pem, &err)) {
+        if (!read_key(p.key, &cfg.key_pem, &err)) {
             term_note("31", err);
             return;
         }
@@ -2833,6 +2977,7 @@ void connect_worker(void*)
     // **index はここで引き直す。** 待っている間に `profiles reload` が
     // 走っていれば、そのときは黙って何もしない方がよい。
     prof::Profile p;
+    ViaTarget     via;
     bool          found = false;
     {
         TermGuard guard;
@@ -2840,6 +2985,17 @@ void connect_worker(void*)
             req.index < static_cast<int>(s_profiles.profiles.size())) {
             p     = s_profiles.profiles[req.index];
             found = true;
+            // **via もここで値にする。** ロックを離した後に s_profiles を引くと、
+            // コンソールの `profiles import` / `clear` による再代入と競合する。
+            if (!p.via.empty()) {
+                via.named = true;
+                if (const prof::Profile* v = prof::find(s_profiles, p.via)) {
+                    if (v->type != prof::Type::kSsh) {
+                        via.present = true;
+                        via.profile = *v;
+                    }
+                }
+            }
         }
     }
     if (!found) {
@@ -2854,7 +3010,7 @@ void connect_worker(void*)
     }
 
     if (p.type == prof::Type::kSsh) {
-        connect_ssh_profile(p, req.index);
+        connect_ssh_profile(p, req.index, via);
     } else {
         term_note("33", "bringing up " + p.name + " (" + prof::type_name(p.type) + ")...");
         std::string err;
@@ -2920,6 +3076,35 @@ int cmd_connect(int argc, char** argv)
         return 1;
     }
     connect_profile(index);
+    return 0;
+}
+
+// NVS の使用量を見る。**接続先と鍵を NVS に置けるか (#57) は、ここの実測で決まる。**
+// パーティションは既定の 24KB (partitions.csv) しかなく、ページ単位 (4KB) で
+// 使うので「blob が何バイトまで」だけを見ても足りない。
+int cmd_nvsstat(int, char**)
+{
+    nvs_stats_t st{};
+    if (esp_err_t err = nvs_get_stats(nullptr, &st); err != ESP_OK) {
+        std::printf("nvs_get_stats failed: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+    std::printf("nvs: used=%u free=%u total=%u entries, namespaces=%u\n", (unsigned)st.used_entries,
+                (unsigned)st.free_entries, (unsigned)st.total_entries,
+                (unsigned)st.namespace_count);
+    // エントリは 32 バイト固定なので、バイト換算も出す（どれだけ置けるかの目安）。
+    std::printf("     おおよそ used=%uB free=%uB (1 エントリ 32B)\n",
+                (unsigned)st.used_entries * 32, (unsigned)st.free_entries * 32);
+
+    nvs_iterator_t it  = nullptr;
+    esp_err_t      err = nvs_entry_find(NVS_DEFAULT_PART_NAME, nullptr, NVS_TYPE_ANY, &it);
+    while (err == ESP_OK) {
+        nvs_entry_info_t info{};
+        nvs_entry_info(it, &info);
+        std::printf("  %-16s %-16s type=%d\n", info.namespace_name, info.key, (int)info.type);
+        err = nvs_entry_next(&it);
+    }
+    nvs_release_iterator(it);
     return 0;
 }
 
@@ -3329,9 +3514,9 @@ void register_term_commands()
         {"ssh", "SSH 接続 (引数なしで保存済み設定)", "[<user> <host> <password> [port]]", &cmd_ssh,
          nullptr, nullptr, nullptr},
         {"sshclose", "SSH セッションを閉じる", nullptr, &cmd_sshclose, nullptr, nullptr, nullptr},
-        {"profiles", "SD の接続先を一覧する／読み直す", "[reload]", &cmd_profiles, nullptr,
-         nullptr, nullptr},
-        {"connect", "SD の接続先に繋ぐ（メニューから選ぶのと同じ経路）", "<name|index>",
+        {"profiles", "接続先 (NVS) の一覧／SD からの取り込み／消去", "[reload|import|clear]",
+         &cmd_profiles, nullptr, nullptr, nullptr},
+        {"connect", "接続先に繋ぐ（メニューから選ぶのと同じ経路）", "<name|index>",
          &cmd_connect, nullptr, nullptr, nullptr},
         {"ssh-forget", "覚えているホスト鍵を忘れる", "<host>[:<port>]", &cmd_ssh_forget, nullptr,
          nullptr, nullptr},
@@ -3369,6 +3554,8 @@ void register_term_commands()
          &cmd_discoloop, nullptr, nullptr, nullptr},
         {"keytest", "sshkey パーティションの鍵を mbedTLS で直接パースする", nullptr, &cmd_keytest,
          nullptr, nullptr, nullptr},
+        {"nvsstat", "NVS の使用量と中身を見る（#57 の設計用）", nullptr, &cmd_nvsstat, nullptr,
+         nullptr, nullptr},
         {"screencap", "画面をシリアルに吸い出す（PNG は tools/screencap.py）", "[step]",
          &cmd_screencap, nullptr, nullptr, nullptr},
         {"termcheck", "本番のレンダラ経路で描いて画素で回転を判定する", nullptr, &cmd_termcheck,
@@ -3556,7 +3743,8 @@ extern "C" void app_main(void)
         }
     }
 
-    // SD の接続先 (#49)。**無くても起動する** — 読めなければ NVS の 1 件で繋ぐ。
+    // 接続先は NVS から読む (#57)。**起動時に SD は触らない** — 取り込み済みなら
+    // 挿していなくても繋がるのが要点。SD を見るのは `profiles import` のときだけ。
     load_profiles();
     menu->set_info(gather_menu_info(gather_status()));
 
