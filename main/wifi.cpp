@@ -195,6 +195,10 @@ esp_err_t connect_with(const char* ssid, const char* pass)
     // 削除で立てた印が残っていることがある。明示的に繋ぐ時点で必ず落とす
     // （残すと、この接続が切れたときの再接続が 1 回だけ黙って飛ぶ）。
     s_reconfiguring = false;
+    // **「繋がっている」印もここで落とす。** 別の設定へ移る時点で前の接続は
+    // 手放しているのに、切断イベントが来るまで印が残る。その間に一覧を出すと
+    // **繋がっていない設定に `*` が付く**（実機で確認）。
+    if (s_events) xEventGroupClearBits(s_events, kConnected);
     if (s_retry_timer) esp_timer_stop(s_retry_timer);
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &cfg), TAG, "set_config");
     if (!s_started) {
