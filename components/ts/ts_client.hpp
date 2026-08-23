@@ -19,6 +19,10 @@ struct ClientConfig {
     std::string host;                       // 制御プレーンのホスト名 or IP
     uint16_t    port               = 80;    // 平文で良い（Noise が保護する）
     std::string auth_key;                   // tskey-auth-... / hskey-auth-...
+    // authkey が無い / 無効なときに対話ログイン（Google などの OAuth）へ回すか (#59)。
+    // **端末は URL を見せて待つだけ** — 認証は人間が手元のブラウザでやるので、
+    // 端末に OAuth クライアントも TLS の証明書検証も要らない。
+    bool        interactive        = false;
     std::string hostname           = "tab5";
     uint16_t    capability_version = 131;
     std::vector<std::string> endpoints;     // 自分の WireGuard エンドポイント
@@ -31,11 +35,13 @@ struct ClientStatus {
         kConnecting,
         kHandshaking,
         kRegistering,
+        kAuthPending, // AuthURL を出して、人間がブラウザで認証するのを待っている (#59)
         kMapping,     // netmap を long-poll 中（正常稼働）
         kFailed,
     };
     State       state = State::kIdle;
     std::string error;
+    std::string auth_url;          // 対話ログインの URL（待っている間だけ入る）
     std::string assigned_address;  // "100.64.0.2/32"
     std::string domain;
     uint32_t    map_messages = 0;
@@ -55,6 +61,13 @@ public:
 
     // netmap を受け取ったときに呼ばれる（生の JSON）。ピア情報の解析は呼び出し側。
     void set_map_handler(std::function<void(const std::string&)> fn) { on_map_ = std::move(fn); }
+
+    // 対話ログインの URL を受け取ったときに 1 回だけ呼ばれる (#59)。
+    // **run_once() のタスクの上で呼ばれる**ので、中で待たないこと（表示だけにする）。
+    void set_auth_url_handler(std::function<void(const std::string&)> fn)
+    {
+        on_auth_url_ = std::move(fn);
+    }
 
     // 1 回接続して long-poll に入る。戻るのは切断か失敗のとき。
     // 呼び出し側がリトライを制御する（バックオフを入れる）。
@@ -79,6 +92,7 @@ private:
     void set_error(std::string e);
     void set_assigned_address(std::string a);
     void set_domain(std::string d);
+    void set_auth_url(std::string u);
     void reset_status();
 
     mutable std::mutex mu_;
@@ -90,6 +104,7 @@ private:
     uint8_t      disco_pub_[32]    = {};
     volatile bool stop_            = false;
     std::function<void(const std::string&)> on_map_;
+    std::function<void(const std::string&)> on_auth_url_;
 };
 
 }  // namespace ts

@@ -22,8 +22,10 @@ namespace ts {
 namespace {
 
 // HTTP/2 のストリーム ID はクライアント側は奇数。
-constexpr uint32_t kStreamRegister = 1;
-constexpr uint32_t kStreamMap      = 3;
+constexpr uint32_t kStreamRegister = 1;  // 最初の register。以後は +2 ずつ増やす
+// 対話ログインで承認を待つ間、register を投げ直す間隔（秒）。
+// **人間がスマホを取り出して認証するまで分単位かかる**ので、詰めても意味がない。
+constexpr int      kAuthPollSec    = 3;
 
 int connect_tcp(const char* host, uint16_t port, int timeout_sec)
 {
@@ -152,6 +154,12 @@ void Client::set_domain(std::string d)
 {
     std::lock_guard<std::mutex> g(mu_);
     st_.domain = std::move(d);
+}
+
+void Client::set_auth_url(std::string u)
+{
+    std::lock_guard<std::mutex> g(mu_);
+    st_.auth_url = std::move(u);
 }
 
 void Client::reset_status()
@@ -382,7 +390,16 @@ bool Client::run_once()
     std::string          body_register;
     std::vector<uint8_t> map_stream;
     bool                 sent_register = false, sent_map = false;
-    bool                 register_done = false;   // stream 1 に END_STREAM が来たか
+    bool                 register_done = false;   // register の stream に END_STREAM が来たか
+    // **HTTP/2 のストリーム id は増える奇数**でなければならない。対話ログイン (#59) では
+    // register を何度も投げ直すので、固定の 1 / 3 では 2 回目が protocol error になる。
+    uint32_t             next_sid = kStreamRegister;
+    uint32_t             reg_sid  = 0;
+    uint32_t             map_sid  = 0;
+    auto                 take_sid = [&]() { const uint32_t s = next_sid; next_sid += 2; return s; };
+    // 対話ログインで待っている間の状態。
+    std::string          shown_auth_url;
+    int                  register_after = 0;  // ループ回数（pump が 1 秒待つので秒とほぼ同じ）
 
     auto handle_frames = [&]() -> bool {
         size_t off = 0;
@@ -408,7 +425,7 @@ bool Client::run_once()
                     }
                     break;
                 case H2Type::kData: {
-                    if (f.stream_id == kStreamRegister) {
+                    if (f.stream_id == reg_sid) {
                         body_register.append(reinterpret_cast<const char*>(f.payload),
                                              f.payload_len);
                         if (f.flags & kFlagEndStream) register_done = true;
@@ -416,7 +433,7 @@ bool Client::run_once()
                             set_error("register response too large");
                             return false;
                         }
-                    } else if (f.stream_id == kStreamMap) {
+                    } else if (f.stream_id == map_sid) {
                         map_stream.insert(map_stream.end(), f.payload, f.payload + f.payload_len);
                         if (map_stream.size() > kMaxBuffered) {
                             set_error("netmap buffer limit exceeded");
@@ -442,7 +459,7 @@ bool Client::run_once()
                         set_error("control plane returned a non-200 status");
                         return false;
                     }
-                    if ((f.flags & kFlagEndStream) && f.stream_id == kStreamRegister) {
+                    if ((f.flags & kFlagEndStream) && f.stream_id == reg_sid) {
                         register_done = true;
                     }
                     break;
@@ -476,7 +493,8 @@ bool Client::run_once()
         }
 
         // SETTINGS をやり取りしたら register を送る。
-        if (!sent_register) {
+        // 対話ログイン中は register_after 秒だけ空けてから投げ直す。
+        if (!sent_register && i >= register_after) {
             RegisterParams rp;
             rp.capability_version = cfg_.capability_version;
             rp.node_key           = key_to_string("nodekey:", node_pub_);
@@ -484,7 +502,8 @@ bool Client::run_once()
             rp.hostname           = cfg_.hostname;
             const std::string body = build_register_request(rp);
             std::vector<uint8_t> buf(body.size() + 1024);
-            const size_t n = h2_build_post(buf.data(), buf.size(), kStreamRegister,
+            reg_sid        = take_sid();
+            const size_t n = h2_build_post(buf.data(), buf.size(), reg_sid,
                                            cfg_.host.c_str(), "/machine/register",
                                            reinterpret_cast<const uint8_t*>(body.data()),
                                            body.size());
@@ -507,11 +526,30 @@ bool Client::run_once()
                 return false;
             }
             if (!rr.auth_url.empty()) {
-                // auth key が無い / 無効なとき。対話ログインは実装しない。
-                set_error("interactive login required: " + rr.auth_url);
-                st_.state = ClientStatus::State::kFailed;
-                return false;
+                // auth key が無い / 無効なとき (#59)。
+                if (!cfg_.interactive) {
+                    set_error("interactive login required: " + rr.auth_url);
+                    st_.state = ClientStatus::State::kFailed;
+                    return false;
+                }
+                // **端末は URL を見せて待つだけ。** 認証は人間が手元のブラウザで
+                // 済ませる（Google なり GitHub なり）ので、ここに OAuth は要らない。
+                if (shown_auth_url != rr.auth_url) {
+                    shown_auth_url = rr.auth_url;
+                    set_auth_url(rr.auth_url);
+                    if (on_auth_url_) on_auth_url_(rr.auth_url);
+                }
+                st_.state = ClientStatus::State::kAuthPending;
+                // 承認されるまで投げ直す。**新しいストリームで**投げること
+                // （take_sid が次の奇数を返す）。
+                body_register.clear();
+                register_done  = false;
+                sent_register  = false;
+                register_after = i + kAuthPollSec;
+                continue;
             }
+            // 通ったら URL は消す。残すと承認後も QR が出たままになる。
+            if (!shown_auth_url.empty()) set_auth_url("");
             if (!rr.machine_authorized) {
                 set_error("machine not authorized");
                 st_.state = ClientStatus::State::kFailed;
@@ -530,7 +568,8 @@ bool Client::run_once()
             mp.stream             = true;
             const std::string body = build_map_request(mp);
             std::vector<uint8_t> buf(body.size() + 1024);
-            const size_t n = h2_build_post(buf.data(), buf.size(), kStreamMap, cfg_.host.c_str(),
+            map_sid        = take_sid();
+            const size_t n = h2_build_post(buf.data(), buf.size(), map_sid, cfg_.host.c_str(),
                                            "/machine/map",
                                            reinterpret_cast<const uint8_t*>(body.data()),
                                            body.size());

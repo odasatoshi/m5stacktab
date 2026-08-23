@@ -35,6 +35,8 @@
 #include "romaji.hpp"
 #include "skk_dict.hpp"
 #include "ssh.hpp"
+#include <qrcode.h>
+
 #include "ts_client.hpp"
 #include "disco.hpp"
 #include "disco_responder.hpp"
@@ -135,6 +137,7 @@ void apply_layout();
 void set_keyboard_visible(bool show);
 // メニューの表示を切り替える。キーボードの表示と端末の行数も一緒に動く。
 void set_menu_visible(bool show);
+extern bool s_auth_qr_active;  // 対話ログインの QR を出している間 (#59)
 // メニュー表示中は端末を描かない（メニューの矩形を上書きしてしまう）。
 void render_term(bool force = false);
 // ステータスバーに出す内容を集める（定義は下）。
@@ -932,12 +935,17 @@ int cmd_kbdinject(int argc, char** argv)
 
 // 1 行入力中は打鍵をそこへ回す（#49 / #56）。定義はずっと下（プロファイル接続の側）。
 bool line_prompt_input(const std::string& in);
+// 対話ログインの QR を出している間の打鍵 (#59)。定義は ts の側。
+bool auth_qr_input(const std::string& in);
 
 // 入力を送る唯一の経路。画面キーボードも純正キーボードもここを通す。
 // 未接続なら端末にエコーして、繋がなくても打鍵の確認ができるようにする。
 void send_input(const std::string& s)
 {
     if (s.empty()) return;
+    // 対話ログインの QR を出している間は Esc で中止する (#59)。
+    // **矢印キーも ESC で始まる**ので、単独の ESC だけを見る。
+    if (auth_qr_input(s)) return;
     // **SSH へ送る前に見る。** 入力中のパスワードをリモートに漏らさない。
     if (line_prompt_input(s)) return;
     if (ssh_is_connected()) {
@@ -1299,7 +1307,13 @@ void ts_task(void* arg)
 
 // Tailscale を上げる。**コンソールもメニューもここを通す** (#49) —
 // 分けると「シリアルからは繋がるのに一覧から選ぶと繋がらない」になる。
-bool ts_start(const std::string& host, const std::string& authkey, uint16_t port, uint16_t capver)
+// 対話ログイン (#59) の QR。定義はこの下（ts の状態表示の側）。
+void show_auth_qr(const std::string& url);
+void hide_auth_qr();
+void term_note(const char* color, const std::string& text);
+
+bool ts_start(const std::string& host, const std::string& authkey, uint16_t port, uint16_t capver,
+              bool interactive = false)
 {
     // **共有オブジェクトを触る前に弾く。** ts::Client は関数ローカル static で
     // 実体が 1 つしかないので、long-poll 中に set_config / set_map_handler を
@@ -1369,6 +1383,7 @@ bool ts_start(const std::string& host, const std::string& authkey, uint16_t port
     cfg.auth_key = authkey;
     cfg.port     = port;
     cfg.capability_version = capver;
+    cfg.interactive = interactive;
     cfg.hostname = "m5stack-tab5";
     // 自分のエンドポイント。
     // ponytail: STUN も portmap も実装していないので LAN アドレスしか申告しない。
@@ -1390,8 +1405,15 @@ bool ts_start(const std::string& host, const std::string& authkey, uint16_t port
         return false;
     }
     client.set_config(cfg);
+    // 対話ログイン (#59)。**ts タスクの上で呼ばれる**ので、描くだけにして待たない。
+    client.set_auth_url_handler([](const std::string& url) { show_auth_qr(url); });
     // netmap が来たらピアの disco 公開鍵を登録する。これが DISCO の前提。
     client.set_map_handler([](const std::string& json) {
+        // netmap が来た = 登録が通った。**QR を畳む** — 残すと承認後も出たままになる。
+        {
+            TermGuard guard;
+            if (guard.ok()) hide_auth_qr();
+        }
         ts::NetMap map;
         if (!ts::parse_netmap(json, &map)) return;
         if (map.keepalive) return;
@@ -1435,7 +1457,129 @@ int cmd_ts(int argc, char** argv)
                : 1;
 }
 
+// authkey 無しで参加する (#59)。制御プレーンが返す AuthURL を QR で出して、
+// 人間がブラウザで承認するまで register を投げ直す。
+int cmd_ts_login(int argc, char** argv)
+{
+    if (argc < 2) {
+        std::printf("usage: ts-login <host> [port] [capver]\n");
+        return 1;
+    }
+    return ts_start(argv[1], /*authkey=*/"",
+                    (argc > 2) ? static_cast<uint16_t>(atoi(argv[2])) : 80,
+                    (argc > 3) ? static_cast<uint16_t>(atoi(argv[3])) : 131,
+                    /*interactive=*/true)
+               ? 0
+               : 1;
+}
 
+
+
+// --- 対話ログインの QR (#59) ---
+//
+// **端末は URL を見せて待つだけ。** 認証は人間が手元のスマホ／PC のブラウザで
+// 済ませる（Google なり GitHub なり）ので、ここに OAuth クライアントも
+// 証明書検証も要らない。URL を画面から手で打たせるのは無理なので QR にする。
+//
+// **メニューと同じ M5GFX で、同じロックの中から描く**（PPA は転送のたびに
+// 出力側のキャッシュを無効化するので、経路を分けると競合する）。
+bool        s_auth_qr_active = false;
+std::string s_auth_qr_url;
+
+void draw_auth_qr_modules(esp_qrcode_handle_t qr, void* user_data)
+{
+    const int  n   = esp_qrcode_get_size(qr);
+    const auto url = static_cast<const std::string*>(user_data);
+    if (n <= 0) return;
+
+    const int top   = s_status_h;
+    const int avail = (int)display.height() - s_status_h - keyboard->height();
+    display.fillRect(0, top, display.width(), avail, TFT_BLACK);
+    display.setFont(&fonts::efontJA_24);
+    display.setTextDatum(textdatum_t::top_left);
+    display.setTextColor(TFT_CYAN, TFT_BLACK);
+    display.drawString("Tailscale: ブラウザで開いて承認する", 24, top + 12);
+
+    // 静穏帯 (quiet zone) を 4 モジュール取る。無いと読み取れない端末がある。
+    constexpr int kQuiet = 4;
+    const int     total  = n + kQuiet * 2;
+    // 文字 2 行ぶん (上 40 / 下 64) を除いて入る大きさにする。
+    const int scale =
+        std::max(2, std::min((avail - 104) / total, static_cast<int>(display.width()) / total));
+    const int side  = total * scale;
+    const int qx    = ((int)display.width() - side) / 2;
+    const int qy    = top + 40;
+
+    // **白地に黒**で描く。反転すると読めない。
+    display.fillRect(qx, qy, side, side, TFT_WHITE);
+    for (int y = 0; y < n; ++y) {
+        for (int x = 0; x < n; ++x) {
+            if (!esp_qrcode_get_module(qr, x, y)) continue;
+            display.fillRect(qx + (x + kQuiet) * scale, qy + (y + kQuiet) * scale, scale, scale,
+                             TFT_BLACK);
+        }
+    }
+    // QR が読めない場合のために URL も出す（打つのは辛いが、手がかりにはなる）。
+    display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    display.drawString(url->c_str(), 24, qy + side + 12);
+    display.setTextColor(0x8410, TFT_BLACK);
+    display.drawString("Esc で中止", 24, top + avail - 32);
+    display.setTextColor(TFT_WHITE, TFT_BLACK);
+}
+
+void hide_auth_qr()
+{
+    if (!s_auth_qr_active) return;
+    s_auth_qr_active = false;
+    s_auth_qr_url.clear();
+    if (renderer && term) renderer->render(*term, /*force=*/true);
+}
+
+bool auth_qr_input(const std::string& in)
+{
+    if (!s_auth_qr_active) return false;
+    // **矢印キーで中止しない。** 特殊キーは ESC で始まる複数バイトなので、
+    // 先頭だけ見ると「QR を見ている間に ↑ を押すと黙って中止」になる。
+    if (in.size() == 1 && in[0] == '\033') {
+        TermGuard guard;
+        if (!guard.ok()) return true;
+        hide_auth_qr();
+        // **待っている ts タスクを止める。** 止めないと、承認されないまま
+        // 10 分間 register を投げ続ける。
+        if (s_ts_client) s_ts_client->stop();
+        term_note("33", "Tailscale の対話ログインを中止した");
+        return true;
+    }
+    // それ以外の打鍵は捨てる（QR の上に文字が流れても読めなくなるだけ）。
+    return true;
+}
+
+void show_auth_qr(const std::string& url)
+{
+    TermGuard guard;
+    if (!guard.ok()) {
+        // 描けなくても URL は残す。コンソールから `ts-status` で読める。
+        ESP_LOGW(TAG, "auth url: %s (画面のロックが取れなかった)", url.c_str());
+        return;
+    }
+    // メニューが出ていると重なるので閉じる。
+    if (menu && menu->visible()) set_menu_visible(false);
+    s_auth_qr_active = true;
+    s_auth_qr_url    = url;
+    esp_qrcode_config_t cfg = {};
+    cfg.display_func_with_cb = &draw_auth_qr_modules;
+    cfg.user_data            = &s_auth_qr_url;
+    // URL は 60 文字前後。version 6 (41x41) まで見ておけば足りる。
+    cfg.max_qrcode_version   = 6;
+    cfg.qrcode_ecc_level     = ESP_QRCODE_ECC_MED;
+    if (esp_qrcode_generate(&cfg, url.c_str()) != ESP_OK) {
+        // 生成できなくても止めない。URL だけでも出す。
+        s_auth_qr_active = false;
+        ESP_LOGE(TAG, "QR を作れなかった: %s", url.c_str());
+        term_note("33", "Tailscale: ブラウザで開いて承認する: " + url);
+    }
+    ESP_LOGI(TAG, "auth url: %s", url.c_str());
+}
 
 // ts の状態を見る。long-poll を保持している間も見られる必要がある。
 int cmd_ts_status(int, char**)
@@ -1622,11 +1766,14 @@ void render_term(bool force)
     // メニューが開いている間は描かない。term->write は続けるので内容は
     // 失われず、閉じるときの force render で追いつく。
     if (menu && menu->visible()) return;
+    // QR を出している間も同じ（上書きすると読めなくなる）(#59)。
+    if (s_auth_qr_active) return;
     renderer->render(*term, force);
 }
 
 void cancel_line_prompt();
 void refresh_wifi_nets();
+void hide_auth_qr();
 
 void set_menu_visible(bool show)
 {
@@ -1635,6 +1782,7 @@ void set_menu_visible(bool show)
     // SSH セッションに届かなくなる（`*` だけが出る）。
     cancel_line_prompt();
     s_swipe_start_y = -1;  // 掴んだままメニューに移ると、次のドラッグが飛ぶ
+    if (show) hide_auth_qr();  // QR とメニューが重なる (#59)
     menu->set_visible(show);
     // メニューはキーボードの領域を覆わないので、隠さないと指でキーを押せてしまう。
     // 端末に戻るときは**ユーザが選んだ状態**に戻す（#54 でダブルタップから
@@ -3845,6 +3993,8 @@ void register_term_commands()
         {"ts", "Tailscale/Headscale の制御プレーンに接続（別タスク）",
          "<host> <authkey> [port] [capver]", &cmd_ts, nullptr, nullptr, nullptr},
         {"ts-status", "ts の状態を見る", nullptr, &cmd_ts_status, nullptr, nullptr, nullptr},
+        {"ts-login", "authkey 無しで参加する（AuthURL を QR で出す）", "<host> [port] [capver]",
+         &cmd_ts_login, nullptr, nullptr, nullptr},
         {"ts-stop", "ts の long-poll を止める", nullptr, &cmd_ts_stop, nullptr, nullptr, nullptr},
         {"ping", "ICMP echo を投げる（トンネル越しの到達性確認）", "<ip> [count]",
          &cmd_ping, nullptr, nullptr, nullptr},

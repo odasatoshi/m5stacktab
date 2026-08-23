@@ -253,6 +253,16 @@ c++ -std=c++17 -Wall -Wextra -Werror -O1 -I$M3/include -I components/wg \
   接続は専用のワーカタスク (`connect`, 32KB) に載せる — 直接呼ぶと
   「メニューから VPN を選ぶと落ちる」という形でしか出ない
 
+## Tailscale の対話ログイン (#59)
+
+- **端末側に OAuth は要らない。** 制御プレーンが `AuthURL` を返し、人間が手元のブラウザで
+  認証する。端末は URL を QR で見せて、承認されるまで register を投げ直すだけ
+- **HTTP/2 のストリーム id は増える奇数**。register を投げ直すのに固定の 1 を使うと
+  2 回目が protocol error になる。`take_sid()` で連番にしてあり、**map のストリームも
+  同じ連番から取る**（register を N 回投げた後に map が来るので、3 に決め打ちできない）
+- QR は `espressif/qrcode` を使う。自前で書かない（生成多項式とマスク選択が要る）。
+  **静穏帯 (quiet zone) を 4 モジュール取る**。無いと読めない端末がある
+
 ## Tailscale / Headscale の開発環境
 
 制御プレーンは **ローカルの Headscale** を相手に開発する。SaaS だと「なぜ弾かれたか」が
