@@ -51,6 +51,8 @@ python tools/serial_log.py --seconds 20      # ログ採取
 
 画面の証跡は実機の `screencap` + `tools/screencap.py` で PNG にできる
 （フレームバッファを読むので、写真が撮れない環境でも「画面キャプチャ」の要件を満たせる）。
+**PNG は `docs/screens/` にコミットして PR から参照する** — `gh` は PR 本文に画像を
+上げられないので、リポジトリに置かないと「添付した」がチェックだけになる。
 
 ## ハード由来のハマりどころ
 
