@@ -12,6 +12,9 @@ struct SshConfig {
     std::string user;
     std::string password;
     uint16_t    port = 22;
+    // 秘密鍵 (PEM)。空なら `sshkey` パーティションの鍵を使う。
+    // SD の接続先 (#49) はここに keys/ から読んだ鍵を入れる。
+    std::string key_pem;
 };
 
 // NVS から接続先を読む / 書く（パスワードも NVS。画面から入力できるまでの手段）。

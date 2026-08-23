@@ -24,6 +24,7 @@
 #include <ping/ping_sock.h>
 #include <arpa/inet.h>
 #include <lwip/sockets.h>
+#include <mbedtls/base64.h>
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/error.h>
@@ -51,6 +52,8 @@
 #include "kbd_keys.hpp"
 #include "kbd_ui.hpp"
 #include "menu_ui.hpp"
+#include "profiles.hpp"
+#include "sdcard.hpp"
 #include "status_bar.hpp"
 #include "noise.hpp"
 #include "transport.hpp"
@@ -162,10 +165,27 @@ constexpr const char* kTunnelMask = "255.192.0.0";
 
 enum class NetifKey { kNone, kOwn, kNode };
 NetifKey    s_netif_key = NetifKey::kNone;
+// 今上がっているトンネルの設定。**上げ直さずに 2 本目を張ろうとしたのを捕まえる**
+// ためだけに持つ（Netif::up は鍵をコピーするので後から差し替えられない）。
+uint8_t     s_wg_priv[32] = {};
+ip4_addr_t  s_wg_addr{};
+ip4_addr_t  s_wg_mask{};
+bool        s_wg_live = false;
 // 今トンネルを張っている相手。netmap ごとに選び直さないために覚える。
 std::string s_tunnel_peer_key;
 std::string s_tunnel_endpoint;
 bool        s_tunnel_peer_valid = false;
+
+// --- SD カードの接続先 (#49) ---
+//
+// **SD の中身は信用しない。** パーサが上限と書式を見ているので、ここは
+// 「読めたか」と「その理由」だけを持つ。読めなくても NVS の 1 件で繋げる。
+constexpr const char* kProfilesPath = "/sdcard/tab5/profiles.json";
+constexpr const char* kKeysDir      = "/sdcard/tab5/keys/";
+
+prof::Config s_profiles;
+// 画面とコンソールに出す 1 行。読み込みのたびに書き換える。
+char s_profiles_status[64] = "not loaded";
 
 // ステータスバーを見に行った最後の時刻。C6 への RPC なので毎フレームは叩かない。
 int64_t s_last_status_us = 0;
@@ -514,6 +534,105 @@ int cmd_scroll(int argc, char** argv)
     return 0;
 }
 
+// keys/ 配下の 1 ファイルを読む。**ファイル名だけを受ける**（パーサが
+// ディレクトリ入りの名前を弾いているので、ここで組み立てても外へは出ない）。
+bool read_key_file(const std::string& name, size_t max_bytes, std::string* out, std::string* err)
+{
+    if (name.empty()) {
+        *err = "鍵のファイル名が空";
+        return false;
+    }
+    const std::string path = std::string(kKeysDir) + name;
+    switch (esp_err_t e = sd_read_file(path.c_str(), max_bytes, out)) {
+        case ESP_OK: return true;
+        case ESP_ERR_NOT_FOUND: *err = path + " が無い"; return false;
+        case ESP_ERR_INVALID_SIZE: *err = path + " が大きすぎる"; return false;
+        case ESP_ERR_INVALID_STATE: *err = "SD がマウントされていない"; return false;
+        default: *err = path + ": " + esp_err_to_name(e); return false;
+    }
+}
+
+// SD の profiles.json を読み直す。**落ちないこと**が第一で、読めない理由は
+// s_profiles_status に残して画面にもコンソールにも出す。
+void load_profiles()
+{
+    s_profiles = prof::Config{};
+    if (esp_err_t err = sd_mount(); err != ESP_OK) {
+        std::snprintf(s_profiles_status, sizeof(s_profiles_status), "SD なし (%s)",
+                      esp_err_to_name(err));
+        return;
+    }
+    std::string json;
+    switch (esp_err_t err = sd_read_file(kProfilesPath, prof::kMaxFileBytes, &json)) {
+        case ESP_OK: break;
+        case ESP_ERR_NOT_FOUND:
+            std::snprintf(s_profiles_status, sizeof(s_profiles_status),
+                          "%s が無い", kProfilesPath);
+            return;
+        case ESP_ERR_INVALID_SIZE:
+            std::snprintf(s_profiles_status, sizeof(s_profiles_status),
+                          "profiles.json が大きすぎる (上限 %uKB)",
+                          (unsigned)(prof::kMaxFileBytes / 1024));
+            return;
+        default:
+            std::snprintf(s_profiles_status, sizeof(s_profiles_status), "読めない (%s)",
+                          esp_err_to_name(err));
+            return;
+    }
+    s_profiles = prof::parse(json);
+    if (!s_profiles.error.empty()) {
+        std::snprintf(s_profiles_status, sizeof(s_profiles_status), "%s",
+                      s_profiles.error.c_str());
+    } else {
+        std::snprintf(s_profiles_status, sizeof(s_profiles_status), "%u 件 (飛ばした %u 件)",
+                      (unsigned)s_profiles.profiles.size(), (unsigned)s_profiles.warnings.size());
+    }
+    ESP_LOGI(TAG, "profiles: %s", s_profiles_status);
+    for (const auto& w : s_profiles.warnings) ESP_LOGW(TAG, "profiles: %s", w.c_str());
+}
+
+// SD の接続先を見る／読み直す。**飛ばした理由をここで出す** — 画面には
+// 1 行しか出ないので、書き損じを直すにはこれが要る。
+int cmd_profiles(int argc, char** argv)
+{
+    if (argc > 2 || (argc == 2 && std::string(argv[1]) != "reload")) {
+        std::printf("usage: profiles [reload]\n");
+        return 1;
+    }
+    // **ロックを取る。** load_profiles は s_profiles を作り直すので、
+    // メニューの描画（1 秒ごとの refresh も）が同じ vector を走査していると
+    // 読んでいる最中に解放される。
+    TermGuard guard;
+    if (!guard.ok()) {
+        std::printf("busy\n");
+        return 1;
+    }
+    if (argc == 2) load_profiles();
+    std::printf("%s: %s\n", kProfilesPath, s_profiles_status);
+    for (size_t i = 0; i < s_profiles.profiles.size(); ++i) {
+        const prof::Profile& p = s_profiles.profiles[i];
+        std::printf("  [%u] %-16s %-10s ", (unsigned)i, p.name.c_str(),
+                    prof::type_name(p.type));
+        switch (p.type) {
+            case prof::Type::kSsh:
+                std::printf("%s@%s:%u%s%s%s", p.user.c_str(), p.host.c_str(), (unsigned)p.port,
+                            p.key.empty() ? "" : " key=", p.key.c_str(),
+                            p.ask_password ? " (パスワードは接続時に入力)" : "");
+                if (!p.via.empty()) std::printf(" via %s", p.via.c_str());
+                break;
+            case prof::Type::kWireGuard:
+                std::printf("%s -> %s", p.address.c_str(), p.peer.endpoint.c_str());
+                break;
+            case prof::Type::kTailscale:
+                std::printf("%s:%u", p.control.c_str(), (unsigned)p.port);
+                break;
+        }
+        std::printf("\n");
+    }
+    for (const auto& w : s_profiles.warnings) std::printf("  ! %s\n", w.c_str());
+    return 0;
+}
+
 int cmd_ssh(int argc, char** argv)
 {
     SshConfig cfg;
@@ -663,11 +782,16 @@ int cmd_kbdinject(int argc, char** argv)
     return 0;
 }
 
+// パスワード入力中は打鍵をそこへ回す（#49）。定義はずっと下（プロファイル接続の側）。
+bool password_prompt_input(const std::string& in);
+
 // 入力を送る唯一の経路。画面キーボードも純正キーボードもここを通す。
 // 未接続なら端末にエコーして、繋がなくても打鍵の確認ができるようにする。
 void send_input(const std::string& s)
 {
     if (s.empty()) return;
+    // **SSH へ送る前に見る。** 入力中のパスワードをリモートに漏らさない。
+    if (password_prompt_input(s)) return;
     if (ssh_is_connected()) {
         ssh_send(s.data(), s.size());
         return;
@@ -1028,19 +1152,17 @@ void ts_task(void* arg)
     vTaskDelete(nullptr);
 }
 
-int cmd_ts(int argc, char** argv)
+// Tailscale を上げる。**コンソールもメニューもここを通す** (#49) —
+// 分けると「シリアルからは繋がるのに一覧から選ぶと繋がらない」になる。
+bool ts_start(const std::string& host, const std::string& authkey, uint16_t port, uint16_t capver)
 {
-    if (argc < 3) {
-        std::printf("usage: ts <host> <authkey> [port] [capver]\n");
-        return 1;
-    }
     // **共有オブジェクトを触る前に弾く。** ts::Client は関数ローカル static で
     // 実体が 1 つしかないので、long-poll 中に set_config / set_map_handler を
     // 呼ぶと走行中のタスクが読んでいる std::string と std::function を
     // 差し替えることになる（use-after-free）。
     if (s_ts_task) {
         std::printf("already running (ts-status で状態、ts-stop で停止)\n");
-        return 1;
+        return false;
     }
     // machine / node / disco の 3 つは別の鍵にする（役割ごとに分離する）。
     // node_priv は **WireGuard の秘密鍵でもある**（Tailscale の設計）。
@@ -1063,7 +1185,7 @@ int cmd_ts(int argc, char** argv)
                 !c.random_bytes(disco_priv, 32)) {
                 std::printf("key generation failed (no entropy)\n");
                 nvs_close(nvs);
-                return 1;
+                return false;
             }
             // 保存に失敗したら黙って続けない。毎回新しい鍵で登録するとノードが増え続ける。
             esp_err_t err = nvs_set_blob(nvs, "mkey", machine_priv, 32);
@@ -1074,7 +1196,7 @@ int cmd_ts(int argc, char** argv)
                 std::printf("could not save keys: %s (refusing to register with throwaway keys)\n",
                             esp_err_to_name(err));
                 nvs_close(nvs);
-                return 1;
+                return false;
             }
             std::printf("generated and saved new machine/node/disco keys\n");
             have_keys = true;
@@ -1083,7 +1205,7 @@ int cmd_ts(int argc, char** argv)
     }
     if (!have_keys) {
         std::printf("could not load or create keys\n");
-        return 1;
+        return false;
     }
     // これ以降 map handler が node_priv を WireGuard の秘密鍵として使う。
     s_ts_keys_ready = true;
@@ -1093,15 +1215,15 @@ int cmd_ts(int argc, char** argv)
     if (!s_disco.set_key(disco_priv)) {
         std::printf("disco key setup failed\n");
         s_ts_keys_ready = false;
-        return 1;
+        return false;
     }
 
     static ts::Client client;
     ts::ClientConfig  cfg;
-    cfg.host     = argv[1];
-    cfg.auth_key = argv[2];
-    cfg.port     = (argc > 3) ? static_cast<uint16_t>(atoi(argv[3])) : 80;
-    cfg.capability_version = (argc > 4) ? static_cast<uint16_t>(atoi(argv[4])) : 131;
+    cfg.host     = host;
+    cfg.auth_key = authkey;
+    cfg.port     = port;
+    cfg.capability_version = capver;
     cfg.hostname = "m5stack-tab5";
     // 自分のエンドポイント。
     // ponytail: STUN も portmap も実装していないので LAN アドレスしか申告しない。
@@ -1120,7 +1242,7 @@ int cmd_ts(int argc, char** argv)
     if (!client.set_keys(machine_priv, node_priv, disco_priv)) {
         std::printf("public key derivation failed\n");
         s_ts_keys_ready = false;
-        return 1;
+        return false;
     }
     client.set_config(cfg);
     // netmap が来たらピアの disco 公開鍵を登録する。これが DISCO の前提。
@@ -1150,10 +1272,25 @@ int cmd_ts(int argc, char** argv)
         s_ts_client     = nullptr;
         s_ts_keys_ready = false;
         std::printf("xTaskCreate failed\n");
+        return false;
+    }
+    return true;
+}
+
+int cmd_ts(int argc, char** argv)
+{
+    if (argc < 3) {
+        std::printf("usage: ts <host> <authkey> [port] [capver]\n");
         return 1;
     }
-    return 0;
+    return ts_start(argv[1], argv[2],
+                    (argc > 3) ? static_cast<uint16_t>(atoi(argv[3])) : 80,
+                    (argc > 4) ? static_cast<uint16_t>(atoi(argv[4])) : 131)
+               ? 0
+               : 1;
 }
+
+
 
 // ts の状態を見る。long-poll を保持している間も見られる必要がある。
 int cmd_ts_status(int, char**)
@@ -1233,6 +1370,7 @@ MenuUi::Info gather_menu_info(const StatusBar::Info& si)
                                                           : nif.handshake_done() ? "up"
                                                                                  : "no handshake");
     std::snprintf(mi.wifi, sizeof(mi.wifi), "%s", si.wifi_up ? si.ssid : "(未接続)");
+    std::snprintf(mi.sd, sizeof(mi.sd), "%s", s_profiles_status);
     return mi;
 }
 
@@ -1318,9 +1456,14 @@ void render_term(bool force)
     renderer->render(*term, force);
 }
 
+void cancel_password_prompt();
+
 void set_menu_visible(bool show)
 {
     if (!menu) return;
+    // 入力途中でメニューへ逃げると、以後の打鍵が全部プロンプトに吸われて
+    // SSH セッションに届かなくなる（`*` だけが出る）。
+    cancel_password_prompt();
     s_swipe_start_y = -1;  // 掴んだままメニューに移ると、次のドラッグが飛ぶ
     menu->set_visible(show);
     // メニューはキーボードの領域を覆わないので、隠さないと指でキーを押せてしまう。
@@ -2245,6 +2388,97 @@ int cmd_ping(int argc, char** argv)
 }
 
 // WireGuard のトンネル netif を上げる。ピア指定は任意（無ければ netif だけ作る）。
+// 16 進文字列 -> バイト列。長さは呼び出し側が確かめる。
+bool hex_to_bytes(const std::string& hex, uint8_t* out, size_t n)
+{
+    if (hex.size() != n * 2) return false;
+    auto nib = [](char ch) -> int {
+        if (ch >= '0' && ch <= '9') return ch - '0';
+        if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+        if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < n; ++i) {
+        const int hi = nib(hex[i * 2]);
+        const int lo = nib(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = static_cast<uint8_t>((hi << 4) | lo);
+    }
+    return true;
+}
+
+// WireGuard の鍵 (32 バイト) を読む。**base64 が標準の表記**（`wg genkey` の出力）
+// なので base64 を先に試し、駄目なら 16 進も受ける。前後の空白と改行は捨てる。
+bool decode_key32(const std::string& text, uint8_t out[32])
+{
+    std::string t;
+    for (char c : text) {
+        if (c != ' ' && c != '\n' && c != '\r' && c != '\t') t += c;
+    }
+    if (t.empty()) return false;
+    size_t len = 0;
+    if (mbedtls_base64_decode(out, 32, &len, reinterpret_cast<const unsigned char*>(t.data()),
+                              t.size()) == 0 &&
+        len == 32) {
+        return true;
+    }
+    return hex_to_bytes(t, out, 32);
+}
+
+// トンネルを上げてピアを設定する。**コンソール (`wg`) も SD の接続先 (#49) も
+// ここを通す** — 分けると片方だけ wire_netif を呼び忘れて DISCO が死ぬ
+// （実機で踏んだのと同じ形）。addr/mask は点表記、peer_pub は 32 バイト、
+// endpoint が空ならピアは設定しない（netif を上げるだけ）。
+bool wg_bring_up(const uint8_t priv[32], const char* addr_str, const char* mask_str,
+                 const uint8_t* peer_pub, const std::string& endpoint, std::string* err)
+{
+    auto& nif = wg::netif_instance();
+    ip4_addr_t addr, mask;
+    if (!ip4addr_aton(addr_str, &addr)) {
+        *err = std::string("bad tunnel ip: ") + addr_str;
+        return false;
+    }
+    if (!ip4addr_aton(mask_str, &mask)) {
+        *err = std::string("bad netmask: ") + mask_str;
+        return false;
+    }
+
+    wire_netif(nif);
+
+    if (nif.is_up()) {
+        // **上がっているものと食い違ったら断る。** Netif::up は鍵をコピーするので
+        // 上がった後に差し替える手段が無く、黙って続けると「1 本目の鍵と
+        // アドレスのまま 2 本目のピアに握手する」ことになる（原因が分からない）。
+        if (!s_wg_live || std::memcmp(s_wg_priv, priv, 32) != 0 ||
+            s_wg_addr.addr != addr.addr || s_wg_mask.addr != mask.addr) {
+            *err = "別の設定でトンネルが上がっている（先に `wg down`）";
+            return false;
+        }
+    } else {
+        const esp_err_t e = nif.up(priv, addr, mask);
+        if (e != ESP_OK) {
+            *err = std::string("netif up failed: ") + esp_err_to_name(e) + " (" +
+                   nif.last_error() + ")";
+            return false;
+        }
+        s_netif_key = NetifKey::kOwn;
+        std::memcpy(s_wg_priv, priv, 32);
+        s_wg_addr = addr;
+        s_wg_mask = mask;
+        s_wg_live = true;
+    }
+    if (endpoint.empty() || !peer_pub) return true;
+
+    wg::PeerConfig peer;
+    std::memcpy(peer.public_key, peer_pub, 32);
+    peer.endpoint = endpoint;
+    if (const esp_err_t e = nif.set_peer(peer); e != ESP_OK) {
+        *err = std::string("set_peer failed: ") + esp_err_to_name(e) + " (" + nif.last_error() + ")";
+        return false;
+    }
+    return true;
+}
+
 int cmd_wg(int argc, char** argv)
 {
     auto& nif = wg::netif_instance();
@@ -2253,6 +2487,7 @@ int cmd_wg(int argc, char** argv)
         nif.down();
         s_netif_key         = NetifKey::kNone;
         s_tunnel_peer_valid = false;
+        s_wg_live           = false;
         std::printf("netif down\n");
         return 0;
     }
@@ -2319,61 +2554,339 @@ int cmd_wg(int argc, char** argv)
     for (int i = 0; i < 32; ++i) std::printf("%02x", pub[i]);
     std::printf("\n");
 
-    ip4_addr_t addr, mask;
-    if (!ip4addr_aton(argv[1], &addr)) {
-        std::printf("bad tunnel ip\n");
-        return 1;
-    }
-    ip4addr_aton(kTunnelMask, &mask);
-
-    wire_netif(nif);
-
-    if (!nif.is_up()) {
-        const esp_err_t err = nif.up(priv, addr, mask);
-        if (err == ESP_OK) s_netif_key = NetifKey::kOwn;
-        if (err != ESP_OK) {
-            std::printf("netif up failed: %s (%s)\n", esp_err_to_name(err), nif.last_error());
-            return 1;
-        }
-    }
-
     if (argc == 3) {
         // 公開鍵だけ渡されても接続できない。黙って netif だけ上げると原因が分からない。
         std::printf("peer endpoint is missing: wg <tunnel-ip> <pubkey> <host:port>\n");
         return 1;
     }
+    uint8_t     peer_pub[32] = {};
+    std::string endpoint;
     if (argc >= 4) {
-        wg::PeerConfig peer;
         const std::string hex = argv[2];
         // std::stoul は例外を投げる。例外を捕まえていないので、打ち間違いで abort してしまう。
-        if (hex.size() != 64) {
+        if (hex.size() != 64 || !hex_to_bytes(hex, peer_pub, 32)) {
             std::printf("peer pubkey must be 64 hex chars\n");
             return 1;
         }
-        for (int i = 0; i < 32; ++i) {
-            int hi = -1, lo = -1;
-            auto nib = [](char ch) {
-                if (ch >= '0' && ch <= '9') return ch - '0';
-                if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
-                if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
-                return -1;
-            };
-            hi = nib(hex[i * 2]);
-            lo = nib(hex[i * 2 + 1]);
-            if (hi < 0 || lo < 0) {
-                std::printf("peer pubkey must be hex\n");
-                return 1;
-            }
-            peer.public_key[i] = static_cast<uint8_t>((hi << 4) | lo);
-        }
-        peer.endpoint = argv[3];
-        const esp_err_t err = nif.set_peer(peer);
-        if (err != ESP_OK) {
-            std::printf("set_peer failed: %s (%s)\n", esp_err_to_name(err), nif.last_error());
-            return 1;
-        }
-        std::printf("handshake started with %s\n", peer.endpoint.c_str());
+        endpoint = argv[3];
     }
+
+    std::string err;
+    if (!wg_bring_up(priv, argv[1], kTunnelMask, endpoint.empty() ? nullptr : peer_pub, endpoint,
+                     &err)) {
+        std::printf("%s\n", err.c_str());
+        return 1;
+    }
+    if (!endpoint.empty()) std::printf("handshake started with %s\n", endpoint.c_str());
+    return 0;
+}
+
+// --- SD の接続先に繋ぐ (#49) ---
+//
+// **メニューもコンソール (`connect`) もここを通す。** 分けると
+// 「一覧から選ぶと繋がらないがシリアルからは繋がる」という形の食い違いが出る。
+
+// 端末に 1 行出す。**ロックは自分で取る** — 接続はワーカタスクで走るので、
+// 呼び出し側が持っている保証がない（s_term_lock は再帰なので入れ子でも安全）。
+void term_note(const char* color, const std::string& text)
+{
+    if (!term) return;
+    TermGuard guard;
+    if (!guard.ok()) return;
+    term->write("\r\n\033[" + std::string(color) + "m" + text + "\033[m\r\n");
+    render_term();
+}
+
+bool connect_vpn_profile(const prof::Profile& p, std::string* err)
+{
+    if (p.type == prof::Type::kTailscale) {
+        std::string authkey;
+        if (!read_key_file(p.authkey, 4096, &authkey, err)) return false;
+        // ファイルなので末尾の改行が付く。そのまま送るとヘッダが壊れる。
+        while (!authkey.empty() && (authkey.back() == '\n' || authkey.back() == '\r' ||
+                                    authkey.back() == ' ')) {
+            authkey.pop_back();
+        }
+        if (authkey.empty()) {
+            *err = std::string(kKeysDir) + p.authkey + " が空";
+            return false;
+        }
+        if (!ts_start(p.control, authkey, p.port, 131)) {
+            *err = "tailscale を起動できなかった（詳細はシリアル）";
+            return false;
+        }
+        return true;
+    }
+
+    // WireGuard。
+    std::string priv_text;
+    if (!read_key_file(p.private_key, 4096, &priv_text, err)) return false;
+    uint8_t priv[32];
+    if (!decode_key32(priv_text, priv)) {
+        *err = std::string(kKeysDir) + p.private_key + " が 32 バイトの鍵ではない";
+        return false;
+    }
+    uint8_t peer_pub[32];
+    if (!decode_key32(p.peer.pubkey, peer_pub)) {
+        *err = "peer.pubkey が 32 バイトの鍵ではない";
+        return false;
+    }
+    std::string addr;
+    int         prefix = 32;
+    if (!prof::split_cidr(p.address, &addr, &prefix)) {
+        *err = "address が IPv4/CIDR ではない: " + p.address;
+        return false;
+    }
+    // **経路は netif のアドレス 1 本ぶんしか持てない。** lwIP にポリシー
+    // ルーティングは無いので、allowed_ips の先頭をネットマスクとして使う。
+    // ponytail: 2 本目以降は無視する。複数レンジが要るなら netif に経路を
+    // 足す仕組みから作ることになる → その時に #49 の続きとして切る。
+    int mask_prefix = prefix;
+    if (!p.peer.allowed_ips.empty()) {
+        std::string ignored;
+        if (!prof::split_cidr(p.peer.allowed_ips[0], &ignored, &mask_prefix)) {
+            *err = "allowed_ips[0] が IPv4/CIDR ではない: " + p.peer.allowed_ips[0];
+            return false;
+        }
+    }
+    const std::string mask = prof::prefix_to_mask(mask_prefix);
+    if (!wg_bring_up(priv, addr.c_str(), mask.c_str(), peer_pub, p.peer.endpoint, err)) {
+        return false;
+    }
+    return true;
+}
+
+// パスワードを画面から入力させる。**SD は抜けば誰でも読める**ので、
+// `auth: "password"` で password を書いていなければここに来る。
+// 打鍵は画面キーボードも純正キーボードも send_input を通るので、そこで横取りする。
+bool s_pw_active = false;
+std::string s_pw_buf;
+// **プロファイルは index で持つ。** 値でコピーして持つと、待っている間に
+// `profiles reload` されたときに古い設定に繋いでしまう。
+int  s_pw_index = -1;
+
+void start_connect(int index, const std::string& password, bool have_password);
+
+// プロンプトを畳む。**メニューを開閉したときにも呼ぶ** — 入力途中で
+// メニューに逃げると、以後の打鍵が全部 s_pw_buf に吸われて
+// SSH セッションに届かなくなる（`*` だけが出る）。
+void cancel_password_prompt()
+{
+    if (!s_pw_active) return;
+    s_pw_active = false;
+    s_pw_buf.clear();
+    s_pw_index = -1;
+    // **畳んだことを端末に書く。** 伏せ字だけが残っていると、入力が
+    // まだ続いているように見える（実際には次の打鍵は端末へ流れる）。
+    term_note("33", "canceled");
+}
+
+void start_password_prompt(int index, const std::string& user, const std::string& host)
+{
+    s_pw_active = true;
+    s_pw_buf.clear();
+    s_pw_index = index;
+    term_note("33", "password for " + user + "@" + host + " (Enter で接続 / Esc で中止):");
+}
+
+// 入力を食ったら true。**エコーは伏せる**（肩越しに見えないように）。
+bool password_prompt_input(const std::string& in)
+{
+    if (!s_pw_active) return false;
+    // **矢印キーで中止しない。** DECCKM を含め特殊キーは ESC で始まる複数バイトなので、
+    // 先頭の ESC だけ見ると「パスワード入力中に ↑ を押すと黙って中止」になる。
+    if (in.size() > 1 && in[0] == '\033') return true;
+    TermGuard guard;
+    if (!guard.ok()) return true;  // 食ったことにする（端末に漏らさない）
+    for (char c : in) {
+        if (c == '\r' || c == '\n') {
+            const int   index = s_pw_index;
+            std::string pw    = s_pw_buf;
+            cancel_password_prompt();
+            term->write("\r\n");
+            render_term();
+            start_connect(index, pw, /*have_password=*/true);
+            return true;
+        }
+        if (c == '\033') {  // Esc 単独で中止
+            cancel_password_prompt();
+            return true;
+        }
+        if (c == '\x7F' || c == '\b') {
+            if (!s_pw_buf.empty()) {
+                s_pw_buf.pop_back();
+                term->write("\b \b");
+            }
+            continue;
+        }
+        if (static_cast<unsigned char>(c) < 0x20) continue;  // 制御文字は捨てる
+        if (s_pw_buf.size() < 128) {
+            s_pw_buf += c;
+            term->write("*");
+        }
+    }
+    render_term();
+    return true;
+}
+
+void connect_ssh_profile(const prof::Profile& p, int index)
+{
+    if (p.ask_password) {
+        start_password_prompt(index, p.user, p.host);
+        return;
+    }
+    // 先に VPN を張る（`via`）。**張れなければ繋ぎに行かない** —
+    // VPN 越しの相手に素の経路で繋ぎに行くと、無関係の相手に当たり得る。
+    if (!p.via.empty()) {
+        const prof::Profile* v = prof::find(s_profiles, p.via);
+        if (!v || v->type == prof::Type::kSsh) {
+            term_note("31", "via \"" + p.via + "\" が見つからない");
+            return;
+        }
+        // **Tailscale だけ「動いていれば飛ばす」。** ts::Client は実体が 1 つで、
+        // 走行中に設定を差し替えると use-after-free になる。WireGuard 側は
+        // wg_bring_up が食い違いを見るので、そのまま通してよい。
+        const bool skip = (v->type == prof::Type::kTailscale) && (s_ts_task != nullptr);
+        if (!skip) {
+            term_note("33", "bringing up " + p.via + " (" + prof::type_name(v->type) + ")...");
+            std::string err;
+            if (!connect_vpn_profile(*v, &err)) {
+                term_note("31", "via " + p.via + ": " + err);
+                return;
+            }
+        }
+    }
+
+    SshConfig cfg;
+    cfg.host     = p.host;
+    cfg.user     = p.user;
+    cfg.port     = p.port;
+    cfg.password = p.password;
+    if (!p.key.empty()) {
+        std::string err;
+        // 秘密鍵は 8KB もあれば足りる（RSA 4096 の PEM で約 3.2KB）。
+        if (!read_key_file(p.key, 8192, &cfg.key_pem, &err)) {
+            term_note("31", err);
+            return;
+        }
+    }
+    char line[128];
+    std::snprintf(line, sizeof(line), "connecting to %s@%s:%u...", cfg.user.c_str(),
+                  cfg.host.c_str(), (unsigned)cfg.port);
+    term_note("33", line);
+    if (esp_err_t err = ssh_connect(cfg, renderer->cols(), renderer->rows()); err != ESP_OK) {
+        ESP_LOGE(TAG, "ssh_connect failed: %s (%s)", esp_err_to_name(err), ssh_last_error());
+        term_note("31", std::string("connect failed: ") + ssh_last_error());
+    }
+}
+
+// --- 接続はワーカタスクで走らせる ---
+//
+// **X25519 は 1 回で 10KB 近くスタックを使う**（CLAUDE.md）。VPN を上げる経路は
+// ハンドシェイクの生成と鍵導出を含むので、呼び出し元（kbd タスク 8KB /
+// メインループ 8KB）の上で走らせるとスタック保護フォルトになる。
+// コンソールの `connect` からも同じタスクに載せる（経路を 1 本に保つ）。
+struct ConnectReq {
+    int         index    = -1;
+    std::string password;
+    bool        have_password = false;
+};
+ConnectReq   s_connect_req;
+TaskHandle_t s_connect_task = nullptr;
+
+void connect_worker(void*)
+{
+    const ConnectReq req = s_connect_req;
+    // **index はここで引き直す。** 待っている間に `profiles reload` が
+    // 走っていれば、そのときは黙って何もしない方がよい。
+    prof::Profile p;
+    bool          found = false;
+    {
+        TermGuard guard;
+        if (guard.ok() && req.index >= 0 &&
+            req.index < static_cast<int>(s_profiles.profiles.size())) {
+            p     = s_profiles.profiles[req.index];
+            found = true;
+        }
+    }
+    if (!found) {
+        term_note("31", "接続先が見つからない（読み直された？）");
+        s_connect_task = nullptr;
+        vTaskDelete(nullptr);
+        return;
+    }
+    if (req.have_password) {
+        p.password     = req.password;
+        p.ask_password = false;
+    }
+
+    if (p.type == prof::Type::kSsh) {
+        connect_ssh_profile(p, req.index);
+    } else {
+        term_note("33", "bringing up " + p.name + " (" + prof::type_name(p.type) + ")...");
+        std::string err;
+        if (!connect_vpn_profile(p, &err)) {
+            term_note("31", p.name + ": " + err);
+        } else {
+            term_note("32", p.name + ": started (詳細は `ts-status` / `wg stat`)");
+        }
+    }
+    ESP_LOGI(TAG, "connect task stack headroom: %u bytes",
+             (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+    s_connect_task = nullptr;
+    vTaskDelete(nullptr);
+}
+
+void start_connect(int index, const std::string& password, bool have_password)
+{
+    if (s_connect_task) {
+        term_note("31", "接続処理が走っている（終わるまで待つ）");
+        return;
+    }
+    s_connect_req = {index, password, have_password};
+    // **端末を見せてから始める。** メニューが出ている間は render_term が描かないので、
+    // 進行と失敗の行が端末バッファに溜まるだけで画面には出ない。
+    set_menu_visible(false);
+    if (xTaskCreate(&connect_worker, "connect", 32768, nullptr, 4, &s_connect_task) != pdPASS) {
+        s_connect_task = nullptr;
+        term_note("31", "接続タスクを作れなかった（メモリ不足）");
+    }
+}
+
+// index 番目の接続先に繋ぐ。SSH も VPN もワーカタスクに載せる。
+void connect_profile(int index)
+{
+    if (index < 0 || index >= static_cast<int>(s_profiles.profiles.size())) return;
+    start_connect(index, "", /*have_password=*/false);
+}
+
+// 一覧から選ぶのと同じ経路を、指も画面も無しで叩く。
+int cmd_connect(int argc, char** argv)
+{
+    if (argc < 2) {
+        std::printf("usage: connect <name|index>   (一覧は `profiles`)\n");
+        return 1;
+    }
+    TermGuard guard;
+    if (!guard.ok()) {
+        std::printf("busy\n");
+        return 1;
+    }
+    int index = -1;
+    if (const prof::Profile* p = prof::find(s_profiles, argv[1])) {
+        index = static_cast<int>(p - s_profiles.profiles.data());
+    } else {
+        char*      end = nullptr;
+        const long v   = std::strtol(argv[1], &end, 10);
+        if (end && *end == '\0' && v >= 0 && v < (long)s_profiles.profiles.size()) {
+            index = static_cast<int>(v);
+        }
+    }
+    if (index < 0) {
+        std::printf("no such profile: %s\n", argv[1]);
+        return 1;
+    }
+    connect_profile(index);
     return 0;
 }
 
@@ -2783,6 +3296,10 @@ void register_term_commands()
         {"ssh", "SSH 接続 (引数なしで保存済み設定)", "[<user> <host> <password> [port]]", &cmd_ssh,
          nullptr, nullptr, nullptr},
         {"sshclose", "SSH セッションを閉じる", nullptr, &cmd_sshclose, nullptr, nullptr, nullptr},
+        {"profiles", "SD の接続先を一覧する／読み直す", "[reload]", &cmd_profiles, nullptr,
+         nullptr, nullptr},
+        {"connect", "SD の接続先に繋ぐ（メニューから選ぶのと同じ経路）", "<name|index>",
+         &cmd_connect, nullptr, nullptr, nullptr},
         {"ssh-forget", "覚えているホスト鍵を忘れる", "<host>[:<port>]", &cmd_ssh_forget, nullptr,
          nullptr, nullptr},
         {"key", "SSH にキー入力を送る", "<text>", &cmd_key, nullptr, nullptr, nullptr},
@@ -2943,8 +3460,17 @@ extern "C" void app_main(void)
     // キーボードの出力はそのまま SSH へ流す。未接続なら端末にエコーして動作確認できるようにする。
     // 電源投入時はメニューを出す。端末は選んでから入る。
     menu = std::make_unique<MenuUi>(display);
-    menu->set_action([](MenuUi::Action a) {
+    menu->set_profiles(&s_profiles);
+    menu->set_action([](MenuUi::Action a, int index) {
         switch (a) {
+            case MenuUi::Action::kConnectProfile:
+                connect_profile(index);
+                break;
+            case MenuUi::Action::kReloadProfiles:
+                load_profiles();
+                menu->set_info(gather_menu_info(gather_status()));
+                menu->refresh();
+                break;
             case MenuUi::Action::kOpenSsh: {
                 // 端末に移るのは set_menu_visible の仕事（画面キーボードの再表示と
                 // 行数の張り直しがここにある）。直に set_visible すると隠れたままになる。
@@ -2996,6 +3522,10 @@ extern "C" void app_main(void)
             ESP_LOGE(TAG, "キーボードの読み取りタスクを立てられなかった（`kbdhw` で再試行）");
         }
     }
+
+    // SD の接続先 (#49)。**無くても起動する** — 読めなければ NVS の 1 件で繋ぐ。
+    load_profiles();
+    menu->set_info(gather_menu_info(gather_status()));
 
     // WiFi。display.init() が C6 の電源 (IO エクスパンダ経由) を入れているので、必ずこの後。
     if (esp_err_t err = wifi_start(); err != ESP_OK) {
