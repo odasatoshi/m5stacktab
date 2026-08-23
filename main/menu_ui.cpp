@@ -34,7 +34,8 @@ void MenuUi::set_area(int top, int height)
     // 見出し 1 行ぶん下げてから項目を並べる。
     list_top_ = top_ + 56;
     // 操作説明の 1 行ぶん (32px) を残して、入るだけ並べる。
-    // **32 件のプロファイルは画面に入らない**ので、窓からはみ出す分はスクロールする。
+    // **画面キーボードを出していると 4 行ぶんしか残らない**ので、窓からはみ出す分は
+    // スクロールする（1 画面の項目数は最大 8 = VPN の 状態 2 + 5 件 + "< Back"）。
     menu_.set_visible_rows((top_ + height_ - 40 - list_top_) / row_h_);
     dirty_    = true;
     if (menu_.count() == 0) rebuild();

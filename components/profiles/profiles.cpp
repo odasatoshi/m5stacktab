@@ -185,12 +185,6 @@ Config parse(const std::string& json)
     cJSON_ArrayForEach(item, arr)
     {
         ++index;
-        if (cfg.profiles.size() >= kMaxProfiles) {
-            cfg.error = "プロファイルが多すぎる (上限 " + std::to_string(kMaxProfiles) + " 件)";
-            cfg.profiles.clear();
-            cJSON_Delete(root);
-            return cfg;
-        }
         const std::string where = "profiles[" + std::to_string(index) + "]";
         if (!cJSON_IsObject(item)) {
             warn(&cfg, where + ": オブジェクトではないので飛ばした");
@@ -219,6 +213,20 @@ Config parse(const std::string& json)
             p.type = Type::kTailscale;
         } else {
             warn(&cfg, where + " \"" + p.name + "\": 未知の type \"" + type + "\" なので飛ばした");
+            continue;
+        }
+
+        // **上限は種類ごとに数え、超えた項目だけを飛ばす**（ファイル全体は失敗させない）。
+        // 6 件目を書いただけで 1 件も繋げなくなるのは重い。
+        const bool   is_ssh = (p.type == Type::kSsh);
+        const size_t limit  = is_ssh ? kMaxSshProfiles : kMaxVpnProfiles;
+        size_t       have   = 0;
+        for (const auto& q : cfg.profiles) {
+            if ((q.type == Type::kSsh) == is_ssh) ++have;
+        }
+        if (have >= limit) {
+            warn(&cfg, where + " \"" + p.name + "\": " + (is_ssh ? "ssh" : "vpn") +
+                           " が上限 (" + std::to_string(limit) + " 件) を超えたので飛ばした");
             continue;
         }
 

@@ -20,8 +20,9 @@ struct Item {
 
 class Menu {
 public:
-    // プロファイルは最大 32 件 (prof::kMaxProfiles) + 見出しと "< Back"。
-    static constexpr int kMaxItems = 36;
+    // 一番多いのは VPN の画面: 状態 2 行 + プロファイル 5 件 (prof::kMaxVpnProfiles)
+    // + "< Back"。SSH は 5 件 + 保存済み 1 + "< Back"。余裕を見て 12。
+    static constexpr int kMaxItems = 12;
 
     // items は呼び出し側が保持し続けること（コピーしない）。
     void set_items(const Item* items, int count);

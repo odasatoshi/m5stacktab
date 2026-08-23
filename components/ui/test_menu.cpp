@@ -203,20 +203,28 @@ void test_vpn_state()
     CHECK(std::strcmp(ui::vpn_label(VpnState::kUp), "up") == 0);
 }
 
-// SD の接続先を並べると 8 件では収まらない (#49)。窓の中だけ描くので、
-// 選択位置に窓が追いつくことと、タップ座標が窓の先頭を足して解決されることを固める。
+// 一覧が窓に収まらないときの挙動 (#49)。窓の中だけ描くので、選択位置に窓が追いつくことと、
+// タップ座標が窓の先頭を足して解決されることを固める。
+//
+// **件数は kMaxItems から取る。** 決め打ちにすると、上限を下げたときに
+// set_items が黙って切り詰めて、末尾を待つループが終わらなくなる（#58 で踏んだ）。
 void test_scroll_window()
 {
-    ui::Item items[20];
+    constexpr int kN    = ui::Menu::kMaxItems;
+    constexpr int kLast = kN - 1;
+    static_assert(kN >= 8, "窓 (5 行) との差が無いとスクロールを試せない");
+
+    ui::Item items[kN];
     // **GCC の -Wformat-truncation は %d を最大 11 桁で見積もる。** 幅を詰めると
     // ホスト CI (Linux/gcc) だけ -Werror で落ちる（macOS の clang は黙っている）。
-    char     labels[20][16];
-    for (int i = 0; i < 20; ++i) {
+    char labels[kN][16];
+    for (int i = 0; i < kN; ++i) {
         std::snprintf(labels[i], sizeof(labels[i]), "i%d", i);
         items[i] = {labels[i], i + 1, true};
     }
     ui::Menu m;
-    m.set_items(items, 20);
+    m.set_items(items, kN);
+    CHECK(m.count() == kN);  // 切り詰められていない
     m.set_visible_rows(5);
     CHECK(m.first_visible() == 0);
 
@@ -229,22 +237,22 @@ void test_scroll_window()
     CHECK(m.selected() == 5);
     CHECK(m.first_visible() == 1);
     // 末尾まで送っても窓は満杯のまま（余白を出さない）
-    while (m.selected() != 19) m.key(ui::Key::kDown);
-    CHECK(m.first_visible() == 15);
+    while (m.selected() != kLast) m.key(ui::Key::kDown);
+    CHECK(m.first_visible() == kN - 5);
     // 端で折り返したら先頭に戻る
     m.key(ui::Key::kDown);
     CHECK(m.selected() == 0);
     CHECK(m.first_visible() == 0);
     // 上に折り返したら末尾の窓
     m.key(ui::Key::kUp);
-    CHECK(m.selected() == 19);
-    CHECK(m.first_visible() == 15);
+    CHECK(m.selected() == kLast);
+    CHECK(m.first_visible() == kN - 5);
 
     // **タップは窓の先頭を足して解く。** 足さないと、スクロールした後に
     // 押した行と違う接続先へ繋いでしまう。
-    CHECK(m.hit_test(0, 0, 40) == 15);
-    CHECK(m.hit_test(40, 0, 40) == 16);
-    CHECK(m.hit_test(4 * 40, 0, 40) == 19);
+    CHECK(m.hit_test(0, 0, 40) == kN - 5);
+    CHECK(m.hit_test(40, 0, 40) == kN - 4);
+    CHECK(m.hit_test(4 * 40, 0, 40) == kLast);
     // 窓の外（描いていない行）は当たらない
     CHECK(m.hit_test(5 * 40, 0, 40) == -1);
 
@@ -253,20 +261,20 @@ void test_scroll_window()
     CHECK(m.first_visible() == 2);
 
     // 全部入るなら窓は動かない
-    m.set_visible_rows(20);
+    m.set_visible_rows(kN);
     CHECK(m.first_visible() == 0);
-    m.set_selected(19);
+    m.set_selected(kLast);
     CHECK(m.first_visible() == 0);
     // 0 = 制限なし
     m.set_visible_rows(0);
     CHECK(m.first_visible() == 0);
-    CHECK(m.hit_test(19 * 40, 0, 40) == 19);
+    CHECK(m.hit_test(kLast * 40, 0, 40) == kLast);
 
     // set_items で窓も先頭に戻る
     m.set_visible_rows(5);
-    m.set_selected(19);
-    CHECK(m.first_visible() == 15);
-    m.set_items(items, 20);
+    m.set_selected(kLast);
+    CHECK(m.first_visible() == kN - 5);
+    m.set_items(items, kN);
     CHECK(m.first_visible() == 0);
 }
 
