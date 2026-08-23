@@ -526,9 +526,33 @@ int wifi_scan(WifiScanEntry* out, int max)
         }
         s_started = true;
     }
+    // **繋ぎに行っている最中はスキャンが 0 件で返る**（実機で確認）。しかも
+    // **保存済みの AP が無い場所で「新規追加」を開くと必ずこの状態**なので、
+    // 直さないと目玉の経路がいつも「AP が見つからない」になる。
+    // 繋がっているときのスキャンは問題ないので、リトライ中だけ止める。
+    const bool was_retrying = !wifi_is_connected() && s_current >= 0;
+    if (was_retrying) {
+        if (s_retry_timer) esp_timer_stop(s_retry_timer);
+        s_reconfiguring = true;  // この切断で再接続を走らせない
+        esp_wifi_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(100));  // 切断イベントが流れるのを待つ
+    }
+
     wifi_scan_config_t cfg = {};
     cfg.show_hidden        = false;  // 隠し SSID は手入力で足す
     esp_err_t err          = esp_wifi_scan_start(&cfg, /*block=*/true);
+    // **探し終わったらリトライを戻す。** 戻さないと、スキャンしただけで
+    // 元の AP に繋ぎ直さなくなる（AP が戻ってきても永久にオフライン）。
+    struct Resume {
+        bool on;
+        ~Resume()
+        {
+            if (!on) return;
+            s_retry         = 0;
+            s_reconfiguring = false;
+            esp_wifi_connect();
+        }
+    } resume{was_retrying};
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "scan_start: %s", esp_err_to_name(err));
         return -1;
