@@ -62,6 +62,8 @@ USB Type-C のシリアルコンソール（`screen /dev/cu.usbmodem101 115200`�
 | `ssh <user> <host> <password> [port]` | パスワードで SSH 接続 |
 | `key <text>` | SSH にキー入力を送る（`\e` = ESC。キーボードが無いときの入力手段） |
 | `sshclose` | SSH 切断 |
+| `profiles [reload]` | SD の接続先を一覧する／読み直す（飛ばした項目の理由も出る） |
+| `connect <name\|index>` | SD の接続先に繋ぐ（メニューから選ぶのと同じ経路） |
 | `conv <romaji>` | ローマ字→かな→漢字を試す |
 | `term <text>` / `termtest` / `termscroll` | 端末描画の確認（`\e` でエスケープを送れる） |
 | `bench` | 描画コストの実測（全画面 vs 1 文字） |
@@ -76,6 +78,35 @@ USB Type-C のシリアルコンソール（`screen /dev/cu.usbmodem101 115200`�
 | `wg <tunnel-ip> [pubkey] [host:port]` | WireGuard トンネルの netif |
 | `wg stat` / `wg disco` / `wg down` | 統計・DISCO 状態・停止 |
 | `ts <host> <authkey> [port] [capver]` | Tailscale / Headscale の制御プレーンに接続 |
+
+## 接続先を SD カードに置く
+
+接続先（SSH / VPN）は SD カードの JSON に書く。メニューの `SSH` / `VPN` に一覧が出て、
+選んでから繋ぐ。SD が無ければ従来どおり NVS に保存した 1 件（`ssh` コマンド）を使う。
+
+```
+/sdcard/tab5/profiles.json   設定本体（上限 64KB / 32 プロファイル）
+/sdcard/tab5/keys/           鍵ファイル（SSH の PEM、WireGuard の秘密鍵、Tailscale の authkey）
+```
+
+`docs/profiles.example.json` をコピーして書き換える。
+
+- **`name` が一覧に出る名前で、`via` の参照先でもある。** 重複したら読み込みごと失敗する
+  （どちらに繋がったのか分からないのが一番困るため）
+- **鍵と authkey は JSON に埋めない。** `keys/` 配下の**ファイル名だけ**を書く
+  （ディレクトリを含む名前は拒否する）
+- パスワードは書けるが既定にしない。`"auth": "password"` で `password` を書かなければ、
+  繋ぐときに画面から入力させる（入力中はエコーしない）
+- 鍵の形式の制約は `sshkey` パーティションと同じ（**PEM のみ。OpenSSH 形式と ed25519 は不可**。
+  ECDSA は named curve）
+- 未知のキーは黙って無視、未知の `type` や必須項目の欠けは**その項目だけ**飛ばす
+  （`profiles` コマンドで飛ばした理由が見られる）
+
+> **秘密鍵を SD に置くのは `sshkey` パーティションより弱い。抜き取られたら終わり。**
+> 持ち歩く端末なので、失っても困らない鍵（用途を限った専用鍵）を置くこと。
+
+WireGuard は netif のアドレス 1 本ぶんしか経路を持てないので、`allowed_ips` は
+**先頭の 1 本だけ**をネットマスクとして使う。
 
 ## 純正キーボードのキー割り当て
 

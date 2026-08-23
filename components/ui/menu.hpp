@@ -1,7 +1,7 @@
 #pragma once
 // 初期メニューの純粋ロジック。ESP-IDF に依存させないのでホストでテストできる。
 //
-// 項目数は 3〜5 なのでスクロールは持たない。必要になってから足す。
+// SD の接続先を並べるようになった (#49) ので、画面に入る行数だけ窓を開けて表示する。
 // 入れ子は「今どの画面か」を呼び出し側が持つ形にして、ここでは 1 画面ぶんだけ扱う
 // （深さ 2 の入れ子に汎用スタックを用意しても使い道がない）。
 #include <cstdint>
@@ -20,7 +20,8 @@ struct Item {
 
 class Menu {
 public:
-    static constexpr int kMaxItems = 8;
+    // プロファイルは最大 32 件 (prof::kMaxProfiles) + 見出しと "< Back"。
+    static constexpr int kMaxItems = 36;
 
     // items は呼び出し側が保持し続けること（コピーしない）。
     void set_items(const Item* items, int count);
@@ -38,19 +39,31 @@ public:
     // Esc / ← が押されたか。取り出したらクリアする。
     bool take_back();
 
+    // 一度に表示できる行数。0 = 制限なし（全部描く）。
+    // これを超えると選択位置を追って窓がずれる。
+    void set_visible_rows(int rows);
+    int  visible_rows() const { return rows_; }
+    // 窓の先頭の項目 index。描画側はここから visible_rows 行ぶん描く。
+    int  first_visible() const { return first_; }
+
     // 行の先頭 y = top、行の高さ row_h で描いたときの、タップ座標 y → 項目 index。
+    // **窓の先頭を足す**ので、スクロールしていてもタップ位置と項目が一致する。
     // 範囲外や選べない項目は -1。
     int hit_test(int y, int top, int row_h) const;
 
 private:
     // enabled な項目だけを辿る。全部 disabled なら動かさない。
     void move(int delta);
+    // 選択位置が窓に入るように first_ を動かす。
+    void scroll_into_view();
 
     const Item* items_     = nullptr;
     int         count_     = 0;
     int         selected_  = 0;
     int         activated_ = -1;
     bool        back_      = false;
+    int         rows_      = 0;
+    int         first_     = 0;
 };
 
 // --- VPN の状態表示 ---

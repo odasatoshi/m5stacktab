@@ -136,6 +136,12 @@ python tools/serial_log.py --seconds 20      # ログ採取
      **1 に決め打ちすると反転時に四隅が入れ替わって偽の NG になる**
   - **物理的な向きはホストからは観測できない。** 読み戻しの経路が全部同じ rotation を
     通るので、画素は反転前後で同じに見える。**実機を見た人の報告が要る**
+- **SD カード (SDMMC 4 線, CLK=G43 / CMD=G44 / D0-D3=G39-42) は on-chip LDO の VO4 を
+  開けないと一切応答しない**（`sd_pwr_ctrl_new_on_chip_ldo`）。実装は `main/sdcard.cpp`
+- **FatFs の長いファイル名は既定で無効**。`CONFIG_FATFS_LFN_NONE` のままだと 8.3 形式しか
+  読めず、`profiles.json` はカードに置いてあるのに `stat` が ENOENT を返す
+  （「が無い」と表示されて、配線もマウントも疑うことになる）。
+  `CONFIG_FATFS_LFN_HEAP` + `CONFIG_FATFS_API_ENCODING_UTF_8` を入れる
 - `CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM` は有効にしない。TX mempool の 1600B ストライドが
   128B キャッシュラインと合わず CMD53 がアライメント検査で弾かれる
 
@@ -209,7 +215,10 @@ c++ -std=c++17 -Wall -Wextra -Werror -O1 -I$M3/include -I components/wg \
   DISCO の共有鍵はピアごとに 1 回）ので現状で足りている → #19
 - **X25519 は 1 回で 10KB 近くスタックを使う**。既定 4KB では即スタック保護フォルト。
   コンソールタスクは 32KB（鍵導出と netif 初期化が重なる経路があるため 16KB でも足りなかった）、
-  WireGuard の受信タスクも 16KB 必要。受信バッファは static にしてスタックから外す
+  WireGuard の受信タスクも 16KB 必要。受信バッファは static にしてスタックから外す。
+  **UI から VPN を上げる経路も同じ制約にかかる**（kbd タスクもメインループも 8KB しかない）。
+  接続は専用のワーカタスク (`connect`, 32KB) に載せる — 直接呼ぶと
+  「メニューから VPN を選ぶと落ちる」という形でしか出ない
 
 ## Tailscale / Headscale の開発環境
 

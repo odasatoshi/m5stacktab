@@ -144,7 +144,9 @@ std::string load_private_key()
 // 鍵があれば公開鍵認証、なければ (または失敗したら) パスワード認証。
 bool authenticate(LIBSSH2_SESSION* session, const SshConfig& cfg)
 {
-    const std::string key = load_private_key();
+    // 接続先が鍵を持っていればそれを使う（SD の profiles.json の `key`）。
+    // 無ければ従来どおり sshkey パーティション。
+    const std::string key = cfg.key_pem.empty() ? load_private_key() : cfg.key_pem;
     if (!key.empty()) {
         // 公開鍵は渡さない。OpenSSH 形式の秘密鍵には公開鍵が含まれているため libssh2 が導出する。
         // パスフレーズ付きの鍵なら cfg.password をパスフレーズとして使う。
@@ -176,7 +178,7 @@ bool authenticate(LIBSSH2_SESSION* session, const SshConfig& cfg)
         set_error("authentication failed: %d", rc);
         return false;
     }
-    if (key.empty()) set_error("no private key in the sshkey partition and no password given");
+    if (key.empty()) set_error("no private key (sshkey partition / profile key) and no password given");
     return false;
 }
 

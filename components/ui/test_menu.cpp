@@ -203,6 +203,73 @@ void test_vpn_state()
     CHECK(std::strcmp(ui::vpn_label(VpnState::kUp), "up") == 0);
 }
 
+// SD の接続先を並べると 8 件では収まらない (#49)。窓の中だけ描くので、
+// 選択位置に窓が追いつくことと、タップ座標が窓の先頭を足して解決されることを固める。
+void test_scroll_window()
+{
+    ui::Item items[20];
+    // **GCC の -Wformat-truncation は %d を最大 11 桁で見積もる。** 幅を詰めると
+    // ホスト CI (Linux/gcc) だけ -Werror で落ちる（macOS の clang は黙っている）。
+    char     labels[20][16];
+    for (int i = 0; i < 20; ++i) {
+        std::snprintf(labels[i], sizeof(labels[i]), "i%d", i);
+        items[i] = {labels[i], i + 1, true};
+    }
+    ui::Menu m;
+    m.set_items(items, 20);
+    m.set_visible_rows(5);
+    CHECK(m.first_visible() == 0);
+
+    // 窓の中を動いている間は動かない
+    for (int i = 0; i < 4; ++i) m.key(ui::Key::kDown);
+    CHECK(m.selected() == 4);
+    CHECK(m.first_visible() == 0);
+    // 窓からはみ出すと 1 行ずつ送る
+    m.key(ui::Key::kDown);
+    CHECK(m.selected() == 5);
+    CHECK(m.first_visible() == 1);
+    // 末尾まで送っても窓は満杯のまま（余白を出さない）
+    while (m.selected() != 19) m.key(ui::Key::kDown);
+    CHECK(m.first_visible() == 15);
+    // 端で折り返したら先頭に戻る
+    m.key(ui::Key::kDown);
+    CHECK(m.selected() == 0);
+    CHECK(m.first_visible() == 0);
+    // 上に折り返したら末尾の窓
+    m.key(ui::Key::kUp);
+    CHECK(m.selected() == 19);
+    CHECK(m.first_visible() == 15);
+
+    // **タップは窓の先頭を足して解く。** 足さないと、スクロールした後に
+    // 押した行と違う接続先へ繋いでしまう。
+    CHECK(m.hit_test(0, 0, 40) == 15);
+    CHECK(m.hit_test(40, 0, 40) == 16);
+    CHECK(m.hit_test(4 * 40, 0, 40) == 19);
+    // 窓の外（描いていない行）は当たらない
+    CHECK(m.hit_test(5 * 40, 0, 40) == -1);
+
+    // set_selected でも窓が追う
+    m.set_selected(2);
+    CHECK(m.first_visible() == 2);
+
+    // 全部入るなら窓は動かない
+    m.set_visible_rows(20);
+    CHECK(m.first_visible() == 0);
+    m.set_selected(19);
+    CHECK(m.first_visible() == 0);
+    // 0 = 制限なし
+    m.set_visible_rows(0);
+    CHECK(m.first_visible() == 0);
+    CHECK(m.hit_test(19 * 40, 0, 40) == 19);
+
+    // set_items で窓も先頭に戻る
+    m.set_visible_rows(5);
+    m.set_selected(19);
+    CHECK(m.first_visible() == 15);
+    m.set_items(items, 20);
+    CHECK(m.first_visible() == 0);
+}
+
 }  // namespace
 
 int main()
@@ -212,6 +279,7 @@ int main()
     test_hit_test();
     test_reselect_after_set_items();
     test_bounds();
+    test_scroll_window();
     test_vpn_state();
     if (g_fails) {
         std::printf("FAILED: %d of %d checks\n", g_fails, g_checks);
