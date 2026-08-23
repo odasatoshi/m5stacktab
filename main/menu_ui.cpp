@@ -110,7 +110,12 @@ bool MenuUi::key(ui::Key k)
     if (!menu_.key(k)) return false;
     dirty_ = true;
     if (menu_.take_back()) {
-        if (screen_ == Screen::kRoot) return true;  // 最上位ではどこにも戻らない
+        // 最上位の Esc / ← は端末へ戻る。**指を使わずメニューから出る経路がここしかない**
+        // （Terminal の項目まで下りて Enter でも出られるが、Esc で閉じるほうが速い）。
+        if (screen_ == Screen::kRoot) {
+            if (action_) action_(Action::kShowTerminal);
+            return true;
+        }
         enter(Screen::kRoot);
         return true;
     }
@@ -190,9 +195,18 @@ void MenuUi::draw(bool force)
     }
 
     gfx_.setTextColor(kHint, kBg);
-    gfx_.drawString(screen_ == Screen::kRoot
-                        ? "tap an item to open   |   tap CLOSE (top left) to go to the terminal"
-                        : "tap an item   |   tap < Back to go up   |   tap CLOSE for the terminal",
-                    24, top_ + height_ - 32);
+    // キーボードが挿さっていればキーの説明も出す。挿さっていなければ指の説明だけ
+    // （押せないキーを案内すると、外したときに嘘になる）。
+    const char* hint;
+    if (has_kbd_) {
+        hint = (screen_ == Screen::kRoot)
+                   ? "up/down + Enter to open   |   Esc or Ctrl+Alt+M for the terminal"
+                   : "up/down + Enter   |   Esc or left to go up   |   Ctrl+Alt+M for the terminal";
+    } else {
+        hint = (screen_ == Screen::kRoot)
+                   ? "tap an item to open   |   tap CLOSE (top left) to go to the terminal"
+                   : "tap an item   |   tap < Back to go up   |   tap CLOSE for the terminal";
+    }
+    gfx_.drawString(hint, 24, top_ + height_ - 32);
     gfx_.setTextColor(TFT_WHITE, TFT_BLACK);
 }

@@ -29,6 +29,16 @@ inline bool kbd_name_is(const std::string& name, const char* want)
     return i == name.size();
 }
 
+// メニューを開く／閉じるキー (#51)。**端末に送りたいキーを潰さない**のが要点で、
+// Esc も Ctrl+C も端末の中で必要なので使えない。Ctrl+Alt+M にしたのは、
+// vim も tmux も既定では使わず、片手で押せるため。
+// `sym` / `Aa` の単独打鍵は使わない（キーボードのファームが内部の層切り替えにも
+// 使っていて、端末側で意味を持たせると挙動が二重になる）。
+inline bool kbd_is_menu_key(const std::string& name, uint8_t mod)
+{
+    return (mod & kKbdModCtrl) && (mod & kKbdModAlt) && kbd_name_is(name, "m");
+}
+
 // キー名 + 修飾ビット -> 端末に送るバイト列。空文字列 = 送るものが無い。
 // `app_cursor` は DECCKM（vim や less が入れる）。矢印を ESC[A ではなく ESC O A で送る。
 inline std::string kbd_key_to_bytes(const std::string& name, uint8_t mod, bool app_cursor)
