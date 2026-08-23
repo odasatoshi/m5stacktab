@@ -232,28 +232,57 @@ void test_via_is_reported_but_not_fatal()
     CHECK(has_warning(c, "VPN ではない"));
 }
 
+// **上限は種類ごと。超えた項目だけを飛ばす（ファイル全体は落とさない）。**
 void test_limits()
 {
+    // ssh を上限 +2 件、vpn を 1 件書く。ssh は上限まで残り、vpn は無事。
     std::string j = R"({"version":1,"profiles":[)";
-    for (int i = 0; i < 33; ++i) {
+    for (size_t i = 0; i < prof::kMaxSshProfiles + 2; ++i) {
         if (i) j += ",";
-        j += "{\"name\":\"p" + std::to_string(i) + "\",\"type\":\"ssh\",\"host\":\"h\",\"user\":\"u\"}";
+        j += "{\"name\":\"s" + std::to_string(i) +
+             "\",\"type\":\"ssh\",\"host\":\"h\",\"user\":\"u\"}";
     }
-    j += "]}";
+    j += R"(,{"name":"v0","type":"tailscale","control":"h","authkey":"k"}]})";
     const prof::Config c = prof::parse(j);
-    CHECK(!c.error.empty());
-    CHECK(c.profiles.empty());
+    CHECK(c.error.empty());  // 全体は失敗させない
+    CHECK(c.profiles.size() == prof::kMaxSshProfiles + 1);
+    CHECK(prof::find(c, "s0") != nullptr);
+    CHECK(prof::find(c, "s4") != nullptr);
+    CHECK(prof::find(c, "s5") == nullptr);  // 6 件目以降は飛ばす
+    CHECK(prof::find(c, "s6") == nullptr);
+    CHECK(prof::find(c, "v0") != nullptr);  // **ssh が溢れても vpn は入る**
+    CHECK(c.warnings.size() == 2);
+    CHECK(has_warning(c, "上限"));
 
-    // 上限ちょうどは通る
+    // vpn も別枠で数える
     std::string k = R"({"version":1,"profiles":[)";
-    for (int i = 0; i < 32; ++i) {
+    for (size_t i = 0; i < prof::kMaxVpnProfiles + 1; ++i) {
         if (i) k += ",";
-        k += "{\"name\":\"p" + std::to_string(i) + "\",\"type\":\"ssh\",\"host\":\"h\",\"user\":\"u\"}";
+        k += "{\"name\":\"v" + std::to_string(i) +
+             "\",\"type\":\"tailscale\",\"control\":\"h\",\"authkey\":\"k\"}";
     }
-    k += "]}";
-    CHECK(prof::parse(k).profiles.size() == 32);
+    k += R"(,{"name":"s0","type":"ssh","host":"h","user":"u"}]})";
+    const prof::Config c2 = prof::parse(k);
+    CHECK(c2.error.empty());
+    CHECK(c2.profiles.size() == prof::kMaxVpnProfiles + 1);
+    CHECK(prof::find(c2, "v5") == nullptr);
+    CHECK(prof::find(c2, "s0") != nullptr);
 
-    // ファイルサイズの上限
+    // **wireguard と tailscale は同じ「vpn」枠。**
+    std::string m = R"({"version":1,"profiles":[)";
+    for (size_t i = 0; i < prof::kMaxVpnProfiles; ++i) {
+        if (i) m += ",";
+        m += "{\"name\":\"t" + std::to_string(i) +
+             "\",\"type\":\"tailscale\",\"control\":\"h\",\"authkey\":\"k\"}";
+    }
+    m += R"(,{"name":"wg","type":"wireguard","address":"10.0.0.1/32","private_key":"k",)"
+         R"("peer":{"pubkey":"p","endpoint":"192.168.0.5:1"}}]})";
+    const prof::Config c3 = prof::parse(m);
+    CHECK(c3.error.empty());
+    CHECK(prof::find(c3, "wg") == nullptr);
+    CHECK(c3.profiles.size() == prof::kMaxVpnProfiles);
+
+    // ファイルサイズの上限は今までどおり全体を失敗させる（中身を見る前の話）
     const prof::Config big = prof::parse(std::string(prof::kMaxFileBytes + 1, ' '));
     CHECK(!big.error.empty());
 }

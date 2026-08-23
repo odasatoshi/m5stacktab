@@ -5,9 +5,9 @@
 // パーサは ESP-IDF に依存させないのでホストでテストできる（cJSON だけ使う。
 // Tailscale の netmap で既に使っているので依存は増えない）。
 //
-// 1 件の書き損じで全部読めなくなるのは避ける: 未知の `type` や必須項目の欠けは
-// その項目だけ飛ばして warnings に理由を残す。**名前の重複だけは全体を失敗させる**
-// （どちらに繋がったのか分からないのが一番困る）。
+// 1 件の書き損じで全部読めなくなるのは避ける: 未知の `type`・必須項目の欠け・
+// 上限超えは、その項目だけ飛ばして warnings に理由を残す。
+// **名前の重複だけは全体を失敗させる**（どちらに繋がったのか分からないのが一番困る）。
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -46,9 +46,11 @@ struct Profile {
     std::string authkey;  // keys/ 配下のファイル名
 };
 
-// SD は抜けば誰でも読めるし、壊れたファイルも入り得る。上限で殴っておく。
-constexpr size_t kMaxProfiles  = 32;
-constexpr size_t kMaxFileBytes = 64 * 1024;
+// **SSH と VPN は別枠で数える。** 違うレイヤなので混ぜない。合計で数えると、
+// `via`（SSH 1 件が VPN 1 件を要求する）構成ですぐ埋まる。
+constexpr size_t kMaxSshProfiles = 5;
+constexpr size_t kMaxVpnProfiles = 5;
+constexpr size_t kMaxFileBytes   = 64 * 1024;
 
 struct Config {
     std::vector<Profile>     profiles;

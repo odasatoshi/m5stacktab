@@ -10,6 +10,14 @@
 #include "menu.hpp"
 #include "profiles.hpp"
 
+// **画面に必要な行数と ui::Menu の上限を結び付ける。** rebuild() は "< Back" を
+// 最後に足すので、溢れると**指で抜ける唯一の経路が黙って消える**（残る行は
+// 全部 disabled で hit_test が -1 を返す）。上限を上げたらここで気づけるようにする。
+static_assert(ui::Menu::kMaxItems >= 2 + (int)prof::kMaxVpnProfiles + 1,
+              "VPN 画面: 状態 2 行 + プロファイル + \"< Back\" が入らない");
+static_assert(ui::Menu::kMaxItems >= (int)prof::kMaxSshProfiles + 1 + 1,
+              "SSH 画面: プロファイル + 保存済み 1 件 + \"< Back\" が入らない");
+
 class MenuUi {
 public:
     // メニューから起こす動作。main が実装を差す（この層は描画と選択だけを持つ）。

@@ -87,7 +87,7 @@ USB Type-C のシリアルコンソール（`screen /dev/cu.usbmodem101 115200`�
 
 ```sh
 # SD に置いて（PC 側で）
-#   /sdcard/tab5/profiles.json  （NVS に置くので 8KB まで）
+#   /sdcard/tab5/profiles.json  （NVS に置くので 8KB まで / SSH 5 件・VPN 5 件）
 #   /sdcard/tab5/keys/          鍵ファイル（SSH の PEM / WireGuard の秘密鍵 / authkey）
 # 端末で取り込む
 tab5> profiles import
@@ -107,8 +107,10 @@ tab5> profiles clear    # 取り込んだものを全部消す
   繋ぐときに画面から入力させる（入力中はエコーしない）
 - 鍵の形式の制約は `sshkey` パーティションと同じ（**PEM のみ。OpenSSH 形式と ed25519 は不可**。
   ECDSA は named curve）
-- 未知のキーは黙って無視、未知の `type`・必須項目の欠け・**鍵の取り込み失敗**は
+- 未知のキーは黙って無視、未知の `type`・必須項目の欠け・**上限超え**・**鍵の取り込み失敗**は
   **その項目だけ**飛ばす（理由が `profiles import` と画面に出る）
+- **上限は SSH 5 件 / VPN 5 件**（別枠で数える。`via` は SSH 1 件が VPN 1 件を要求するので、
+  合計で数えるとすぐ埋まる）。6 件目を書いても 5 件目までは使える
 - **`profiles import` は毎回「消してから書く」。** 鍵の名前を変えたり接続先を消したりしても、
   古い秘密鍵が NVS に residue として残らない
 
