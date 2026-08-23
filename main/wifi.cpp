@@ -552,9 +552,14 @@ int wifi_scan(WifiScanEntry* out, int max)
         ~Resume()
         {
             if (!on) return;
-            s_retry         = 0;
+            // **バックオフは引き継ぐ。** 0 に戻すと、スキャンするたびに 500ms から
+            // やり直しになって指数バックオフが育たない。
             s_reconfiguring = false;
-            esp_wifi_connect();
+            // **失敗を拾う。** ここで諦めると、リトライタイマは既に止めてあり、
+            // 接続が始まらない以上 DISCONNECTED も来ないので**再武装する者が
+            // 誰もいなくなる** — このコミットが防ごうとした「スキャンしただけで
+            // 永久にオフライン」がそのまま残る（retry_timer_cb と同じ扱いにする）。
+            if (esp_wifi_connect() != ESP_OK) schedule_reconnect();
         }
     } resume{was_retrying};
     if (err != ESP_OK) {
