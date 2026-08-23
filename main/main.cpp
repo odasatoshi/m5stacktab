@@ -930,8 +930,8 @@ int cmd_kbdinject(int argc, char** argv)
     return 0;
 }
 
-// パスワード入力中は打鍵をそこへ回す（#49）。定義はずっと下（プロファイル接続の側）。
-bool password_prompt_input(const std::string& in);
+// 1 行入力中は打鍵をそこへ回す（#49 / #56）。定義はずっと下（プロファイル接続の側）。
+bool line_prompt_input(const std::string& in);
 
 // 入力を送る唯一の経路。画面キーボードも純正キーボードもここを通す。
 // 未接続なら端末にエコーして、繋がなくても打鍵の確認ができるようにする。
@@ -939,7 +939,7 @@ void send_input(const std::string& s)
 {
     if (s.empty()) return;
     // **SSH へ送る前に見る。** 入力中のパスワードをリモートに漏らさない。
-    if (password_prompt_input(s)) return;
+    if (line_prompt_input(s)) return;
     if (ssh_is_connected()) {
         ssh_send(s.data(), s.size());
         return;
@@ -1625,21 +1625,25 @@ void render_term(bool force)
     renderer->render(*term, force);
 }
 
-void cancel_password_prompt();
+void cancel_line_prompt();
+void refresh_wifi_nets();
 
 void set_menu_visible(bool show)
 {
     if (!menu) return;
     // 入力途中でメニューへ逃げると、以後の打鍵が全部プロンプトに吸われて
     // SSH セッションに届かなくなる（`*` だけが出る）。
-    cancel_password_prompt();
+    cancel_line_prompt();
     s_swipe_start_y = -1;  // 掴んだままメニューに移ると、次のドラッグが飛ぶ
     menu->set_visible(show);
     // メニューはキーボードの領域を覆わないので、隠さないと指でキーを押せてしまう。
     // 端末に戻るときは**ユーザが選んだ状態**に戻す（#54 でダブルタップから
     // 切り替えられるようになったので、開くたびに勝手に出すと選択が消える）。
     keyboard->set_visible(!show && s_keyboard_wanted);
-    if (show) menu->set_info(gather_menu_info(gather_status()));
+    if (show) {
+        menu->set_info(gather_menu_info(gather_status()));
+        refresh_wifi_nets();  // `*` の位置は繋ぎ直しで変わる (#56)
+    }
     apply_layout();
     if (show) {
         menu->draw(/*force=*/true);
@@ -2825,43 +2829,51 @@ bool connect_vpn_profile(const prof::Profile& p, std::string* err)
     return true;
 }
 
-// パスワードを画面から入力させる。**SD は抜けば誰でも読める**ので、
-// `auth: "password"` で password を書いていなければここに来る。
+// 画面から 1 行入力させる (#49 / #56)。**SD は抜けば誰でも読める**ので、
+// SSH の `auth: "password"` で password を書いていなければここに来る。
+// WiFi のパスワードと隠し SSID も同じ入り口を使う。
+//
 // 打鍵は画面キーボードも純正キーボードも send_input を通るので、そこで横取りする。
-bool s_pw_active = false;
-std::string s_pw_buf;
-// **プロファイルは index で持つ。** 値でコピーして持つと、待っている間に
-// `profiles reload` されたときに古い設定に繋いでしまう。
-int  s_pw_index = -1;
+bool        s_prompt_active = false;
+bool        s_prompt_mask   = false;  // 伏せ字にする（肩越しに見えないように）
+std::string s_prompt_buf;
+// Enter で呼ぶ。**呼ぶ前にプロンプトを畳む**ので、この中から次の入力を始めてよい
+// （隠し SSID は SSID → パスワードと 2 回続けて聞く）。
+std::function<void(const std::string&)> s_prompt_done;
 
 void start_connect(int index, const std::string& password, bool have_password);
 
 // プロンプトを畳む。**メニューを開閉したときにも呼ぶ** — 入力途中で
-// メニューに逃げると、以後の打鍵が全部 s_pw_buf に吸われて
+// メニューに逃げると、以後の打鍵が全部 s_prompt_buf に吸われて
 // SSH セッションに届かなくなる（`*` だけが出る）。
-void cancel_password_prompt()
+void cancel_line_prompt()
 {
-    if (!s_pw_active) return;
-    s_pw_active = false;
-    s_pw_buf.clear();
-    s_pw_index = -1;
+    if (!s_prompt_active) return;
+    s_prompt_active = false;
+    s_prompt_mask   = false;
+    s_prompt_buf.clear();
+    // **続きの処理も捨てる。** 残すと、次に別のプロンプトを開いたときに
+    // 前回の続きが動く（SSID を聞いていたつもりが VPN に繋ぎに行く）。
+    s_prompt_done = nullptr;
     // **畳んだことを端末に書く。** 伏せ字だけが残っていると、入力が
     // まだ続いているように見える（実際には次の打鍵は端末へ流れる）。
     term_note("33", "canceled");
 }
 
-void start_password_prompt(int index, const std::string& user, const std::string& host)
+void start_line_prompt(const std::string& label, bool mask,
+                       std::function<void(const std::string&)> done)
 {
-    s_pw_active = true;
-    s_pw_buf.clear();
-    s_pw_index = index;
-    term_note("33", "password for " + user + "@" + host + " (Enter で接続 / Esc で中止):");
+    s_prompt_active = true;
+    s_prompt_mask   = mask;
+    s_prompt_buf.clear();
+    s_prompt_done   = std::move(done);
+    term_note("33", label);
 }
 
-// 入力を食ったら true。**エコーは伏せる**（肩越しに見えないように）。
-bool password_prompt_input(const std::string& in)
+// 入力を食ったら true。
+bool line_prompt_input(const std::string& in)
 {
-    if (!s_pw_active) return false;
+    if (!s_prompt_active) return false;
     // **矢印キーで中止しない。** DECCKM を含め特殊キーは ESC で始まる複数バイトなので、
     // 先頭の ESC だけ見ると「パスワード入力中に ↑ を押すと黙って中止」になる。
     if (in.size() > 1 && in[0] == '\033') return true;
@@ -2869,33 +2881,48 @@ bool password_prompt_input(const std::string& in)
     if (!guard.ok()) return true;  // 食ったことにする（端末に漏らさない）
     for (char c : in) {
         if (c == '\r' || c == '\n') {
-            const int   index = s_pw_index;
-            std::string pw    = s_pw_buf;
-            cancel_password_prompt();
+            // **先に畳んでから呼ぶ。** 続きの中で次のプロンプトを開くので、
+            // 後で畳むとそれを消してしまう。
+            auto              done = std::move(s_prompt_done);
+            const std::string line = s_prompt_buf;
+            s_prompt_active = false;
+            s_prompt_mask   = false;
+            s_prompt_buf.clear();
+            s_prompt_done = nullptr;
             term->write("\r\n");
             render_term();
-            start_connect(index, pw, /*have_password=*/true);
+            if (done) done(line);
             return true;
         }
         if (c == '\033') {  // Esc 単独で中止
-            cancel_password_prompt();
+            cancel_line_prompt();
             return true;
         }
         if (c == '\x7F' || c == '\b') {
-            if (!s_pw_buf.empty()) {
-                s_pw_buf.pop_back();
+            if (!s_prompt_buf.empty()) {
+                s_prompt_buf.pop_back();
                 term->write("\b \b");
             }
             continue;
         }
         if (static_cast<unsigned char>(c) < 0x20) continue;  // 制御文字は捨てる
-        if (s_pw_buf.size() < 128) {
-            s_pw_buf += c;
-            term->write("*");
+        if (s_prompt_buf.size() < 128) {
+            s_prompt_buf += c;
+            term->write(s_prompt_mask ? "*" : std::string(1, c));
         }
     }
     render_term();
     return true;
+}
+
+// SSH のパスワードを聞く。**プロファイルは index で持つ** — 値でコピーして持つと、
+// 待っている間に `profiles reload` されたときに古い設定に繋いでしまう。
+void start_password_prompt(int index, const std::string& user, const std::string& host)
+{
+    start_line_prompt("password for " + user + "@" + host + " (Enter で接続 / Esc で中止):",
+                      /*mask=*/true, [index](const std::string& pw) {
+                          start_connect(index, pw, /*have_password=*/true);
+                      });
 }
 
 // via の解決結果。**s_profiles をロックの外で引かない**ために、呼び出し側が
@@ -3039,6 +3066,187 @@ void start_connect(int index, const std::string& password, bool have_password)
     if (xTaskCreate(&connect_worker, "connect", 32768, nullptr, 4, &s_connect_task) != pdPASS) {
         s_connect_task = nullptr;
         term_note("31", "接続タスクを作れなかった（メモリ不足）");
+    }
+}
+
+// --- WiFi の一覧 (#56) ---
+//
+// 表示に使う文字列は main が持つ。**MenuUi は参照しか持たない**ので、
+// 生きている間ずっと差し替えないこと（差し替えるときは下の refresh を通す）。
+// 触るのは「メニューの描画・タッチ・キー」と「スキャンのワーカ」だけで、
+// どれも s_term_lock (TermGuard) の中で動く。
+std::vector<std::string>   s_wifi_nets;
+std::vector<std::string>   s_wifi_scan_rows;
+std::vector<WifiScanEntry> s_wifi_scan_aps;  // 選ばれたときに SSID を引く
+TaskHandle_t               s_wifi_scan_task = nullptr;
+
+void refresh_wifi_nets()
+{
+    s_wifi_nets.clear();
+    const int cur = wifi_net_current();
+    for (size_t i = 0; i < wifi_net_count(); ++i) {
+        char ssid[33] = {};
+        if (!wifi_net_ssid(i, ssid, sizeof(ssid))) continue;
+        // **繋がっているかも見る。** 選んだだけで印を付けると、繋がっていない
+        // 設定に `*` が残って一覧が嘘になる。
+        const bool active = (static_cast<int>(i) == cur) && wifi_is_connected();
+        s_wifi_nets.emplace_back(std::string(active ? "* " : "  ") + ssid);
+    }
+}
+
+// 足して繋ぐ。満杯や長すぎは理由を端末に出す（メニューは閉じている）。
+void wifi_add_and_connect(const std::string& ssid, const std::string& pass)
+{
+    const esp_err_t err = wifi_net_add(ssid.c_str(), pass.c_str());
+    if (err != ESP_OK) {
+        term_note("31", err == ESP_ERR_NO_MEM
+                            ? "保存済みが " + std::to_string(kMaxWifiNets) +
+                                  " 件で満杯。消してから追加する"
+                            : "保存できない: " + std::string(esp_err_to_name(err)));
+        return;
+    }
+    refresh_wifi_nets();
+    const int i = wifi_net_find(ssid.c_str());
+    if (i < 0) {
+        term_note("31", "保存したはずの \"" + ssid + "\" が見つからない");
+        return;
+    }
+    term_note("33", "connecting to \"" + ssid + "\"...");
+    if (const esp_err_t e = wifi_net_connect(static_cast<size_t>(i)); e != ESP_OK) {
+        term_note("31", std::string("connect failed: ") + esp_err_to_name(e));
+        return;
+    }
+    refresh_wifi_nets();
+}
+
+// パスワードを聞いてから足す。オープンな AP は聞かない。
+void wifi_ask_password(const std::string& ssid, bool secure)
+{
+    if (!secure) {
+        wifi_add_and_connect(ssid, "");
+        return;
+    }
+    start_line_prompt("password for \"" + ssid + "\" (Enter で接続 / Esc で中止):",
+                      /*mask=*/true,
+                      [ssid](const std::string& pw) { wifi_add_and_connect(ssid, pw); });
+}
+
+// スキャンは数秒ブロックするうえ通信が一瞬止まる。**専用タスクに載せる** —
+// メインループや kbd タスクの上で走らせると、その間画面が固まる。
+void wifi_scan_worker(void*)
+{
+    WifiScanEntry aps[kMaxWifiScanRows];
+    const int     n = wifi_scan(aps, kMaxWifiScanRows);
+    {
+        // 一覧を作り直す間はメニューの描画と噛み合わせる（同じロックで守る）。
+        TermGuard guard;
+        if (guard.ok()) {
+            s_wifi_scan_aps.clear();
+            s_wifi_scan_rows.clear();
+            for (int i = 0; i < n; ++i) {
+                s_wifi_scan_aps.push_back(aps[i]);
+                char buf[80];
+                std::snprintf(buf, sizeof(buf), "%-20s %4d dBm%s", aps[i].ssid, aps[i].rssi,
+                              aps[i].secure ? "" : "  (open)");
+                s_wifi_scan_rows.emplace_back(buf);
+            }
+            // **失敗と 0 件を区別して出す。** どちらも空の一覧になるので、
+            // 理由を書かないと「AP が無い」と読める。
+            menu->set_wifi_note(n < 0 ? "スキャンできない（WiFi が起動していない？）"
+                                      : (n == 0 ? "AP が見つからない" : ""));
+            // 途中でメニューを閉じていたら移らない（端末の上に描いてしまう）。
+            if (menu->visible()) {
+                menu->show_wifi_scan();
+                menu->draw();
+            }
+        }
+    }
+    ESP_LOGI(TAG, "wifi scan task stack headroom: %u bytes",
+             (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+    s_wifi_scan_task = nullptr;
+    vTaskDelete(nullptr);
+}
+
+void start_wifi_scan()
+{
+    if (s_wifi_scan_task) return;  // 走っている間は放っておく（注記が出たまま）
+    // 4096 では実測で残り 1696 バイトしかなかった（esp-hosted の RPC が深い）。
+    // 稀にしか走らないタスクなので余裕を取る。
+    if (xTaskCreate(&wifi_scan_worker, "wifiscan", 8192, nullptr, 4, &s_wifi_scan_task) != pdPASS) {
+        s_wifi_scan_task = nullptr;
+        menu->set_wifi_note("スキャンできない（メモリ不足）");
+    }
+}
+
+// メニューの WiFi の項目から呼ぶ。index の意味は Action ごとに違う。
+void wifi_menu_action(MenuUi::Action a, int index)
+{
+    switch (a) {
+        case MenuUi::Action::kWifiScan:
+            // **先に満杯を出して、パスワードを聞く前に断る。** 聞いてから
+            // 断ると、打った後で捨てられる。
+            if (wifi_net_count() >= kMaxWifiNets) {
+                menu->set_wifi_note("保存済みが " + std::to_string(kMaxWifiNets) +
+                                    " 件で満杯。消してから追加する");
+                menu->draw();
+                return;
+            }
+            start_wifi_scan();
+            break;
+        case MenuUi::Action::kWifiAddScanned: {
+            if (index < 0 || index >= static_cast<int>(s_wifi_scan_aps.size())) return;
+            const std::string ssid(s_wifi_scan_aps[index].ssid);
+            const bool        secure = s_wifi_scan_aps[index].secure;
+            // 入力は端末に出るので、先に端末へ移る。
+            set_menu_visible(false);
+            wifi_ask_password(ssid, secure);
+            break;
+        }
+        case MenuUi::Action::kWifiAddManual:
+            if (wifi_net_count() >= kMaxWifiNets) {
+                menu->set_wifi_note("保存済みが " + std::to_string(kMaxWifiNets) +
+                                    " 件で満杯。消してから追加する");
+                menu->draw();
+                return;
+            }
+            set_menu_visible(false);
+            // 隠し SSID。**スキャンに出ないので打つしかない。**
+            start_line_prompt("hidden SSID (Enter で次へ / Esc で中止):", /*mask=*/false,
+                              [](const std::string& ssid) {
+                                  if (ssid.empty()) {
+                                      term_note("31", "SSID が空");
+                                      return;
+                                  }
+                                  wifi_ask_password(ssid, /*secure=*/true);
+                              });
+            break;
+        case MenuUi::Action::kWifiConnect: {
+            if (index < 0 || index >= static_cast<int>(wifi_net_count())) return;
+            char ssid[33] = {};
+            wifi_net_ssid(static_cast<size_t>(index), ssid, sizeof(ssid));
+            const esp_err_t err = wifi_net_connect(static_cast<size_t>(index));
+            refresh_wifi_nets();
+            menu->set_wifi_note(err == ESP_OK
+                                    ? std::string("connecting to \"") + ssid + "\"..."
+                                    : std::string("connect failed: ") + esp_err_to_name(err));
+            menu->show_wifi_list();
+            menu->draw();
+            break;
+        }
+        case MenuUi::Action::kWifiDelete: {
+            if (index < 0 || index >= static_cast<int>(wifi_net_count())) return;
+            char ssid[33] = {};
+            wifi_net_ssid(static_cast<size_t>(index), ssid, sizeof(ssid));
+            const esp_err_t err = wifi_net_remove(static_cast<size_t>(index));
+            refresh_wifi_nets();
+            menu->set_wifi_note(err == ESP_OK ? std::string("削除した: ") + ssid
+                                              : std::string("削除できない: ") +
+                                                    esp_err_to_name(err));
+            menu->show_wifi_list();
+            menu->draw();
+            break;
+        }
+        default: break;
     }
 }
 
@@ -3681,6 +3889,9 @@ extern "C" void app_main(void)
     // 電源投入時はメニューを出す。端末は選んでから入る。
     menu = std::make_unique<MenuUi>(display);
     menu->set_profiles(&s_profiles);
+    menu->set_wifi_nets(&s_wifi_nets);
+    menu->set_wifi_scan(&s_wifi_scan_rows);
+    refresh_wifi_nets();
     menu->set_action([](MenuUi::Action a, int index) {
         switch (a) {
             case MenuUi::Action::kConnectProfile:
@@ -3722,6 +3933,13 @@ extern "C" void app_main(void)
             case MenuUi::Action::kWgUp:
                 // ponytail: 接続先を NVS に持っていないので、まだ画面からは繋げない。
                 // 保存できるようにしたら menu_ui 側の項目を enabled にする。
+                break;
+            case MenuUi::Action::kWifiConnect:
+            case MenuUi::Action::kWifiDelete:
+            case MenuUi::Action::kWifiScan:
+            case MenuUi::Action::kWifiAddScanned:
+            case MenuUi::Action::kWifiAddManual:
+                wifi_menu_action(a, index);
                 break;
         }
     });
@@ -3806,6 +4024,7 @@ extern "C" void app_main(void)
                 if (poll && status_bar->draw(si) && menu->visible()) {
                     // 状態が変わったときだけメニューの表示も作り直す。
                     menu->set_info(mi);
+                    refresh_wifi_nets();  // 繋がった / 切れたで `*` が動く (#56)
                     menu->refresh();
                 }
                 if (menu->visible()) {

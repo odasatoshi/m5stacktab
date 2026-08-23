@@ -136,6 +136,13 @@ python tools/serial_log.py --seconds 20      # ログ採取
      **1 に決め打ちすると反転時に四隅が入れ替わって偽の NG になる**
   - **物理的な向きはホストからは観測できない。** 読み戻しの経路が全部同じ rotation を
     通るので、画素は反転前後で同じに見える。**実機を見た人の報告が要る**
+- **WiFi の設定は 5 件まで NVS の blob 1 つ**（`wifi/nets`）に持つ (#56)。1 件しか持てなかった
+  頃の `ssid` / `pass` からは起動時に自動で引き継ぐ。**画面から消したら実際に切断する**ので、
+  `s_reconfiguring` を立ててから `esp_wifi_disconnect` を呼ぶ（立てないと切断イベントで
+  再接続が走り、消した AP に繋ぎ直しに行く）
+- **`esp_wifi_scan_start(&cfg, true)` は数秒ブロックする。専用タスクに載せる**。
+  メインループや kbd タスク (8KB) の上で走らせると、その間画面が固まる。
+  esp-hosted の RPC が深いので **4096 では残り 1696 バイトしかなかった**（実測）。8192 にしてある
 - **SD カード (SDMMC 4 線, CLK=G43 / CMD=G44 / D0-D3=G39-42) は on-chip LDO の VO4 を
   開けないと一切応答しない**（`sd_pwr_ctrl_new_on_chip_ldo`）。実装は `main/sdcard.cpp`
 - **FatFs の長いファイル名は既定で無効**。`CONFIG_FATFS_LFN_NONE` のままだと 8.3 形式しか
