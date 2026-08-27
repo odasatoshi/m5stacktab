@@ -120,7 +120,7 @@ ts-login 192.168.0.10 8080
 - 承認されるまで 3 秒おきに register を投げ直す。**HTTP/2 のストリーム id は増える奇数**
   でなければならないので、投げ直すたびに新しい id を使う（固定の 1 / 3 だと 2 回目が
   protocol error になる）
-- **Esc で中止**できる。中止しないと最長 10 分投げ続ける
+- **Esc で中止**できる。中止しないと最長 5 分投げ続ける（`kAuthTimeoutSec`。10 分は登録後の long-poll 側の `kMapTimeoutSec` で、別の持ち時間）
 - Headscale でも同じ経路が使える（`headscale nodes register --key ...` で承認する）
 
 ## 接続先（SSH / VPN）の設定

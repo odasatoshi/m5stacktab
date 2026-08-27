@@ -1292,12 +1292,15 @@ void ts_task(void* arg)
     const bool ok = client->run_once();
     // **QR を必ず畳む。** 承認されずにタイムアウトした / GOAWAY を食らった場合、
     // 畳まないと死んだ QR が残り、端末も更新されなくなる (#59)。
+    // **畳むことをロックに依存させない。** TermGuard は 2 秒でタイムアウトする
+    // （メニューの再描画は NVS 読みを含むので実際に長い）ので、取れたときだけ
+    // 畳むと、取れなかった一回で s_auth_qr_active が true のまま ts タスクが
+    // 消える。以後 render_term() は永久に早期 return し、auth_qr_input() が
+    // ESC 以外の打鍵を全部食う。**ロックが要るのは再描画だけ。**
+    s_auth_qr_url.clear();
     {
         TermGuard guard;
-        if (guard.ok()) {
-            s_auth_qr_url.clear();
-            hide_auth_qr();
-        }
+        hide_auth_qr(/*redraw=*/guard.ok());
     }
     // run_once() から戻ったあとなので、この参照を書き換える者はもういない。
     const auto& st = client->status();
@@ -1561,9 +1564,13 @@ bool auth_qr_input(const std::string& in)
     if (in.size() == 1 && in[0] == '\033') {
         TermGuard guard;
         if (!guard.ok()) return true;
+        // **URL も消す。** 消さないと、stop() から ts タスクが実際に抜けるまでの
+        // 間にメニューを開閉するだけで、中止したはずの QR が描き直される
+        // （state はまだ kAuthPending のため）。
+        s_auth_qr_url.clear();
         hide_auth_qr();
         // **待っている ts タスクを止める。** 止めないと、承認されないまま
-        // 10 分間 register を投げ続ける。
+        // 5 分間 (kAuthTimeoutSec) register を投げ続ける。
         if (s_ts_client) s_ts_client->stop();
         term_note("33", "Tailscale の対話ログインを中止した");
         return true;
@@ -1611,8 +1618,11 @@ int cmd_ts_status(int, char**)
     const ts::ClientStatus st = s_ts_client->snapshot();
     std::printf("ts: %s (%lld ms)\n", s_ts_task ? "running" : "finished",
                 (esp_timer_get_time() - s_ts_started_us) / 1000);
-    std::printf("  state=%d registered=%d map_messages=%u keepalives=%u\n", (int)st.state,
-                st.registered ? 1 : 0, (unsigned)st.map_messages, (unsigned)st.keepalives);
+    // **名前も出す。** 数字だけだと、State に値を挿したときに過去のログの
+    // `state=5` が別の意味になる（実際 kAuthPending を挿して繰り上がった）。
+    std::printf("  state=%d (%s) registered=%d map_messages=%u keepalives=%u\n", (int)st.state,
+                ts::state_name(st.state), st.registered ? 1 : 0, (unsigned)st.map_messages,
+                (unsigned)st.keepalives);
     if (!st.assigned_address.empty()) {
         std::printf("  assigned address: %s\n", st.assigned_address.c_str());
     }
@@ -1632,12 +1642,11 @@ int cmd_ts_stop(int, char**)
     }
     s_ts_client->stop();
     // 対話ログインの QR を出したまま止めると、端末が更新されないまま残る (#59)。
+    // ts_task の後始末と同じ理由で、畳むこと自体はロックに依存させない。
+    s_auth_qr_url.clear();
     {
         TermGuard guard;
-        if (guard.ok()) {
-            s_auth_qr_url.clear();
-            hide_auth_qr();
-        }
+        hide_auth_qr(/*redraw=*/guard.ok());
     }
     std::printf("stop requested\n");
     return 0;

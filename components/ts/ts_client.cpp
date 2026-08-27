@@ -553,7 +553,15 @@ bool Client::run_once()
                 }
                 // **端末は URL を見せて待つだけ。** 認証は人間が手元のブラウザで
                 // 済ませる（Google なり GitHub なり）ので、ここに OAuth は要らない。
-                if (shown_auth_url != rr.auth_url) {
+                // **最初の 1 本だけを見せ続ける。** Headscale は register を投げ直す
+                // たびに別の AuthURL を発行するので、届くたびに差し替えると
+                // QR が 3 秒ごとに描き変わり（スキャン中に別物になる）、UI 側は
+                // 出し直しのたびにメニューを畳む（実機で確認: 承認待ちの間
+                // メニューが開けない）。古い URL も承認に使えることは実機で確認済み。
+                // ponytail: 承認待ちの上限 (kAuthTimeoutSec) の間に制御プレーンが
+                // URL を失効させたら、死んだ QR を出し続けることになる。実際に
+                // 失効を踏んだら、新しい URL に差し替える条件を足す。
+                if (shown_auth_url.empty()) {
                     shown_auth_url = rr.auth_url;
                     set_auth_url(rr.auth_url);
                     if (on_auth_url_) on_auth_url_(rr.auth_url);
@@ -637,7 +645,17 @@ bool Client::run_once()
     }
 
     set_error(stop_ ? "stopped" : "timed out");
-    return st_.state == ClientStatus::State::kMapping;
+    // **承認待ちのまま抜けない。** kAuthPending を残すと ts-status が承認待ちだと
+    // 嘘をつき、死んだ auth_url を出し続ける。UI 側もメニューを閉じるたびに
+    // 「まだ承認待ちか」を state で見ているので、死んだ QR が復活する
+    // (main.cpp の set_menu_visible)。
+    const bool ok = (st_.state == ClientStatus::State::kMapping);
+    if (!ok) {
+        set_auth_url("");
+        std::lock_guard<std::mutex> g(mu_);
+        st_.state = ClientStatus::State::kFailed;
+    }
+    return ok;
 }
 
 }  // namespace ts

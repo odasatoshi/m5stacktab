@@ -49,6 +49,24 @@ struct ClientStatus {
     bool        registered   = false;
 };
 
+// **State を足したらここも増やす。** default を書いていないので、増やし忘れると
+// -Wswitch が鳴る。数字だけをログに出していると、値を途中に挿したときに過去の
+// 証跡の `state=5` が黙って別の意味になる（kAuthPending を挿して実際に起きた）。
+inline const char* state_name(ClientStatus::State s)
+{
+    switch (s) {
+        case ClientStatus::State::kIdle:        return "idle";
+        case ClientStatus::State::kFetchingKey: return "fetching-key";
+        case ClientStatus::State::kConnecting:  return "connecting";
+        case ClientStatus::State::kHandshaking: return "handshaking";
+        case ClientStatus::State::kRegistering: return "registering";
+        case ClientStatus::State::kAuthPending: return "auth-pending";
+        case ClientStatus::State::kMapping:     return "mapping";
+        case ClientStatus::State::kFailed:      return "failed";
+    }
+    return "?";
+}
+
 class Client {
 public:
     // machine key / node key / disco key は呼び出し側が持つ（NVS に保存して再利用する）。
