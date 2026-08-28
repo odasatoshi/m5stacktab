@@ -5,6 +5,7 @@
 #include <cstdio>
 
 #include <esp_log.h>
+#include <esp_timer.h>
 
 #include "kbd_keys.hpp"  // kKbdModCtrl（修飾ビットは純正キーボードと同じ表を使う）
 
@@ -22,6 +23,13 @@ constexpr uint16_t kText     = 0xFFFF;
 constexpr uint16_t kStatusBg = 0x0000;
 constexpr uint16_t kComposeC = 0xFFE0;  // 未確定は黄色
 
+// --- PAD（端末に薄く重ねる小さなパッド）---
+constexpr int      kPadKeyW  = 88;
+constexpr int      kPadKeyH  = 68;
+constexpr int      kPadEdge  = 16;      // 画面の縁からの余白
+constexpr uint16_t kPadDim   = 0x2965;  // 重ねる暗い灰色（端末の黒より少し明るい）
+constexpr uint16_t kPadTransp = 0xF81F; // 透過色（面のどこにも使わないマゼンタ）
+
 }  // namespace
 
 KeyboardUi::Mode KeyboardUi::next_mode(Mode m)
@@ -29,7 +37,8 @@ KeyboardUi::Mode KeyboardUi::next_mode(Mode m)
     switch (m) {
         case Mode::kOff:   return Mode::kAscii;
         case Mode::kAscii: return Mode::kKana;
-        case Mode::kKana:  return Mode::kOff;
+        case Mode::kKana:  return Mode::kPad;
+        case Mode::kPad:   return Mode::kOff;
     }
     return Mode::kOff;
 }
@@ -40,6 +49,7 @@ const char* KeyboardUi::mode_label(Mode m)
         case Mode::kOff:   return "なし";
         case Mode::kAscii: return "ABC";
         case Mode::kKana:  return "かな";
+        case Mode::kPad:   return "PAD";
     }
     return "?";
 }
@@ -74,14 +84,110 @@ void KeyboardUi::begin(int height)
     a.height = height_ - status_h_;
     ascii_.set_layout(a);
 
-    ESP_LOGI(TAG, "keyboard %dpx: kana key %dx%d, ascii key %dx%d", height_, l.key_w(), l.key_h(),
-             a.key_w(), a.key_h());
+    build_pad();
+
+    ESP_LOGI(TAG, "keyboard %dpx: kana key %dx%d, ascii key %dx%d, pad %dx%d at (%d,%d)", height_,
+             l.key_w(), l.key_h(), a.key_w(), a.key_h(), kPadKeyW * ime::kPadCols,
+             kPadKeyH * ime::kPadRows, pad_x_, pad_y_);
+}
+
+// PAD の見た目を 1 枚のスプライトに焼いておく。**毎回描き直すのは重ねる 1 回だけ**にする。
+//
+// **市松に間引いて薄く見せる。** M5GFX に α 合成は無い。フレームバッファを読んで
+// 平均する方法は端末の差分描画と噛み合わない — 読むのは「前回薄くした画素」なので、
+// 重ねるたびに暗くなっていく。市松なら何度重ねても同じ見た目になる（べき等）。
+void KeyboardUi::build_pad()
+{
+    const int w = kPadKeyW * ime::kPadCols;
+    const int h = kPadKeyH * ime::kPadRows;
+    pad_x_      = gfx_.width() - w - kPadEdge;
+    pad_y_      = gfx_.height() - h - kPadEdge;
+
+    pad_.setPsram(true);  // 内蔵 RAM は 260KB しかない。95KB を常駐させない
+    // **色深度は明示する。** `16` を渡すと swap565 になり、透過色の比較が
+    // バイト入れ替わりで一致しなくなる（CLAUDE.md）。
+    pad_.setColorDepth(lgfx::v1::color_depth_t::rgb565_nonswapped);
+    if (!pad_.createSprite(w, h)) {
+        ESP_LOGE(TAG, "PAD のスプライトを作れない (%dx%d)", w, h);
+        return;
+    }
+
+    // **4 画素に 1 つだけ透かす。** 半分ずつだと下の端末の文字が明るいままはっきり
+    // 見えてしまい、パッドの文字と競合する（実機で確認）。3/4 を潰すと
+    // 「下に何かある」ことは分かるまま、パッドが読めるようになる。
+    pad_.fillSprite(kPadDim);
+    for (int y = 0; y < h; y += 2) {
+        for (int x = 0; x < w; x += 2) pad_.drawPixel(x, y, kPadTransp);
+    }
+
+    pad_.setFont(&fonts::efontJA_24);
+    for (int row = 0; row < ime::kPadRows; ++row) {
+        for (int col = 0; col < ime::kPadCols; ++col) {
+            const ime::AsciiKey* k = ime::pad_key(row, col);
+            if (!k) continue;
+            const int kx = col * kPadKeyW;
+            const int ky = row * kPadKeyH;
+            // **枠は 2px 焼く。** 押下の色はここと文字の背景箱にしか塗れない
+            // （下の draw_pad_key を参照）ので、1px だと手応えが細すぎる。
+            pad_.drawRect(kx + 1, ky + 1, kPadKeyW - 2, kPadKeyH - 2, kKeyLine);
+            pad_.drawRect(kx + 2, ky + 2, kPadKeyW - 4, kPadKeyH - 4, kKeyLine);
+            // **文字の後ろは塗る。** 市松のままだと下の端末の文字が字画の隙間に
+            // 出て読めない。
+            pad_.setTextColor(kText, kPadDim);
+            const int tw = pad_.textWidth(k->label);
+            pad_.drawString(k->label, kx + (kPadKeyW - tw) / 2, ky + (kPadKeyH - 24) / 2);
+        }
+    }
+}
+
+void KeyboardUi::draw_overlay()
+{
+    if (mode_ != Mode::kPad || !pad_.getBuffer()) return;
+    const int64_t t0 = esp_timer_get_time();
+    pad_.pushSprite(pad_x_, pad_y_, kPadTransp);
+    last_overlay_us_ = (uint32_t)(esp_timer_get_time() - t0);
+}
+
+// 押下の手応え。**塗ってよいのはスプライト側が不透明な画素だけ** — 枠 2px と
+// 文字の背景箱。キー全面を塗ると、離して重ね直しても**透かした 1/4 の画素に
+// 押下色が残る**（市松がべき等なのは「下が端末の画素のまま」の間だけ）。
+void KeyboardUi::draw_pad_key(int row, int col, bool pressed)
+{
+    const ime::AsciiKey* k = ime::pad_key(row, col);
+    if (!k || !pad_.getBuffer()) return;
+    if (!pressed) {
+        draw_overlay();  // 素の見た目はスプライトにしかない。全体を重ね直す
+        return;
+    }
+    const int x = pad_x_ + col * kPadKeyW;
+    const int y = pad_y_ + row * kPadKeyH;
+    gfx_.drawRect(x + 1, y + 1, kPadKeyW - 2, kPadKeyH - 2, kKeyDown);
+    gfx_.drawRect(x + 2, y + 2, kPadKeyW - 4, kPadKeyH - 4, kKeyDown);
+    gfx_.setFont(&fonts::efontJA_24);
+    gfx_.setTextColor(kText, kKeyDown);
+    const int tw = gfx_.textWidth(k->label);
+    gfx_.drawString(k->label, x + (kPadKeyW - tw) / 2, y + (kPadKeyH - 24) / 2);
+}
+
+bool KeyboardUi::pad_hit(int x, int y, int* row, int* col) const
+{
+    // **スプライトが取れなかったら触らせない。** 画面には何も出ていないのに
+    // 右下のタップが Esc や ^C を端末へ送ることになる。
+    if (!pad_.getBuffer()) return false;
+    const int c = (x - pad_x_) / kPadKeyW;
+    const int r = (y - pad_y_) / kPadKeyH;
+    if (x < pad_x_ || y < pad_y_ || c >= ime::kPadCols || r >= ime::kPadRows) return false;
+    *row = r;
+    *col = c;
+    return true;
 }
 
 void KeyboardUi::set_mode(Mode m)
 {
     if (mode_ == m) return;
-    const bool was_visible = visible();
+    // **帯を持っていたかで見る。** PAD は visible() が true でも帯を占めないので、
+    // visible() で判定すると PAD を抜けるときに端末の画素を黒く塗り潰す。
+    const bool had_band = (height() > 0);
     mode_   = m;
     shift_  = false;
     ctrl_   = false;
@@ -94,7 +200,7 @@ void KeyboardUi::set_mode(Mode m)
     press_idx_   = -1;
     if (visible()) {
         draw();
-    } else if (was_visible) {
+    } else if (had_band) {
         // 端末側を描き直させる（呼び出し側が force render する）。
         gfx_.fillRect(0, gfx_.height() - height_, gfx_.width(), height_, TFT_BLACK);
     }
@@ -221,6 +327,11 @@ void KeyboardUi::draw_status()
 void KeyboardUi::draw()
 {
     if (!visible()) return;
+    if (mode_ == Mode::kPad) {
+        // **PAD は端末を消さない。** 帯を塗らずに重ねるだけ。
+        draw_overlay();
+        return;
+    }
     if (mode_ == Mode::kAscii) {
         draw_ascii();
         draw_status();
@@ -245,6 +356,14 @@ void KeyboardUi::emit(const std::string& s)
 bool KeyboardUi::touch_down(int x, int y)
 {
     if (!visible()) return false;
+    if (mode_ == Mode::kPad) {
+        int row = -1, col = -1;
+        if (!pad_hit(x, y, &row, &col)) return false;
+        press_row_ = row;
+        press_idx_ = col;
+        draw_pad_key(row, col, true);
+        return true;
+    }
     if (mode_ == Mode::kAscii) {
         int row = -1, idx = -1;
         if (!ascii_.hit(x, y, &row, &idx)) return false;
@@ -264,14 +383,32 @@ bool KeyboardUi::touch_down(int x, int y)
 bool KeyboardUi::touch_move(int x, int y)
 {
     if (!visible()) return false;
-    // ASCII 面にフリックは無い。指がずれても押したキーのまま（キーボードとして自然）。
-    if (mode_ == Mode::kAscii) return press_row_ >= 0;
+    // ASCII 面と PAD にフリックは無い。指がずれても押したキーのまま（キーボードとして自然）。
+    if (mode_ == Mode::kAscii || mode_ == Mode::kPad) return press_row_ >= 0;
     if (!kb_.is_pressed()) return false;
     const ime::Flick f = kb_.current_flick(x, y);
     if (f == preview_) return true;
     preview_ = f;
     const auto& l = kb_.layout();
     draw_key(pressed_key_ / l.cols, pressed_key_ % l.cols, true);
+    return true;
+}
+
+// PAD の離し。**ラッチは無い** — 面に文字キーが無いので、掛ける先が無い。
+// Ctrl が要る唯一のキー (`^C`) は表側で修飾ビットを持っている。
+bool KeyboardUi::pad_touch_up()
+{
+    const int row = press_row_;
+    const int col = press_idx_;
+    press_row_ = press_idx_ = -1;
+    const ime::AsciiKey* k = ime::pad_key(row, col);
+    if (!k) return true;
+
+    const Mode before = mode_;
+    if (key_output_) key_output_(k->name, k->send_mod);
+    // ASCII 面と同じ理由（送った先で段が変わることがある）。
+    if (mode_ != before) return true;
+    draw_pad_key(row, col, false);
     return true;
 }
 
@@ -325,6 +462,10 @@ bool KeyboardUi::ascii_touch_up()
 bool KeyboardUi::touch_up(int x, int y)
 {
     if (!visible()) return false;
+    if (mode_ == Mode::kPad) {
+        if (press_row_ < 0) return false;
+        return pad_touch_up();
+    }
     if (mode_ == Mode::kAscii) {
         if (press_row_ < 0) return false;
         return ascii_touch_up();

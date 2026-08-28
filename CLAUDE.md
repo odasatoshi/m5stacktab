@@ -152,6 +152,31 @@ python tools/serial_log.py --seconds 20      # ログ採取
     豆腐 (□) になる（実機で確認。かな面の `⌫` はずっと豆腐だった）。
     矢印 `← ↑ ↓ →` は JIS X 0208 にあるので出る
   - `Shift` と `Ctrl` は**次の 1 打だけ効くラッチ**（指は押しっぱなしにできない）
+  - **PAD 段だけは端末に重なる**（行数を削らない）。ここが他の段と違う:
+    - `KeyboardUi::height()` は PAD で **0** を返す。`visible()` は true のままなので、
+      **配分を張り直すかどうかは visible() ではなく height() で見る**
+      （`ABC → PAD` は visible() が変わらないのに 13 行 → 29 行に戻る）
+    - **端末を描いたら必ず重ね直す。** `TermRenderer::render()` は変わったセルだけ
+      塗るので、下の文字が動いた分だけ PAD に穴が開く。`renderer->render()` を直に
+      呼ばず `render_term_raw()` を通す（`last_pixels() == 0` なら重ね直さない）
+    - 薄表示は**市松（4 画素に 1 つ透かす）を焼いたスプライトを透過色つきで重ねる**。
+      **フレームバッファを読んで平均する方法は使えない** — 差分描画なので読むのは
+      「前回薄くした画素」で、重ねるたびに暗くなっていく。市松はべき等
+    - **押下の色を塗ってよいのは、スプライト側が不透明な画素だけ**（枠 2px と
+      文字の背景箱）。キー全面を塗ると、離して重ね直しても**透かした画素に
+      押下色が残る**（市松がべき等なのは「下が端末の画素のまま」の間だけ）
+    - **対話ログインの QR は PAD を塗り潰す**（QR は `height()` の分しか避けない）。
+      見えないのに当たり判定だけ生きると右下のタップが `Esc` を送って承認待ちを
+      中止するので、QR 表示中は PAD にタッチを渡さない
+    - **`screencap` の縮小は点サンプリング**なので、市松の PAD は実物よりずっと薄く
+      写る（step が偶数だと透過画素だけを拾って**丸ごと消えて見える**）。
+      PAD の見た目を判定するときは `screencap 1 <x> <y> <w> <h>` で等倍に吸う
+    - 重ね直しは **6〜8ms**（352x136 の透過 pushSprite、実測）。`bench` が出す。
+      ponytail: 端末が塗った行と重なるときだけ出せば減らせるが、下端の行は
+      たいてい塗られるので効きは薄い
+    - **PAD に `Ctrl` 単体を置かない。** 面に文字キーが無いので掛ける先が無い
+      （`kbd_key_to_bytes` の Ctrl は 1 文字のキー名にしか効かない）。
+      `^C` を 1 キーにして `AsciiKey::send_mod` で修飾を持たせてある
 - **`esp_wifi_scan_start` は接続試行と重なると 0 件で返る**（実機で確認）。繋がっている
   ときは問題ない。**保存済みの AP が無い場所で「新規追加」を開くと必ずリトライ中**なので、
   リトライを止めてから探して、探し終わったら戻す（戻さないと、スキャンしただけで
@@ -175,6 +200,31 @@ python tools/serial_log.py --seconds 20      # ログ採取
   `CONFIG_FATFS_LFN_HEAP` + `CONFIG_FATFS_API_ENCODING_UTF_8` を入れる
 - `CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM` は有効にしない。TX mempool の 1600B ストライドが
   128B キャッシュラインと合わず CMD53 がアライメント検査で弾かれる
+
+## コンソールに長い行を送ってはいけない
+
+**256 文字以上の行を送ると、何十秒も後に無関係な `free` が abort する。**
+
+```
+CORRUPT HEAP: Bad tail at 0x4ff71c04. Expected 0xbaad5678 got 0x6c4f5678
+assert failed: block_next tlsf_block_functions.h:161 (!block_is_last(block))
+  esp_console_repl_task -> linenoiseHistoryAdd -> free -> tlsf_free -> assert
+```
+
+ESP-IDF の linenoise は `calloc(1, max_cmdline_length)`（`main/wifi.cpp` で **256**）した
+buf を dumb モードで**端まで埋め、NUL を置かない**。その後 `sanitize()` が NUL を探して
+確保領域の外まで走り、止まったところに `*dst = 0` を書く。ヒープのメタデータが壊れ、
+**次に同じアリーナを触った誰かが死ぬ**。`linenoiseHistoryAdd` は被害者で犯人ではない。
+
+**再現は 1 行で足りる**（`term` + 300 文字）。**間欠に見えるのは、壊れてから
+誰かが踏むまでに間があるから**で、原因は決定的。
+
+- 送る側 (`tools/serial_log.py`) が 256 文字以上を弾くようにしてある。**弾かないと、
+  検証のつもりで検証対象を壊す**（Reality Check で「PAD の PR がヒープを壊す」と
+  誤って疑うところだった → #72）
+- 実機の画面に長い行を出したいときは `term` を分けて送る
+- `CONFIG_HEAP_POISONING_COMPREHENSIVE` を入れると**書いた瞬間に**止まるので、
+  「壊れているが誰が壊したか分からない」ときはこれを入れて再現させる
 
 ## lwIP を触るときの制約
 
