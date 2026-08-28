@@ -6,6 +6,8 @@
 
 #include <esp_log.h>
 
+#include "kbd_keys.hpp"  // kKbdModCtrl（修飾ビットは純正キーボードと同じ表を使う）
+
 namespace {
 
 const char* TAG = "kbd";
@@ -13,6 +15,8 @@ const char* TAG = "kbd";
 constexpr uint16_t kBg       = 0x2104;  // 暗いグレー
 constexpr uint16_t kKeyBg    = 0x4208;
 constexpr uint16_t kKeyDown  = 0x05BF;  // 押下中は青
+constexpr uint16_t kKeyFunc  = 0x2945;  // 制御キーは少し暗く（文字キーと見分ける）
+constexpr uint16_t kKeyLatch = 0x8200;  // ラッチ中の ⇧ / Ctrl
 constexpr uint16_t kKeyLine  = 0x8410;
 constexpr uint16_t kText     = 0xFFFF;
 constexpr uint16_t kStatusBg = 0x0000;
@@ -20,13 +24,33 @@ constexpr uint16_t kComposeC = 0xFFE0;  // 未確定は黄色
 
 }  // namespace
 
+KeyboardUi::Mode KeyboardUi::next_mode(Mode m)
+{
+    switch (m) {
+        case Mode::kOff:   return Mode::kAscii;
+        case Mode::kAscii: return Mode::kKana;
+        case Mode::kKana:  return Mode::kOff;
+    }
+    return Mode::kOff;
+}
+
+const char* KeyboardUi::mode_label(Mode m)
+{
+    switch (m) {
+        case Mode::kOff:   return "なし";
+        case Mode::kAscii: return "ABC";
+        case Mode::kKana:  return "かな";
+    }
+    return "?";
+}
+
 void KeyboardUi::begin(int height)
 {
     height_   = height;
-    status_h_ = 32;  // 未確定と候補を出す帯
+    status_h_ = 32;  // 未確定と候補、ラッチの状態を出す帯
 
-    // 画面幅いっぱいに 4 列だと 1 キー 320px で間延びする。親指で押せる幅に収めて中央に置き、
-    // 空いた右側は候補表示に使う。
+    // かな面: 画面幅いっぱいに 4 列だと 1 キー 320px で間延びする。親指で押せる幅に
+    // 収めて中央に置き、空いた右側は候補表示に使う。
     constexpr int kMaxKeyW = 160;
     ime::FlickLayout l;
     l.width  = std::min<int>(gfx_.width(), kMaxKeyW * 4);
@@ -36,18 +60,42 @@ void KeyboardUi::begin(int height)
     l.cols   = 4;
     l.rows   = 4;
     kb_.set_layout(l);
-    ESP_LOGI(TAG, "keyboard %dx%d at y=%d (key %dx%d)", l.width, l.height, l.y, l.key_w(),
-             l.key_h());
+
+    // ASCII 面: 12 列を画面幅いっぱいに。**端数は左右の余白に逃がす** —
+    // 割り切れないまま使うと右端のキーだけ当たり判定がずれる。
+    ime::FlickLayout a;
+    a.cols   = ime::AsciiKeyboard::kCols;
+    a.rows   = ime::AsciiKeyboard::kRows;
+    a.width  = (gfx_.width() / a.cols) * a.cols;
+    a.x      = (gfx_.width() - a.width) / 2;
+    a.y      = l.y;
+    // **端数を切り捨てない。** 切ると draw_ascii が塗る帯より当たり判定が短くなり、
+    // 下端の数 px が端末領域（スクロールバックのスワイプ）に流れる。
+    a.height = height_ - status_h_;
+    ascii_.set_layout(a);
+
+    ESP_LOGI(TAG, "keyboard %dpx: kana key %dx%d, ascii key %dx%d", height_, l.key_w(), l.key_h(),
+             a.key_w(), a.key_h());
 }
 
-void KeyboardUi::set_visible(bool v)
+void KeyboardUi::set_mode(Mode m)
 {
-    if (visible_ == v) return;
-    visible_ = v;
-    if (visible_) {
+    if (mode_ == m) return;
+    const bool was_visible = visible();
+    mode_   = m;
+    shift_  = false;
+    ctrl_   = false;
+    // **かな面の押下も捨てる。** 指を置いたまま段が変わる経路がある
+    // （純正キーボードの Ctrl+Alt+M でメニューを開閉する）。捨てないと、
+    // 離したときに選んでいないかなが出る。
+    kb_.cancel();
+    pressed_key_ = -1;
+    press_row_   = -1;
+    press_idx_   = -1;
+    if (visible()) {
         draw();
-    } else {
-        // 端末側を描き直させる。
+    } else if (was_visible) {
+        // 端末側を描き直させる（呼び出し側が force render する）。
         gfx_.fillRect(0, gfx_.height() - height_, gfx_.width(), height_, TFT_BLACK);
     }
 }
@@ -88,18 +136,61 @@ void KeyboardUi::draw_key(int row, int col, bool pressed)
     }
 }
 
+void KeyboardUi::draw_ascii_key(int row, int index, bool pressed)
+{
+    const ime::AsciiKey* k = ime::AsciiKeyboard::key_at(row, index);
+    if (!k) return;
+    const auto& l  = ascii_.layout();
+    const int   kw = l.key_w();
+    const int   kh = l.key_h();
+    const int   x  = l.x + ime::AsciiKeyboard::col_of(row, index) * kw;
+    const int   y  = l.y + row * kh;
+    const int   w  = kw * k->span;
+
+    const bool latched = (k->mod == ime::AsciiMod::kShift && shift_) ||
+                         (k->mod == ime::AsciiMod::kCtrl && ctrl_);
+    const uint16_t bg = pressed  ? kKeyDown
+                        : latched ? kKeyLatch
+                        : (k->mod != ime::AsciiMod::kNone || !k->shift) ? kKeyFunc
+                                                                        : kKeyBg;
+    gfx_.fillRect(x + 2, y + 2, w - 4, kh - 4, bg);
+    gfx_.drawRect(x + 2, y + 2, w - 4, kh - 4, kKeyLine);
+
+    gfx_.setFont(&fonts::efontJA_24);
+    gfx_.setTextColor(kText, bg);
+    const char* label = (shift_ && k->shift) ? k->shift : k->label;
+    const int   tw    = gfx_.textWidth(label);
+    gfx_.drawString(label, x + (w - tw) / 2, y + (kh - 24) / 2);
+}
+
+void KeyboardUi::draw_ascii()
+{
+    const auto& l = ascii_.layout();
+    gfx_.fillRect(0, l.y, gfx_.width(), height_ - status_h_, kBg);
+    for (int row = 0; row < ime::AsciiKeyboard::kRows; ++row) {
+        for (int i = 0; ime::AsciiKeyboard::key_at(row, i); ++i) {
+            draw_ascii_key(row, i, press_row_ == row && press_idx_ == i);
+        }
+    }
+}
+
 void KeyboardUi::draw_status()
 {
     const int y = gfx_.height() - height_;
     gfx_.fillRect(0, y, gfx_.width(), status_h_, kStatusBg);
     gfx_.setFont(&fonts::efontJA_24);
 
-    std::string line;
-    if (ime_.mode() == ime::Mode::kDirect) {
-        line = "[abc] ";
-    } else {
-        line = "[かな] ";
+    if (mode_ == Mode::kAscii) {
+        // ラッチは面（キーの色）にも出るが、**指の下に隠れる**ので帯にも出す。
+        std::string line = "[ABC]";
+        if (shift_) line += "  Shift";
+        if (ctrl_) line += "  Ctrl";
+        gfx_.setTextColor((shift_ || ctrl_) ? kComposeC : kKeyLine, kStatusBg);
+        gfx_.drawString(line.c_str(), 8, y + 4);
+        return;
     }
+
+    std::string line = "[かな] ";
     // composing() は未確定のローマ字も含んでいる。ここで pending_romaji を足すと二重になる。
     const std::string composing = ime_.composing();
     if (!composing.empty()) {
@@ -129,7 +220,12 @@ void KeyboardUi::draw_status()
 
 void KeyboardUi::draw()
 {
-    if (!visible_) return;
+    if (!visible()) return;
+    if (mode_ == Mode::kAscii) {
+        draw_ascii();
+        draw_status();
+        return;
+    }
     const auto& l = kb_.layout();
     gfx_.fillRect(0, l.y, gfx_.width(), l.height, kBg);
     // キーボードの左右に余白ができるので、そこは背景色で塗るだけにする。
@@ -148,7 +244,15 @@ void KeyboardUi::emit(const std::string& s)
 
 bool KeyboardUi::touch_down(int x, int y)
 {
-    if (!visible_) return false;
+    if (!visible()) return false;
+    if (mode_ == Mode::kAscii) {
+        int row = -1, idx = -1;
+        if (!ascii_.hit(x, y, &row, &idx)) return false;
+        press_row_ = row;
+        press_idx_ = idx;
+        draw_ascii_key(row, idx, true);
+        return true;
+    }
     if (!kb_.touch_down(x, y)) return false;
     pressed_key_ = kb_.pressed_key();
     preview_     = ime::Flick::kCenter;
@@ -159,7 +263,10 @@ bool KeyboardUi::touch_down(int x, int y)
 
 bool KeyboardUi::touch_move(int x, int y)
 {
-    if (!visible_ || !kb_.is_pressed()) return false;
+    if (!visible()) return false;
+    // ASCII 面にフリックは無い。指がずれても押したキーのまま（キーボードとして自然）。
+    if (mode_ == Mode::kAscii) return press_row_ >= 0;
+    if (!kb_.is_pressed()) return false;
     const ime::Flick f = kb_.current_flick(x, y);
     if (f == preview_) return true;
     preview_ = f;
@@ -168,9 +275,61 @@ bool KeyboardUi::touch_move(int x, int y)
     return true;
 }
 
+// ASCII 面の離し。押していたキーを処理する。
+bool KeyboardUi::ascii_touch_up()
+{
+    const int row = press_row_;
+    const int idx = press_idx_;
+    press_row_ = press_idx_ = -1;
+    const ime::AsciiKey* k = ime::AsciiKeyboard::key_at(row, idx);
+    if (!k) return true;
+
+    switch (k->mod) {
+        case ime::AsciiMod::kShift:
+            shift_ = !shift_;
+            draw_ascii();  // 面の文字が全部変わる
+            draw_status();
+            return true;
+        case ime::AsciiMod::kCtrl:
+            ctrl_ = !ctrl_;
+            draw_ascii_key(row, idx, false);
+            draw_status();
+            return true;
+        case ime::AsciiMod::kKana:
+            if (mode_request_) mode_request_(Mode::kKana);
+            return true;
+        case ime::AsciiMod::kNone:
+            break;
+    }
+
+    const char* name = (shift_ && k->shift) ? k->shift : k->name;
+    const uint8_t mod = ctrl_ ? kKbdModCtrl : 0;
+    // **ラッチは 1 打で落とす。** 落とさないと Ctrl を押した後の全部が Ctrl 付きになる。
+    const bool had_shift = shift_;
+    const bool had_latch = shift_ || ctrl_;
+    shift_ = ctrl_ = false;
+
+    const Mode before = mode_;
+    if (key_output_) key_output_(name, mod);
+    // **段が変わったら何も描かない。** 送った先で 1 行入力が確定して元の段へ戻ることが
+    // あり（パスワード入力の Enter）、そのまま描くと新しい画面の上に ASCII の面を描く。
+    // 新しい面は set_mode がもう描いている。
+    if (mode_ != before) return true;
+
+    if (had_shift) draw_ascii();  // 面の文字が戻る
+    else draw_ascii_key(row, idx, false);
+    if (had_latch) draw_status();
+    return true;
+}
+
 bool KeyboardUi::touch_up(int x, int y)
 {
-    if (!visible_ || !kb_.is_pressed()) return false;
+    if (!visible()) return false;
+    if (mode_ == Mode::kAscii) {
+        if (press_row_ < 0) return false;
+        return ascii_touch_up();
+    }
+    if (!kb_.is_pressed()) return false;
 
     const int  released = pressed_key_;
     const auto r        = kb_.touch_up(x, y);
@@ -182,6 +341,7 @@ bool KeyboardUi::touch_up(int x, int y)
 
     if (!r.valid) return true;
 
+    const Mode before = mode_;
     if (!r.kana.empty()) {
         // 「゛」「゜」「small」は文字ではなく直前のかなへの修飾。
         if (r.kana == "゛") {
@@ -210,12 +370,16 @@ bool KeyboardUi::touch_up(int x, int y)
                 }
                 break;
             case ime::FuncKey::kMode:
-                ime_.set_direct(ime_.mode() == ime::Mode::kDirect ? false : true);
-                break;
+                // かな面の "abc" は ASCII 面へ切り替える（IME の直接入力ではなく、
+                // 本物の ASCII 配列がある (#65)）。
+                if (mode_request_) mode_request_(Mode::kAscii);
+                return true;
             case ime::FuncKey::kNone:
                 break;
         }
     }
+    // ASCII 面と同じ理由（emit の先で段が変わることがある）。
+    if (mode_ != before) return true;
     draw_status();
     return true;
 }

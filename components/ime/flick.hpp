@@ -65,6 +65,9 @@ public:
     bool touch_down(int px, int py);
     // 指を離した。押していたキーとフリック方向から結果を返す。
     FlickResult touch_up(int px, int py);
+    // 押しっぱなしのまま面が切り替わったときに捨てる（そのまま離すと、
+    // 選んでいないかなが出る）。
+    void cancel() { pressed_ = false; }
     bool is_pressed() const { return pressed_; }
     int  pressed_key() const { return press_key_; }
 
