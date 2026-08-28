@@ -39,6 +39,13 @@ constexpr AsciiKey kRow4[] = {
     {"かな", "", nullptr, AsciiMod::kKana},
 };
 
+// PAD 面。**矢印は逆 T 字**（↑ の真下が ↓、その左右が ← →）。
+// 横一列に並べるより指が迷わない。
+constexpr AsciiKey kPadTable[kPadRows][kPadCols] = {
+    {{"Esc", "esc"}, {"↑", "up"}, {"Tab", "tab"}, {"^C", "c", nullptr, AsciiMod::kNone, 1, kCtrlBit}},
+    {{"←", "left"}, {"↓", "down"}, {"→", "right"}, {"Enter", "enter"}},
+};
+
 struct Row {
     const AsciiKey* keys;
     int             n;
@@ -52,6 +59,12 @@ constexpr Row kTable[AsciiKeyboard::kRows] = {
 };
 
 }  // namespace
+
+const AsciiKey* pad_key(int row, int col)
+{
+    if (row < 0 || row >= kPadRows || col < 0 || col >= kPadCols) return nullptr;
+    return &kPadTable[row][col];
+}
 
 const AsciiKey* AsciiKeyboard::key_at(int row, int index)
 {
