@@ -272,6 +272,28 @@ void test_flick_to_ime()
 }
 
 // レビュー指摘の回帰テスト。
+// 押しっぱなしのまま面が切り替わったときに捨てられること (#65)。
+// **捨てないと、離したときに選んでいないかなが出る** — 画面キーボードの段は
+// 指を置いたままでも変わる（純正キーボードの Ctrl+Alt+M でメニューが開く）。
+void test_flick_cancel()
+{
+    ime::FlickKeyboard kb;
+    ime::FlickLayout   l;
+    l.x      = 0;
+    l.y      = 400;
+    l.width  = 480;
+    l.height = 320;
+    kb.set_layout(l);
+
+    CHECK(kb.touch_down(60, 440));  // 「あ」キー
+    CHECK(kb.is_pressed());
+    kb.cancel();
+    CHECK(!kb.is_pressed());
+    const auto r = kb.touch_up(60, 440);
+    CHECK(!r.valid);
+    EXPECT(r.kana, "");
+}
+
 void test_review_regressions()
 {
     // composing() は未確定のローマ字を含む。UI 側で pending_romaji を足すと二重になるので、
@@ -309,6 +331,7 @@ int main()
     test_modifiers();
     test_flick_keys();
     test_flick_to_ime();
+    test_flick_cancel();
     test_review_regressions();
     std::printf("ok: %d checks passed\n", g_checks);
     return 0;
