@@ -135,6 +135,7 @@ int                            s_status_h = 0;
 // 高さの計算はここ 1 箇所しかない。分散させると片方だけ直して重なる。
 void apply_layout();
 // 画面キーボードの出し入れ（コンソールもダブルタップも通す唯一の経路）。
+void set_keyboard_mode(KeyboardUi::Mode m);
 void set_keyboard_visible(bool show);
 // メニューの表示を切り替える。キーボードの表示と端末の行数も一緒に動く。
 void set_menu_visible(bool show);
@@ -215,10 +216,13 @@ int s_swipe_start_offset = 0;
 // 判定そのものは tap_gesture.hpp（ホストテスト付き）に置いてある。
 TapState s_tap;
 
-// ユーザが選んだ画面キーボードの表示状態。**メニューから端末へ戻るときはこれに従う。**
+// ユーザが選んだ画面キーボードの段。**メニューから端末へ戻るときはこれに従う。**
 // 以前は無条件で出していたが、指で切り替えられる以上、メニューを 1 回開くたびに
 // 勝手に戻るのは困る。
-bool s_keyboard_wanted = true;
+KeyboardUi::Mode s_kbd_mode = KeyboardUi::Mode::kAscii;
+// 「なし」の前に出していた段。ダブルタップ (#54) はここへ戻す
+// （巡回ボタンと違い、出す／隠すの往復であってほしい）。
+KeyboardUi::Mode s_kbd_face = KeyboardUi::Mode::kAscii;
 
 // M5GFX はパネル・タッチの判別結果を NVS にキャッシュする。NVS を初期化しておかないと
 // 毎起動でフルプローブ（タッチ IC のファームウェア待ちを含む）が走る。
@@ -1189,10 +1193,27 @@ int cmd_bench(int, char**)
     return 0;
 }
 
+// `kbd [off|ascii|kana|next]`。**指と同じ関数を通す** — 分けると
+// 「コマンドでは切り替わるが指では切り替わらない」（またはその逆）になる。
 int cmd_kbd(int argc, char** argv)
 {
-    const bool show = (argc < 2) || (std::string(argv[1]) != "off");
-    TermGuard  guard;
+    KeyboardUi::Mode m = s_kbd_face;
+    if (argc >= 2) {
+        const std::string a = argv[1];
+        if (a == "off") {
+            m = KeyboardUi::Mode::kOff;
+        } else if (a == "ascii" || a == "abc") {
+            m = KeyboardUi::Mode::kAscii;
+        } else if (a == "kana") {
+            m = KeyboardUi::Mode::kKana;
+        } else if (a == "next") {
+            m = KeyboardUi::next_mode(s_kbd_mode);
+        } else if (a != "on") {
+            std::printf("usage: kbd [off|ascii|kana|next]\n");
+            return 1;
+        }
+    }
+    TermGuard guard;
     if (!guard.ok()) {
         std::printf("busy\n");
         return 1;
@@ -1202,8 +1223,8 @@ int cmd_kbd(int argc, char** argv)
         std::printf("menu is shown (menu hide してから)\n");
         return 1;
     }
-    set_keyboard_visible(show);
-    std::printf("keyboard %s, terminal %dx%d\n", show ? "shown" : "hidden", renderer->cols(),
+    set_keyboard_mode(m);
+    std::printf("keyboard %s, terminal %dx%d\n", KeyboardUi::mode_label(m), renderer->cols(),
                 renderer->rows());
     return 0;
 }
@@ -1703,6 +1724,10 @@ StatusBar::Info gather_status()
 {
     StatusBar::Info info{};
     info.menu_open = (menu && menu->visible());
+    // **出ている段ではなく、ユーザが選んだ段を出す。** メニュー表示中は
+    // キーボードを隠しているので、実物を見るとボタンが勝手に「なし」に戻る。
+    info.kbd    = KeyboardUi::mode_label(s_kbd_mode);
+    info.kbd_on = (s_kbd_mode != KeyboardUi::Mode::kOff);
     info.wifi_up = wifi_status(info.ssid, sizeof(info.ssid), &info.rssi, info.ip, sizeof(info.ip));
 
     auto& nif = wg::netif_instance();
@@ -1776,20 +1801,40 @@ void apply_layout()
 // 画面キーボードを出し入れする。**コンソール (`kbd`) もダブルタップもここを通す** —
 // 分けると「指では消えるがコマンドでは消えない」（またはその逆）になって検証にならない。
 // ロックは呼び出し側が持っている。
-void set_keyboard_visible(bool show)
+void set_keyboard_mode(KeyboardUi::Mode m)
 {
     if (!keyboard || !renderer || !term) return;
-    s_keyboard_wanted = show;
-    if (keyboard->visible() == show) return;
-    keyboard->set_visible(show);  // 出すときは KeyboardUi 側が描く
-    apply_layout();
-    // **QR は端末領域に描いてある。** 畳まずに塗り直すと、消えたのにフラグが
-    // 残って端末が二度と更新されなくなる。
-    hide_auth_qr(/*redraw=*/false);
-    // 隠すときはキーボードが居た帯まで端末の行が伸びるので、force で全部塗り直す。
-    renderer->render(*term, /*force=*/true);
-    ESP_LOGI(TAG, "keyboard %s, terminal %dx%d", show ? "shown" : "hidden", renderer->cols(),
+    s_kbd_mode = m;
+    if (m != KeyboardUi::Mode::kOff) s_kbd_face = m;
+    // **メニュー表示中はキーボードに触らない。** 出せばメニューの上に描いてしまうし、
+    // 端末の force render がメニューを潰す。閉じるときに set_menu_visible が
+    // s_kbd_mode を見て張り直す（プロンプトはメニューから開くことがある）。
+    if (menu && menu->visible()) {
+        if (status_bar) status_bar->draw(gather_status(), /*force=*/true);
+        return;
+    }
+    if (keyboard->mode() == m) return;
+    const bool was_visible = keyboard->visible();
+    keyboard->set_mode(m);  // 出すときも面を変えるときも KeyboardUi 側が描く
+    // **面が変わるだけなら端末には触らない。** 行数も帯の位置も同じなので、
+    // force render は全画面の PPA 転送を無駄に 1 回出すだけになる。
+    if (keyboard->visible() != was_visible) {
+        apply_layout();
+        // **QR は端末領域に描いてある。** 畳まずに塗り直すと、消えたのにフラグが
+        // 残って端末が二度と更新されなくなる。
+        hide_auth_qr(/*redraw=*/false);
+        // 隠すときはキーボードが居た帯まで端末の行が伸びるので、force で全部塗り直す。
+        renderer->render(*term, /*force=*/true);
+    }
+    if (status_bar) status_bar->draw(gather_status(), /*force=*/true);
+    ESP_LOGI(TAG, "keyboard %s, terminal %dx%d", KeyboardUi::mode_label(m), renderer->cols(),
              renderer->rows());
+}
+
+// ダブルタップと `kbd` コマンド用。出すときは「なし」の前の段に戻す。
+void set_keyboard_visible(bool show)
+{
+    set_keyboard_mode(show ? s_kbd_face : KeyboardUi::Mode::kOff);
 }
 
 void touch_down_at(int x, int y)
@@ -1798,7 +1843,16 @@ void touch_down_at(int x, int y)
         // ステータスバーをタップでメニューを開閉する。純正キーボードが来るまで、
         // 指だけでメニューに戻れる経路はここだけなので、当たり判定は描画（24px）
         // より広く取る。24px は 3.5mm しかない。
-        set_menu_visible(!menu->visible());
+        //
+        // **MENU の隣のブロックだけは画面キーボードの段を巡回する (#65)。**
+        // メニュー表示中はキーボードを隠しているので、そのときはバー全体を
+        // CLOSE として扱う（段だけ変えても画面に何も起きず、押し損に見える）。
+        if (!menu->visible() && x >= StatusBar::kLabelW &&
+            x < StatusBar::kLabelW + StatusBar::kKbdW) {
+            set_keyboard_mode(KeyboardUi::next_mode(s_kbd_mode));
+        } else {
+            set_menu_visible(!menu->visible());
+        }
     } else if (menu->visible()) {
         // メニュー表示中はキーボードを隠しているので、ここで全部食う。
         if (menu->touch_down(x, y)) menu->draw();
@@ -1872,7 +1926,7 @@ void set_menu_visible(bool show)
     // メニューはキーボードの領域を覆わないので、隠さないと指でキーを押せてしまう。
     // 端末に戻るときは**ユーザが選んだ状態**に戻す（#54 でダブルタップから
     // 切り替えられるようになったので、開くたびに勝手に出すと選択が消える）。
-    keyboard->set_visible(!show && s_keyboard_wanted);
+    keyboard->set_mode(show ? KeyboardUi::Mode::kOff : s_kbd_mode);
     if (show) {
         menu->set_info(gather_menu_info(gather_status()));
         refresh_wifi_nets();  // `*` の位置は繋ぎ直しで変わる (#56)
@@ -3075,8 +3129,8 @@ bool connect_vpn_profile(const prof::Profile& p, std::string* err)
 // 打鍵は画面キーボードも純正キーボードも send_input を通るので、そこで横取りする。
 bool        s_prompt_active = false;
 bool        s_prompt_mask   = false;  // 伏せ字にする（肩越しに見えないように）
-// プロンプトの間だけ画面キーボードを abc にするので、元のモードを覚えておく。
-bool        s_prompt_prev_direct = false;
+// プロンプトの間だけ画面キーボードを ASCII 面にするので、元の段を覚えておく。
+KeyboardUi::Mode s_prompt_prev_mode = KeyboardUi::Mode::kAscii;
 std::string s_prompt_buf;
 // Enter で呼ぶ。**呼ぶ前にプロンプトを畳む**ので、この中から次の入力を始めてよい
 // （隠し SSID は SSID → パスワードと 2 回続けて聞く）。
@@ -3096,7 +3150,7 @@ void cancel_line_prompt()
     // **続きの処理も捨てる。** 残すと、次に別のプロンプトを開いたときに
     // 前回の続きが動く（SSID を聞いていたつもりが VPN に繋ぎに行く）。
     s_prompt_done = nullptr;
-    if (keyboard) keyboard->set_direct(s_prompt_prev_direct);
+    set_keyboard_mode(s_prompt_prev_mode);
     // **畳んだことを端末に書く。** 伏せ字だけが残っていると、入力が
     // まだ続いているように見える（実際には次の打鍵は端末へ流れる）。
     term_note("33", "canceled");
@@ -3105,11 +3159,12 @@ void cancel_line_prompt()
 void start_line_prompt(const std::string& label, bool mask,
                        std::function<void(const std::string&)> done)
 {
-    // **かな（フリック）のままでは打てない。** パスワードも SSID も英数なので、
-    // 開いている間だけ abc にして、終わったら元のモードへ戻す。
+    // **かな面のままでは打てない。** パスワードも SSID も英数なので、開いている間だけ
+    // ASCII 面にして、終わったら元の段へ戻す。**「なし」だった人にも出す** —
+    // 画面から聞いておいて打つ手段が無いのは、そのまま行き止まりになる。
     if (keyboard && !s_prompt_active) {
-        s_prompt_prev_direct = keyboard->direct();
-        keyboard->set_direct(true);
+        s_prompt_prev_mode = s_kbd_mode;
+        set_keyboard_mode(KeyboardUi::Mode::kAscii);
     }
     s_prompt_active = true;
     s_prompt_mask   = mask;
@@ -3140,7 +3195,7 @@ bool line_prompt_input(const std::string& in)
             // **続きが次のプロンプトを開くなら、その中でまた abc にする。**
             // ここで戻しておかないと、2 段目 (SSID → パスワード) を抜けたときに
             // 元のモードが失われる。
-            if (keyboard) keyboard->set_direct(s_prompt_prev_direct);
+            set_keyboard_mode(s_prompt_prev_mode);
             term->write("\r\n");
             render_term();
             if (done) done(line);
@@ -4052,7 +4107,7 @@ void register_term_commands()
         {"kbdhw", "純正キーボード (Ext.Port1 I2C) の状態を見る／読み取りを立て直す", nullptr,
          &cmd_kbdhw, nullptr, nullptr, nullptr},
         {"kbdlog", "打鍵をシリアルに出す", "[off]", &cmd_kbdlog, nullptr, nullptr, nullptr},
-        {"kbd", "画面キーボードの表示切り替え", "[off]", &cmd_kbd, nullptr, nullptr, nullptr},
+        {"kbd", "画面キーボードの段", "[off|ascii|kana|next]", &cmd_kbd, nullptr, nullptr, nullptr},
         {"menu", "初期メニューの操作", "[show|hide|up|down|enter|esc|left|right]", &cmd_menu,
          nullptr, nullptr, nullptr},
         {"tap", "タッチを合成する（実タッチと同じ経路）", "<x> <y>", &cmd_tap, nullptr, nullptr,
@@ -4149,7 +4204,9 @@ extern "C" void app_main(void)
     // 画面下部をキーボードに使うので、端末の行数はその分減らす。
     keyboard = std::make_unique<KeyboardUi>(display, *renderer);
     // キーボードの上端は端末のセル境界に合わせる。合わせないと誰も描かない帯が残る。
-    constexpr int kWantKeyboardH = 320;  // 4 行 x 72px + ステータス帯 32px 程度
+    // ASCII 面が 12 列 x 5 行。1 キー 106 x 70px（約 12.8 x 8.4mm）になる高さ。
+    // 320px だと 1 行 57px = 6.9mm で、指には狭い。
+    constexpr int kWantKeyboardH = 380;  // 5 行 x 70px + ステータス帯 32px 程度
     const int avail      = display.height() - s_status_h;
     const int term_rows  = (avail - kWantKeyboardH) / renderer->cell_h();
     const int keyboard_h = avail - term_rows * renderer->cell_h();
@@ -4262,6 +4319,13 @@ extern "C" void app_main(void)
     // 描画はキーボードの表示が決まってから（下の apply_layout で行う）。
 
     keyboard->set_output(send_input);
+    // **ASCII 面は純正キーボードと同じ経路に載せる。** 分けると「実キーでは効くのに
+    // 画面キーボードでは効かない」（またはその逆）が起きて、検証にならない。
+    keyboard->set_key_output([](const std::string& name, uint8_t mod) {
+        kbd_handle_key(name, mod);
+    });
+    // 面の中の切り替えキーも**ステータスバーのボタンと同じ関数**を通す。
+    keyboard->set_mode_request([](KeyboardUi::Mode m) { set_keyboard_mode(m); });
 
     // 純正キーボードが挿さっていれば読み取りタスクを立てる（起動時に検出済み）。
     // **画面の向きでは判定しない**（`flip` で手で戻した後も読み続ける必要がある）。

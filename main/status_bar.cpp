@@ -15,7 +15,8 @@ bool StatusBar::Info::operator==(const Info& o) const
     return wifi_up == o.wifi_up && menu_open == o.menu_open &&
            (rssi / 10) == (o.rssi / 10) && vpn == o.vpn &&
            std::strcmp(ssid, o.ssid) == 0 && std::strcmp(ip, o.ip) == 0 &&
-           std::strcmp(vpn_ip, o.vpn_ip) == 0;
+           std::strcmp(vpn_ip, o.vpn_ip) == 0 && kbd_on == o.kbd_on &&
+           std::strcmp(kbd, o.kbd) == 0;
 }
 
 void StatusBar::begin(int height)
@@ -42,6 +43,13 @@ bool StatusBar::draw(const Info& info, bool force)
     gfx_.fillRect(0, 0, kLabelW, height_, info.menu_open ? TFT_ORANGE : TFT_CYAN);
     gfx_.drawString(info.menu_open ? " CLOSE" : " MENU", 4, 0);
 
+    // 画面キーボードの段 (#65)。**「なし」も文字で出す** — 空にすると、
+    // そこがタップできる場所だと分からない（MENU と同じ理由）。
+    const uint16_t kbd_bg = info.kbd_on ? TFT_YELLOW : 0x52AA;
+    gfx_.fillRect(kLabelW, 0, kKbdW, height_, kbd_bg);
+    gfx_.setTextColor(info.kbd_on ? TFT_BLACK : TFT_WHITE, kbd_bg);
+    gfx_.drawString(info.kbd, kLabelW + (kKbdW - gfx_.textWidth(info.kbd)) / 2, 0);
+
     char line[96];
     if (info.wifi_up) {
         // RSSI は esp_hosted 経由だと 0 が返ることがある（実機で確認）。
@@ -56,7 +64,7 @@ bool StatusBar::draw(const Info& info, bool force)
         std::snprintf(line, sizeof(line), "WiFi --");
         gfx_.setTextColor(TFT_DARKGREY, kBg);
     }
-    gfx_.drawString(line, kLabelW + 8, 0);
+    gfx_.drawString(line, kLabelW + kKbdW + 8, 0);
 
     // VPN は右寄せ。左の SSID が伸びても位置が動かないようにする。
     char vpn[64];

@@ -46,6 +46,13 @@ jobs:
               components/ime/flick.cpp components/ime/romaji.cpp components/ime/skk_dict.cpp
           /tmp/test_flick
 
+      - name: ime (ASCII 面のキー表と当たり判定)
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \
+              -I main -I components/ime -o /tmp/test_ascii \
+              components/ime/test_ascii.cpp components/ime/ascii.cpp components/ime/flick.cpp
+          /tmp/test_ascii
+
       - name: blake2s / hmac / kdf (RFC 7693 とテストベクタ)
         run: |
           c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \
