@@ -18,6 +18,25 @@ import time
 import serial  # ESP-IDF の python 環境に含まれる
 
 
+# **実機のコンソールに 256 文字以上の行を送ってはいけない。**
+# ESP-IDF の linenoise は `calloc(1, max_cmdline_length)` した buf を dumb モードで
+# 端まで埋め、NUL を置かない。その後 `sanitize()` が NUL を探して確保領域の外まで
+# 走り、止まったところに `*dst = 0` を書く。**ヒープのメタデータが壊れ、
+# 何十秒も後に無関係な free が abort する**（`assert failed: block_next` /
+# `CORRUPT HEAP: Bad tail`）。実機で再現確認済み。
+# ここで弾かないと、検証のつもりが検証対象を壊すことになる。
+MAX_CMDLINE = 256  # main/wifi.cpp の repl_cfg.max_cmdline_length と合わせる
+
+
+def check_line(line: str) -> None:
+    if len(line) >= MAX_CMDLINE:
+        raise SystemExit(
+            f"送る行が {len(line)} 文字ある。コンソールは {MAX_CMDLINE} 文字未満しか"
+            f"受け取れず、超えると ESP-IDF の linenoise がヒープを壊す"
+            f"（後で無関係な free が abort する）。分割して送ること。\n  {line[:60]}..."
+        )
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--port", default="/dev/cu.usbmodem101")
@@ -30,6 +49,8 @@ def main() -> int:
                    help="送信までの待ち秒数。ポートを開くとリセットが入るので、"
                         "起動を待ってから送りたいときに使う")
     args = p.parse_args()
+    for line in args.send:
+        check_line(line)
 
     with serial.Serial(args.port, args.baud, timeout=0.2) as s:
         # pyserial は open 時に DTR/RTS を両方 assert する。USB-Serial-JTAG では

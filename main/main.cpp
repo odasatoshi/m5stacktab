@@ -4038,6 +4038,10 @@ int cmd_termcheck(int, char**)
                 renderer->ppa_enabled() ? "PPA" : "pushSprite", bad == 0 ? "ok" : "FAILED");
     status_bar->draw(gather_status(), /*force=*/true);
     if (menu_was_shown) menu->draw(/*force=*/true);
+    // **PAD も戻す。** 上の render は端末を全部塗り直しているので、重ねてある
+    // パッドが消えている（画素を読む前に重ねると、診断が PAD の色を読みかねない
+    // ので、読み終わってからにする）。
+    if (keyboard) keyboard->draw_overlay();
     return bad == 0 ? 0 : 1;
 }
 

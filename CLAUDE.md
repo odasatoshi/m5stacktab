@@ -201,6 +201,31 @@ python tools/serial_log.py --seconds 20      # ログ採取
 - `CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM` は有効にしない。TX mempool の 1600B ストライドが
   128B キャッシュラインと合わず CMD53 がアライメント検査で弾かれる
 
+## コンソールに長い行を送ってはいけない
+
+**256 文字以上の行を送ると、何十秒も後に無関係な `free` が abort する。**
+
+```
+CORRUPT HEAP: Bad tail at 0x4ff71c04. Expected 0xbaad5678 got 0x6c4f5678
+assert failed: block_next tlsf_block_functions.h:161 (!block_is_last(block))
+  esp_console_repl_task -> linenoiseHistoryAdd -> free -> tlsf_free -> assert
+```
+
+ESP-IDF の linenoise は `calloc(1, max_cmdline_length)`（`main/wifi.cpp` で **256**）した
+buf を dumb モードで**端まで埋め、NUL を置かない**。その後 `sanitize()` が NUL を探して
+確保領域の外まで走り、止まったところに `*dst = 0` を書く。ヒープのメタデータが壊れ、
+**次に同じアリーナを触った誰かが死ぬ**。`linenoiseHistoryAdd` は被害者で犯人ではない。
+
+**再現は 1 行で足りる**（`term` + 300 文字）。**間欠に見えるのは、壊れてから
+誰かが踏むまでに間があるから**で、原因は決定的。
+
+- 送る側 (`tools/serial_log.py`) が 256 文字以上を弾くようにしてある。**弾かないと、
+  検証のつもりで検証対象を壊す**（Reality Check で「PAD の PR がヒープを壊す」と
+  誤って疑うところだった → #72）
+- 実機の画面に長い行を出したいときは `term` を分けて送る
+- `CONFIG_HEAP_POISONING_COMPREHENSIVE` を入れると**書いた瞬間に**止まるので、
+  「壊れているが誰が壊したか分からない」ときはこれを入れて再現させる
+
 ## lwIP を触るときの制約
 
 `CONFIG_LWIP_TCPIP_CORE_LOCKING` は無効なので、次を守る必要がある。
