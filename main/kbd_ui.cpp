@@ -69,7 +69,9 @@ void KeyboardUi::begin(int height)
     a.width  = (gfx_.width() / a.cols) * a.cols;
     a.x      = (gfx_.width() - a.width) / 2;
     a.y      = l.y;
-    a.height = ((height_ - status_h_) / a.rows) * a.rows;
+    // **端数を切り捨てない。** 切ると draw_ascii が塗る帯より当たり判定が短くなり、
+    // 下端の数 px が端末領域（スクロールバックのスワイプ）に流れる。
+    a.height = height_ - status_h_;
     ascii_.set_layout(a);
 
     ESP_LOGI(TAG, "keyboard %dpx: kana key %dx%d, ascii key %dx%d", height_, l.key_w(), l.key_h(),
@@ -83,6 +85,10 @@ void KeyboardUi::set_mode(Mode m)
     mode_   = m;
     shift_  = false;
     ctrl_   = false;
+    // **かな面の押下も捨てる。** 指を置いたまま段が変わる経路がある
+    // （純正キーボードの Ctrl+Alt+M でメニューを開閉する）。捨てないと、
+    // 離したときに選んでいないかなが出る。
+    kb_.cancel();
     pressed_key_ = -1;
     press_row_   = -1;
     press_idx_   = -1;

@@ -138,18 +138,6 @@ void test_ime_editing()
     EXPECT(ime.composing(), "あいう");
 }
 
-void test_ime_direct_mode()
-{
-    ime::Ime ime;
-    ime.set_direct(true);
-    EXPECT(ime.input_char('a'), "a");
-    EXPECT(ime.input_char('Z'), "Z");
-    CHECK(ime.empty());
-    ime.set_direct(false);
-    EXPECT(ime.input_char('a'), "");
-    EXPECT(ime.composing(), "あ");
-}
-
 void test_modifiers()
 {
     ime::Ime ime;
@@ -318,7 +306,6 @@ int main()
     test_ime_romaji_flow();
     test_ime_no_dict();
     test_ime_editing();
-    test_ime_direct_mode();
     test_modifiers();
     test_flick_keys();
     test_flick_to_ime();

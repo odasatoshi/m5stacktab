@@ -216,6 +216,11 @@ int s_swipe_start_offset = 0;
 // 判定そのものは tap_gesture.hpp（ホストテスト付き）に置いてある。
 TapState s_tap;
 
+// set_menu_visible の実行中か。**この間 set_keyboard_mode は画面に触らない** —
+// 開閉の側が最後に配分と描画を張り直すので、途中で張ると apply_layout と
+// 全画面 render を 2 回ずつ走らせる（SSH の相手にも窓サイズが 2 回飛ぶ）。
+bool s_menu_transition = false;
+
 // ユーザが選んだ画面キーボードの段。**メニューから端末へ戻るときはこれに従う。**
 // 以前は無条件で出していたが、指で切り替えられる以上、メニューを 1 回開くたびに
 // 勝手に戻るのは困る。
@@ -1806,6 +1811,8 @@ void set_keyboard_mode(KeyboardUi::Mode m)
     if (!keyboard || !renderer || !term) return;
     s_kbd_mode = m;
     if (m != KeyboardUi::Mode::kOff) s_kbd_face = m;
+    // 開閉の途中なら状態だけ更新して返る（張り直すのは set_menu_visible の仕事）。
+    if (s_menu_transition) return;
     // **メニュー表示中はキーボードに触らない。** 出せばメニューの上に描いてしまうし、
     // 端末の force render がメニューを潰す。閉じるときに set_menu_visible が
     // s_kbd_mode を見て張り直す（プロンプトはメニューから開くことがある）。
@@ -1917,6 +1924,8 @@ void refresh_wifi_nets();
 void set_menu_visible(bool show)
 {
     if (!menu) return;
+    // 開閉の間は set_keyboard_mode に画面を触らせない（下で全部張り直すので）。
+    s_menu_transition = true;
     // 入力途中でメニューへ逃げると、以後の打鍵が全部プロンプトに吸われて
     // SSH セッションに届かなくなる（`*` だけが出る）。
     cancel_line_prompt();
@@ -1945,6 +1954,7 @@ void set_menu_visible(bool show)
         }
     }
     // ラベルを MENU / CLOSE に切り替える。開閉のたびに必ず描き直す。
+    s_menu_transition = false;
     status_bar->draw(gather_status(), /*force=*/true);
 }
 
@@ -3130,7 +3140,10 @@ bool connect_vpn_profile(const prof::Profile& p, std::string* err)
 bool        s_prompt_active = false;
 bool        s_prompt_mask   = false;  // 伏せ字にする（肩越しに見えないように）
 // プロンプトの間だけ画面キーボードを ASCII 面にするので、元の段を覚えておく。
+// **face も覚える。** 覚えないと、プロンプトの一時的な ASCII が
+// 「なし の前に出していた段」を上書きし、次のダブルタップが かな ではなく ABC を出す。
 KeyboardUi::Mode s_prompt_prev_mode = KeyboardUi::Mode::kAscii;
+KeyboardUi::Mode s_prompt_prev_face = KeyboardUi::Mode::kAscii;
 std::string s_prompt_buf;
 // Enter で呼ぶ。**呼ぶ前にプロンプトを畳む**ので、この中から次の入力を始めてよい
 // （隠し SSID は SSID → パスワードと 2 回続けて聞く）。
@@ -3151,6 +3164,7 @@ void cancel_line_prompt()
     // 前回の続きが動く（SSID を聞いていたつもりが VPN に繋ぎに行く）。
     s_prompt_done = nullptr;
     set_keyboard_mode(s_prompt_prev_mode);
+    s_kbd_face = s_prompt_prev_face;
     // **畳んだことを端末に書く。** 伏せ字だけが残っていると、入力が
     // まだ続いているように見える（実際には次の打鍵は端末へ流れる）。
     term_note("33", "canceled");
@@ -3159,12 +3173,18 @@ void cancel_line_prompt()
 void start_line_prompt(const std::string& label, bool mask,
                        std::function<void(const std::string&)> done)
 {
+    // **画面に触るのでロックを取る。** ここは `connect` ワーカ（ロックを持っていない）
+    // からも呼ばれる（`ask_password` のプロファイル）。TermGuard は再帰なので、
+    // 既に持っている呼び出し元（メニュー・kbd タスク）からも安全。
+    TermGuard guard;
     // **かな面のままでは打てない。** パスワードも SSID も英数なので、開いている間だけ
     // ASCII 面にして、終わったら元の段へ戻す。**「なし」だった人にも出す** —
     // 画面から聞いておいて打つ手段が無いのは、そのまま行き止まりになる。
     if (keyboard && !s_prompt_active) {
+        // **段は取れなくても覚える。** 覚えずに戻すと、古い値で別の段へ飛ぶ。
         s_prompt_prev_mode = s_kbd_mode;
-        set_keyboard_mode(KeyboardUi::Mode::kAscii);
+        s_prompt_prev_face = s_kbd_face;
+        if (guard.ok()) set_keyboard_mode(KeyboardUi::Mode::kAscii);
     }
     s_prompt_active = true;
     s_prompt_mask   = mask;
@@ -3196,6 +3216,7 @@ bool line_prompt_input(const std::string& in)
             // ここで戻しておかないと、2 段目 (SSID → パスワード) を抜けたときに
             // 元のモードが失われる。
             set_keyboard_mode(s_prompt_prev_mode);
+            s_kbd_face = s_prompt_prev_face;
             term->write("\r\n");
             render_term();
             if (done) done(line);
