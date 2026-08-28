@@ -16,8 +16,12 @@
 namespace ts {
 
 struct ClientConfig {
-    std::string host;                       // 制御プレーンのホスト名 or IP
-    uint16_t    port               = 80;    // 平文で良い（Noise が保護する）
+    std::string host;                       // 制御プレーンのホスト名 or IP（スキームは含まない）
+    uint16_t    port               = 80;
+    // TLS で繋ぐか (#68)。**Noise が中身を保護するので平文でも安全だが、
+    // SaaS は平文を受けない**（http は https へ 302 する）。
+    // 判定は parse_control_url() に集約してあり、ここには結果だけが来る。
+    bool        tls                = false;
     std::string auth_key;                   // tskey-auth-... / hskey-auth-...
     // authkey が無い / 無効なときに対話ログイン（Google などの OAuth）へ回すか (#59)。
     // **端末は URL を見せて待つだけ** — 認証は人間が手元のブラウザでやるので、

@@ -312,3 +312,75 @@ RegisterResult parse_register_response(const std::string& json)
 }
 
 }  // namespace ts
+
+namespace ts {
+
+bool parse_control_url(const std::string& in, uint16_t arg_port, ControlEndpoint* out)
+{
+    if (!out) return false;
+    *out = ControlEndpoint{};
+
+    std::string s = in;
+
+    // 1. スキーム。無しは平文 80（現状維持）。
+    uint16_t scheme_port = 80;
+    if (s.rfind("https://", 0) == 0) {
+        out->tls    = true;
+        scheme_port = 443;
+        s.erase(0, 8);
+    } else if (s.rfind("http://", 0) == 0) {
+        s.erase(0, 7);
+    }
+
+    // 2. パス以降は捨てる。ブラウザからコピペした URL をそのまま通せるようにする。
+    const size_t slash = s.find('/');
+    if (slash != std::string::npos) s.erase(slash);
+
+    // 3. ポート。**IPv6 リテラルは "[::1]:8080" なので、']' より後ろの ':' だけが区切り。**
+    uint16_t     url_port = 0;
+    const size_t rb       = s.rfind(']');
+    const size_t colon    = s.find(':', (rb == std::string::npos) ? 0 : rb + 1);
+    if (colon != std::string::npos) {
+        const std::string p = s.substr(colon + 1);
+        if (p.empty() || p.size() > 5) return false;
+        unsigned v = 0;
+        for (char c : p) {
+            if (c < '0' || c > '9') return false;
+            v = v * 10 + static_cast<unsigned>(c - '0');
+        }
+        if (v == 0 || v > 65535) return false;
+        url_port = static_cast<uint16_t>(v);
+        s.erase(colon);
+    }
+
+    // 4. ブラケットを外す。getaddrinfo は "::1" を受けるが "[::1]" は受けない。
+    bool bracketed = false;
+    if (s.size() >= 2 && s.front() == '[' && s.back() == ']') {
+        bracketed = true;
+        s         = s.substr(1, s.size() - 2);
+    }
+    if (s.empty()) return false;
+    // **黙って誤読しない。** ブラケット無しで ':' が残るのは "::1" のような曖昧な入力で、
+    // 「最後の ':' をポート区切り」と決めると "::1" が host ":" + port 1 になる。
+    if (!bracketed && s.find(':') != std::string::npos) return false;
+    if (s.find('[') != std::string::npos || s.find(']') != std::string::npos) return false;
+
+    out->host = s;
+    out->port = url_port ? url_port : (arg_port ? arg_port : scheme_port);
+    return true;
+}
+
+}  // namespace ts
+
+namespace ts {
+
+std::string http_authority(const std::string& host, uint16_t port, bool tls)
+{
+    // ':' を含む = IPv6 リテラル。parse_control_url がブラケットを外しているので戻す。
+    std::string a = (host.find(':') != std::string::npos) ? ("[" + host + "]") : host;
+    const uint16_t implied = tls ? 443 : 80;
+    if (port != 0 && port != implied) a += ":" + std::to_string(port);
+    return a;
+}
+
+}  // namespace ts

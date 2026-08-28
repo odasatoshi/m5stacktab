@@ -13,6 +13,35 @@ std::string key_to_string(const char* prefix, const uint8_t key[32]);
 // "nodekey:<64hex>" から 32 バイトを取り出す。prefix が合わなければ false。
 bool key_from_string(const std::string& s, const char* prefix, uint8_t out[32]);
 
+// --- 接続先の URL ---
+
+// 制御プレーンの接続先。`ts-login https://host:8443` のような文字列から作る。
+struct ControlEndpoint {
+    std::string host;         // "[" "]" は外した形（そのまま getaddrinfo に渡せる）
+    uint16_t    port = 0;
+    bool        tls  = false;
+};
+
+// スキーム付き / 無しの接続先文字列を分解する (#68)。
+//
+//   "https://h"      -> tls,  port 443
+//   "http://h:8080"  -> 平文, port 8080
+//   "h"              -> 平文, port 80   ← **スキーム無しは現状維持**（既存の設定が動く）
+//   "[::1]:8080"     -> 平文, port 8080, host "::1"
+//
+// ポートの優先順位は **URL の :port > arg_port > スキームの既定**。
+// `arg_port` は 0 で「指定なし」を表す（引数やプロファイルの port をそのまま渡す）。
+//
+// **曖昧な入力は黙って誤読せず false を返す。** ブラケット無しで ':' が残る
+// （"::1" のような裸の IPv6）、ポートが数字でない / 範囲外、ホストが空、など。
+bool parse_control_url(const std::string& in, uint16_t arg_port, ControlEndpoint* out);
+
+// HTTP の Host ヘッダに入れる authority を作る (#68)。
+// **スキームの既定ポート以外は `:port` を付ける**（リバースプロキシの vhost 振り分けや
+// Headscale の server_url 検査が、ポート無しだと別のホストとして扱う）。
+// IPv6 リテラルはブラケットを戻す（`Host: ::1` は不正なヘッダ）。
+std::string http_authority(const std::string& host, uint16_t port, bool tls);
+
 // --- HTTP upgrade ---
 
 // POST /ts2021 のリクエストを組み立てる。ハンドシェイクはヘッダに base64 で載せる。
