@@ -406,6 +406,8 @@ bool Client::run_once()
     auto                 take_sid = [&]() { const uint32_t s = next_sid; next_sid += 2; return s; };
     // 対話ログインで待っている間の状態。
     std::string          shown_auth_url;
+    // AuthURL を最初に出した時刻。承認待ちの持ち時間はここから数える。
+    int                  auth_started_s = 0;
     // **ループ回数を時計に使わない。** pump() はフレームが届くと即 return する
     // （サーバの PING や keepalive で起きる）ので、回数は経過時間と比例しない。
     auto now_s = [] {
@@ -563,6 +565,11 @@ bool Client::run_once()
                 // 失効を踏んだら、新しい URL に差し替える条件を足す。
                 if (shown_auth_url.empty()) {
                     shown_auth_url = rr.auth_url;
+                    // **人間の持ち時間は URL を出した時点から数える。**
+                    // run_once() の開始から数えると、接続・ハンドシェイク・初回
+                    // register の時間が 5 分に食い込む（実測: 4.5 分で承認する
+                    // テストが残り 1.4 秒で通っていた）。
+                    auth_started_s = now_s();
                     set_auth_url(rr.auth_url);
                     if (on_auth_url_) on_auth_url_(rr.auth_url);
                 }
@@ -574,7 +581,7 @@ bool Client::run_once()
                 sent_register = false;
                 register_at   = now_s() + kAuthPollSec;
                 // 承認を待つ間は別の持ち時間で数える。
-                deadline_s = start_s + kAuthTimeoutSec;
+                deadline_s = auth_started_s + kAuthTimeoutSec;
                 continue;
             }
             // 通ったら URL は消す。残すと承認後も QR が出たままになる。

@@ -1296,10 +1296,15 @@ void ts_task(void* arg)
     // （メニューの再描画は NVS 読みを含むので実際に長い）ので、取れたときだけ
     // 畳むと、取れなかった一回で s_auth_qr_active が true のまま ts タスクが
     // 消える。以後 render_term() は永久に早期 return し、auth_qr_input() が
-    // ESC 以外の打鍵を全部食う。**ロックが要るのは再描画だけ。**
-    s_auth_qr_url.clear();
+    // ESC 以外の打鍵を全部食う。**ロックの外に出す必要があるのはフラグだけ。**
+    // s_auth_qr_url は他の全アクセスがロックの下（show_auth_qr / set_menu_visible）で、
+    // しかも show_auth_qr は &s_auth_qr_url を描画コールバックに渡すので、
+    // 外から clear() すると生成中に解放済みバッファを読ませることになる。
+    // 取れなくても実害は無い: run_once() が抜けるとき state が kFailed になるので、
+    // メニューを開閉しても「まだ承認待ち」の条件が成立せず出し直されない。
     {
         TermGuard guard;
+        if (guard.ok()) s_auth_qr_url.clear();
         hide_auth_qr(/*redraw=*/guard.ok());
     }
     // run_once() から戻ったあとなので、この参照を書き換える者はもういない。
@@ -1642,10 +1647,11 @@ int cmd_ts_stop(int, char**)
     }
     s_ts_client->stop();
     // 対話ログインの QR を出したまま止めると、端末が更新されないまま残る (#59)。
-    // ts_task の後始末と同じ理由で、畳むこと自体はロックに依存させない。
-    s_auth_qr_url.clear();
+    // ts_task の後始末と同じ理由で、畳むこと自体はロックに依存させない
+    // （URL はロックの下でだけ触る。理由は ts_task 側のコメント）。
     {
         TermGuard guard;
+        if (guard.ok()) s_auth_qr_url.clear();
         hide_auth_qr(/*redraw=*/guard.ok());
     }
     std::printf("stop requested\n");
