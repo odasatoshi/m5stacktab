@@ -127,7 +127,10 @@ void KeyboardUi::build_pad()
             if (!k) continue;
             const int kx = col * kPadKeyW;
             const int ky = row * kPadKeyH;
+            // **枠は 2px 焼く。** 押下の色はここと文字の背景箱にしか塗れない
+            // （下の draw_pad_key を参照）ので、1px だと手応えが細すぎる。
             pad_.drawRect(kx + 1, ky + 1, kPadKeyW - 2, kPadKeyH - 2, kKeyLine);
+            pad_.drawRect(kx + 2, ky + 2, kPadKeyW - 4, kPadKeyH - 4, kKeyLine);
             // **文字の後ろは塗る。** 市松のままだと下の端末の文字が字画の隙間に
             // 出て読めない。
             pad_.setTextColor(kText, kPadDim);
@@ -145,17 +148,21 @@ void KeyboardUi::draw_overlay()
     last_overlay_us_ = (uint32_t)(esp_timer_get_time() - t0);
 }
 
+// 押下の手応え。**塗ってよいのはスプライト側が不透明な画素だけ** — 枠 2px と
+// 文字の背景箱。キー全面を塗ると、離して重ね直しても**透かした 1/4 の画素に
+// 押下色が残る**（市松がべき等なのは「下が端末の画素のまま」の間だけ）。
 void KeyboardUi::draw_pad_key(int row, int col, bool pressed)
 {
     const ime::AsciiKey* k = ime::pad_key(row, col);
-    if (!k) return;
+    if (!k || !pad_.getBuffer()) return;
     if (!pressed) {
         draw_overlay();  // 素の見た目はスプライトにしかない。全体を重ね直す
         return;
     }
     const int x = pad_x_ + col * kPadKeyW;
     const int y = pad_y_ + row * kPadKeyH;
-    gfx_.fillRect(x + 1, y + 1, kPadKeyW - 2, kPadKeyH - 2, kKeyDown);
+    gfx_.drawRect(x + 1, y + 1, kPadKeyW - 2, kPadKeyH - 2, kKeyDown);
+    gfx_.drawRect(x + 2, y + 2, kPadKeyW - 4, kPadKeyH - 4, kKeyDown);
     gfx_.setFont(&fonts::efontJA_24);
     gfx_.setTextColor(kText, kKeyDown);
     const int tw = gfx_.textWidth(k->label);
@@ -164,6 +171,9 @@ void KeyboardUi::draw_pad_key(int row, int col, bool pressed)
 
 bool KeyboardUi::pad_hit(int x, int y, int* row, int* col) const
 {
+    // **スプライトが取れなかったら触らせない。** 画面には何も出ていないのに
+    // 右下のタップが Esc や ^C を端末へ送ることになる。
+    if (!pad_.getBuffer()) return false;
     const int c = (x - pad_x_) / kPadKeyW;
     const int r = (y - pad_y_) / kPadKeyH;
     if (x < pad_x_ || y < pad_y_ || c >= ime::kPadCols || r >= ime::kPadRows) return false;

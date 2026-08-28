@@ -1174,33 +1174,43 @@ int cmd_flip(int argc, char** argv)
 }
 
 
+// PAD を重ね直すのにかかった時間。段が PAD でなければ 0。
+// **端末を描くたびに上乗せされる**ので、bench はこれを込みで出す。
+uint32_t pad_overlay_us()
+{
+    if (!keyboard || keyboard->mode() != KeyboardUi::Mode::kPad) return 0;
+    return keyboard->last_overlay_us();
+}
+
 // 差分転送の効き目を測る。1 文字ずつ書いたときの再描画コストを見る。
 int cmd_bench(int, char**)
 {
     // 計測中に別タスクが描画すると値が混ざるので、区間全体を押さえる。
     TermGuard guard;
     render_term(/*force=*/true);
-    const uint32_t full_us = renderer->last_render_us();
-    const uint32_t full_px = renderer->last_pixels();
+    const uint32_t full_us  = renderer->last_render_us();
+    const uint32_t full_px  = renderer->last_pixels();
+    // **重ね直しは render の計測区間の外**（TermRenderer は自分の時間しか測らない）。
+    // 直後に読まないと、次の描画の値に上書きされて別の区間の数字を出してしまう。
+    const uint32_t full_pad = pad_overlay_us();
 
     // 1 文字入力を 20 回。実際のタイプ入力に相当する。
-    uint32_t typing_us = 0, typing_px = 0;
+    uint32_t typing_us = 0, typing_px = 0, typing_pad = 0;
     for (int i = 0; i < 20; ++i) {
         term->write("x");
         render_term();
         typing_us += renderer->last_render_us();
         typing_px += renderer->last_pixels();
+        typing_pad += pad_overlay_us();
     }
     term->write("\r\n");
     render_term();
 
-    std::printf("full screen: %u us (%u px)\n", (unsigned)full_us, (unsigned)full_px);
-    // PAD は端末を描くたびに重ね直すので、その分も出す（段が PAD のときだけ意味がある）。
-    if (keyboard && keyboard->mode() == KeyboardUi::Mode::kPad) {
-        std::printf("pad overlay: %u us\n", (unsigned)keyboard->last_overlay_us());
-    }
-    std::printf("20 keystrokes: %u us total, %u us each (%u px each)\n", (unsigned)typing_us,
-                (unsigned)(typing_us / 20), (unsigned)(typing_px / 20));
+    std::printf("full screen: %u us (%u px) + pad %u us = %u us\n", (unsigned)full_us,
+                (unsigned)full_px, (unsigned)full_pad, (unsigned)(full_us + full_pad));
+    std::printf("20 keystrokes: %u us each (%u px each) + pad %u us each = %u us each\n",
+                (unsigned)(typing_us / 20), (unsigned)(typing_px / 20),
+                (unsigned)(typing_pad / 20), (unsigned)((typing_us + typing_pad) / 20));
     return 0;
 }
 
@@ -1856,6 +1866,15 @@ void set_keyboard_visible(bool show)
     set_keyboard_mode(show ? s_kbd_face : KeyboardUi::Mode::kOff);
 }
 
+// 対話ログインの QR は端末領域を塗り潰す (#59)。帯を持つ段 (ABC / かな) は
+// `keyboard->height()` の分だけ避けてもらえるが、**PAD は高さ 0 なので QR に
+// 覆われる**。見えていないのに当たり判定だけ生きていると、右下のタップが
+// `Esc`（＝承認待ちの中止）や `^C` を送ることになる。
+bool pad_hidden_by_qr()
+{
+    return s_auth_qr_active && keyboard && keyboard->mode() == KeyboardUi::Mode::kPad;
+}
+
 void touch_down_at(int x, int y)
 {
     if (y < kStatusTapH) {
@@ -1875,7 +1894,7 @@ void touch_down_at(int x, int y)
     } else if (menu->visible()) {
         // メニュー表示中はキーボードを隠しているので、ここで全部食う。
         if (menu->touch_down(x, y)) menu->draw();
-    } else if (!keyboard->touch_down(x, y)) {
+    } else if (pad_hidden_by_qr() || !keyboard->touch_down(x, y)) {
         // キーボード外 = 端末領域。縦スワイプでスクロールバックを見る。
         s_swipe_start_y      = y;
         s_swipe_start_offset = term->view_offset();
