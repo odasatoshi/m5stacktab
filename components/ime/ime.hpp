@@ -13,8 +13,9 @@
 
 namespace ime {
 
+// **英数の直接入力はここには無い。** 画面キーボードに ASCII 面ができたので (#65)、
+// かな面の中で変換を止める段は要らなくなった（`abc` キーは ASCII 面へ切り替える）。
 enum class Mode {
-    kDirect,    // 英数直接入力（変換しない）
     kKana,      // かな入力中（未変換）
     kSelect,    // 候補選択中
 };
@@ -25,7 +26,6 @@ public:
     void set_dict(const SkkDict* dict) { dict_ = dict; }
 
     Mode mode() const { return mode_; }
-    void set_direct(bool direct);
 
     // --- 入力 ---
     // ローマ字 1 文字。確定した文字列が返る（通常は空）。

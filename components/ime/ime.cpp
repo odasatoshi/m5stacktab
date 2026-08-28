@@ -4,19 +4,8 @@
 
 namespace ime {
 
-void Ime::set_direct(bool direct)
-{
-    mode_ = direct ? Mode::kDirect : Mode::kKana;
-    romaji_.clear();
-    kana_.clear();
-    candidates_.clear();
-    cand_index_ = 0;
-}
-
 std::string Ime::input_char(char c)
 {
-    if (mode_ == Mode::kDirect) return std::string(1, c);
-
     // 候選択中に文字が来たら、今の候補を確定してから続ける（一般的な IME の挙動）。
     std::string out;
     if (mode_ == Mode::kSelect) out = commit();
@@ -27,7 +16,6 @@ std::string Ime::input_char(char c)
 
 std::string Ime::input_kana(const std::string& kana)
 {
-    if (mode_ == Mode::kDirect) return kana;
     std::string out;
     if (mode_ == Mode::kSelect) out = commit();
     // フリック入力はローマ字を経由しないので、未確定のローマ字があれば先に吐き出す。
@@ -141,7 +129,6 @@ bool Ime::modify_last(Modifier m)
 
 void Ime::convert()
 {
-    if (mode_ == Mode::kDirect) return;
     if (mode_ == Mode::kSelect) {
         next_candidate();
         return;
