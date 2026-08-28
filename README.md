@@ -83,6 +83,7 @@ USB Type-C のシリアルコンソール（`screen /dev/cu.usbmodem101 115200`�
 | `wg <tunnel-ip> [pubkey] [host:port]` | WireGuard トンネルの netif |
 | `wg stat` / `wg disco` / `wg down` | 統計・DISCO 状態・停止 |
 | `ts <host> <authkey> [port] [capver]` | Tailscale / Headscale の制御プレーンに接続 |
+| `ts-login <host> [port] [capver]` | authkey 無しで参加する（AuthURL を QR で出す） |
 
 ## WiFi の接続先
 
@@ -103,6 +104,24 @@ USB Type-C のシリアルコンソール（`screen /dev/cu.usbmodem101 115200`�
   SD は抜けば誰でも読めるのでパスワードの置き場として弱い
 - 起動時は**前回つながったもの**に繋ぐ。繋がらない場所へ移ったら一覧から選ぶ
   （総当たりはしない）
+
+## Tailscale に対話ログインで参加する
+
+`ts-login <host>` は authkey を使わずに参加する。制御プレーンが返す `AuthURL` を
+**画面に QR で出して、承認されるまで待つ**。
+
+```
+ts-login 192.168.0.10 8080
+```
+
+- **端末は URL を見せて待つだけ。** Google なり GitHub なりの認証は、人間が手元の
+  スマホ／PC のブラウザで済ませる。**端末に OAuth クライアントも TLS の証明書検証も要らない**
+- URL を画面から手で打つのは無理なので QR にする（読めなかったとき用に URL も併記する）
+- 承認されるまで 3 秒おきに register を投げ直す。**HTTP/2 のストリーム id は増える奇数**
+  でなければならないので、投げ直すたびに新しい id を使う（固定の 1 / 3 だと 2 回目が
+  protocol error になる）
+- **Esc で中止**できる。中止しないと最長 5 分投げ続ける（`kAuthTimeoutSec`。10 分は登録後の long-poll 側の `kMapTimeoutSec` で、別の持ち時間）
+- Headscale でも同じ経路が使える（`headscale nodes register --key ...` で承認する）
 
 ## 接続先（SSH / VPN）の設定
 

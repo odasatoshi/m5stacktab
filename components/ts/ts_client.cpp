@@ -1,8 +1,9 @@
 #include <cstdint>
 #include "ts_client.hpp"
 
-#include <cstdio>
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 
 #include <cerrno>
@@ -22,8 +23,16 @@ namespace ts {
 namespace {
 
 // HTTP/2 のストリーム ID はクライアント側は奇数。
-constexpr uint32_t kStreamRegister = 1;
-constexpr uint32_t kStreamMap      = 3;
+constexpr uint32_t kStreamRegister = 1;  // 最初の register。以後は +2 ずつ増やす
+// 対話ログインで承認を待つ間、register を投げ直す間隔（秒）。
+// **人間がスマホを取り出して認証するまで分単位かかる**ので、詰めても意味がない。
+constexpr int      kAuthPollSec    = 3;
+// 登録が通るまでの持ち時間。authkey があれば数秒で終わる。
+constexpr int      kRegisterTimeoutSec = 60;
+// 対話ログインで人間の承認を待つ持ち時間。**スマホを取り出して認証するまで分単位**。
+constexpr int      kAuthTimeoutSec     = 300;
+// netmap の long-poll を保持する時間。DISCO の往復はこのストリームが開いている間に起きる。
+constexpr int      kMapTimeoutSec      = 600;
 
 int connect_tcp(const char* host, uint16_t port, int timeout_sec)
 {
@@ -152,6 +161,12 @@ void Client::set_domain(std::string d)
 {
     std::lock_guard<std::mutex> g(mu_);
     st_.domain = std::move(d);
+}
+
+void Client::set_auth_url(std::string u)
+{
+    std::lock_guard<std::mutex> g(mu_);
+    st_.auth_url = std::move(u);
 }
 
 void Client::reset_status()
@@ -382,7 +397,27 @@ bool Client::run_once()
     std::string          body_register;
     std::vector<uint8_t> map_stream;
     bool                 sent_register = false, sent_map = false;
-    bool                 register_done = false;   // stream 1 に END_STREAM が来たか
+    bool                 register_done = false;   // register の stream に END_STREAM が来たか
+    // **HTTP/2 のストリーム id は増える奇数**でなければならない。対話ログイン (#59) では
+    // register を何度も投げ直すので、固定の 1 / 3 では 2 回目が protocol error になる。
+    uint32_t             next_sid = kStreamRegister;
+    uint32_t             reg_sid  = 0;
+    uint32_t             map_sid  = 0;
+    auto                 take_sid = [&]() { const uint32_t s = next_sid; next_sid += 2; return s; };
+    // 対話ログインで待っている間の状態。
+    std::string          shown_auth_url;
+    // AuthURL を最初に出した時刻。承認待ちの持ち時間はここから数える。
+    int                  auth_started_s = 0;
+    // **ループ回数を時計に使わない。** pump() はフレームが届くと即 return する
+    // （サーバの PING や keepalive で起きる）ので、回数は経過時間と比例しない。
+    auto now_s = [] {
+        return static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count());
+    };
+    const int start_s      = now_s();
+    int       register_at  = 0;              // これ以降に register を投げ直す（秒）
+    int       deadline_s   = start_s + kRegisterTimeoutSec;
 
     auto handle_frames = [&]() -> bool {
         size_t off = 0;
@@ -408,7 +443,7 @@ bool Client::run_once()
                     }
                     break;
                 case H2Type::kData: {
-                    if (f.stream_id == kStreamRegister) {
+                    if (f.stream_id == reg_sid) {
                         body_register.append(reinterpret_cast<const char*>(f.payload),
                                              f.payload_len);
                         if (f.flags & kFlagEndStream) register_done = true;
@@ -416,7 +451,7 @@ bool Client::run_once()
                             set_error("register response too large");
                             return false;
                         }
-                    } else if (f.stream_id == kStreamMap) {
+                    } else if (f.stream_id == map_sid) {
                         map_stream.insert(map_stream.end(), f.payload, f.payload + f.payload_len);
                         if (map_stream.size() > kMaxBuffered) {
                             set_error("netmap buffer limit exceeded");
@@ -442,7 +477,7 @@ bool Client::run_once()
                         set_error("control plane returned a non-200 status");
                         return false;
                     }
-                    if ((f.flags & kFlagEndStream) && f.stream_id == kStreamRegister) {
+                    if ((f.flags & kFlagEndStream) && f.stream_id == reg_sid) {
                         register_done = true;
                     }
                     break;
@@ -463,7 +498,10 @@ bool Client::run_once()
     };
 
     st_.state = ClientStatus::State::kRegistering;
-    for (int i = 0; i < 600 && !stop_; ++i) {
+    // **登録の待ちと map の long-poll で持ち時間を分ける。** 一緒にすると、
+    // 人間が 5 分かけて承認したときに long-poll へ 5 分しか残らず、
+    // 参加した直後にトンネルが黙って落ちる。
+    while (!stop_ && now_s() < deadline_s) {
         if (!pump(1000)) {
             if (st_.error.empty()) set_error("connection closed");
             st_.state = ClientStatus::State::kFailed;
@@ -476,7 +514,8 @@ bool Client::run_once()
         }
 
         // SETTINGS をやり取りしたら register を送る。
-        if (!sent_register) {
+        // 対話ログイン中は register_after 秒だけ空けてから投げ直す。
+        if (!sent_register && now_s() >= register_at) {
             RegisterParams rp;
             rp.capability_version = cfg_.capability_version;
             rp.node_key           = key_to_string("nodekey:", node_pub_);
@@ -484,7 +523,8 @@ bool Client::run_once()
             rp.hostname           = cfg_.hostname;
             const std::string body = build_register_request(rp);
             std::vector<uint8_t> buf(body.size() + 1024);
-            const size_t n = h2_build_post(buf.data(), buf.size(), kStreamRegister,
+            reg_sid        = take_sid();
+            const size_t n = h2_build_post(buf.data(), buf.size(), reg_sid,
                                            cfg_.host.c_str(), "/machine/register",
                                            reinterpret_cast<const uint8_t*>(body.data()),
                                            body.size());
@@ -507,11 +547,48 @@ bool Client::run_once()
                 return false;
             }
             if (!rr.auth_url.empty()) {
-                // auth key が無い / 無効なとき。対話ログインは実装しない。
-                set_error("interactive login required: " + rr.auth_url);
-                st_.state = ClientStatus::State::kFailed;
-                return false;
+                // auth key が無い / 無効なとき (#59)。
+                if (!cfg_.interactive) {
+                    set_error("interactive login required: " + rr.auth_url);
+                    st_.state = ClientStatus::State::kFailed;
+                    return false;
+                }
+                // **端末は URL を見せて待つだけ。** 認証は人間が手元のブラウザで
+                // 済ませる（Google なり GitHub なり）ので、ここに OAuth は要らない。
+                // **最初の 1 本だけを見せ続ける。** Headscale は register を投げ直す
+                // たびに別の AuthURL を発行するので、届くたびに差し替えると
+                // QR が 3 秒ごとに描き変わり（スキャン中に別物になる）、UI 側は
+                // 出し直しのたびにメニューを畳む（実機で確認: 承認待ちの間
+                // メニューが開けない）。古い URL も承認に使えることは実機で確認済み。
+                // ponytail: 承認待ちの上限 (kAuthTimeoutSec) の間に制御プレーンが
+                // URL を失効させたら、死んだ QR を出し続けることになる。実際に
+                // 失効を踏んだら、新しい URL に差し替える条件を足す。
+                if (shown_auth_url.empty()) {
+                    shown_auth_url = rr.auth_url;
+                    // **人間の持ち時間は URL を出した時点から数える。**
+                    // run_once() の開始から数えると、接続・ハンドシェイク・初回
+                    // register の時間が 5 分に食い込む（実測: 4.5 分で承認する
+                    // テストが残り 1.4 秒で通っていた）。
+                    auth_started_s = now_s();
+                    set_auth_url(rr.auth_url);
+                    if (on_auth_url_) on_auth_url_(rr.auth_url);
+                }
+                st_.state = ClientStatus::State::kAuthPending;
+                // 承認されるまで投げ直す。**新しいストリームで**投げること
+                // （take_sid が次の奇数を返す）。
+                body_register.clear();
+                register_done = false;
+                sent_register = false;
+                register_at   = now_s() + kAuthPollSec;
+                // 承認を待つ間は別の持ち時間で数える。
+                deadline_s = auth_started_s + kAuthTimeoutSec;
+                continue;
             }
+            // 通ったら URL は消す。残すと承認後も QR が出たままになる。
+            if (!shown_auth_url.empty()) set_auth_url("");
+            // **ここから long-poll の持ち時間を数え直す。** 承認に何分かかっても
+            // netmap を受け取る時間が削られないようにする。
+            deadline_s = now_s() + kMapTimeoutSec;
             if (!rr.machine_authorized) {
                 set_error("machine not authorized");
                 st_.state = ClientStatus::State::kFailed;
@@ -530,7 +607,8 @@ bool Client::run_once()
             mp.stream             = true;
             const std::string body = build_map_request(mp);
             std::vector<uint8_t> buf(body.size() + 1024);
-            const size_t n = h2_build_post(buf.data(), buf.size(), kStreamMap, cfg_.host.c_str(),
+            map_sid        = take_sid();
+            const size_t n = h2_build_post(buf.data(), buf.size(), map_sid, cfg_.host.c_str(),
                                            "/machine/map",
                                            reinterpret_cast<const uint8_t*>(body.data()),
                                            body.size());
@@ -574,7 +652,17 @@ bool Client::run_once()
     }
 
     set_error(stop_ ? "stopped" : "timed out");
-    return st_.state == ClientStatus::State::kMapping;
+    // **承認待ちのまま抜けない。** kAuthPending を残すと ts-status が承認待ちだと
+    // 嘘をつき、死んだ auth_url を出し続ける。UI 側もメニューを閉じるたびに
+    // 「まだ承認待ちか」を state で見ているので、死んだ QR が復活する
+    // (main.cpp の set_menu_visible)。
+    const bool ok = (st_.state == ClientStatus::State::kMapping);
+    if (!ok) {
+        set_auth_url("");
+        std::lock_guard<std::mutex> g(mu_);
+        st_.state = ClientStatus::State::kFailed;
+    }
+    return ok;
 }
 
 }  // namespace ts

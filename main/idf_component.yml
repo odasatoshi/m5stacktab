@@ -8,3 +8,6 @@ dependencies:
   # SSH クライアント。libssh2 1.11.1 を mbedTLS で使う ESP-IDF ポート。
   # Registry の wolfssh / david-cermak/libssh はサーバ向けなので使わない。
   skuodi/libssh2_esp: "^1.1.0"
+  # Tailscale の対話ログイン (#59) で AuthURL を QR にする。
+  # 自前で書かない（生成多項式とマスク選択を持つ必要がある）。依存なしの小さな実装。
+  espressif/qrcode: "^0.2.0"
