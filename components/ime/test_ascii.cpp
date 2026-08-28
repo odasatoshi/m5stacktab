@@ -1,8 +1,7 @@
 // 画面キーボードの ASCII 面のホストテスト。
 //
-//   c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=undefined -I main -I components/ime \
-//       -o /tmp/test_ascii components/ime/test_ascii.cpp components/ime/ascii.cpp \
-//       components/ime/flick.cpp && /tmp/test_ascii
+//   c++ -std=c++17 -Wall -Wextra -Werror -O1 -I main -I components/ime -o /tmp/test_ascii
+//       components/ime/test_ascii.cpp components/ime/ascii.cpp components/ime/flick.cpp
 //
 // **一番効くのは「表のキー名が端末に届くか」**。名前を打ち間違えても画面は
 // 正しく出るので、実機では「そのキーだけ黙って効かない」という形でしか出ない。
