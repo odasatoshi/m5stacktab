@@ -253,6 +253,30 @@ c++ -std=c++17 -Wall -Wextra -Werror -O1 -I$M3/include -I components/wg \
   接続は専用のワーカタスク (`connect`, 32KB) に載せる — 直接呼ぶと
   「メニューから VPN を選ぶと落ちる」という形でしか出ない
 
+## Tailscale の対話ログイン (#59)
+
+- **端末側に OAuth は要らない。** 制御プレーンが `AuthURL` を返し、人間が手元のブラウザで
+  認証する。端末は URL を QR で見せて、承認されるまで register を投げ直すだけ
+- **HTTP/2 のストリーム id は増える奇数**。register を投げ直すのに固定の 1 を使うと
+  2 回目が protocol error になる。`take_sid()` で連番にしてあり、**map のストリームも
+  同じ連番から取る**（register を N 回投げた後に map が来るので、3 に決め打ちできない）
+- QR は `espressif/qrcode` を使う。自前で書かない（生成多項式とマスク選択が要る）。
+  **静穏帯 (quiet zone) を 4 モジュール取る**。無いと読めない端末がある
+- **Headscale は register を投げ直すたびに別の `AuthURL` を発行する**（SaaS と違う）。
+  「URL が変わったら UI に通知する」と書くと 3 秒ごとに発火し、**QR がスキャン中に
+  描き変わり、`show_auth_qr()` がメニューを畳むので承認待ちの間メニューが開けない**
+  （`menu show` は「menu shown」と返すのに画面は QR のまま、という形でしか出ない）。
+  **承認待ちの間は最初の 1 本を保持する**。古い URL も承認に使える（実機で 4.5 分後に確認）
+- **QR が読めることは目視で確かめない。** `screencap 1 <x> <y> <w> <h>` で等倍に吸って
+  デコーダに通す（macOS なら CoreImage で 15 行。追加インストール不要）。
+  ログの URL と一致するかまで見る
+- **`ts-status` の `state` は数字だけで読まない。** `ClientStatus::State` に値を挿すと
+  過去のログの `state=5` が黙って別の意味になる（`kAuthPending` を挿して実際に起きた）。
+  `ts::state_name()` が名前も出す
+- **QR を畳む処理を `TermGuard` の中に閉じ込めない。** ロックは 2 秒でタイムアウトするので、
+  取れなかった一回で `s_auth_qr_active` が true のまま残り、以後 `render_term()` が
+  永久に早期 return する。**ロックが要るのは再描画だけ**
+
 ## Tailscale / Headscale の開発環境
 
 制御プレーンは **ローカルの Headscale** を相手に開発する。SaaS だと「なぜ弾かれたか」が
@@ -267,10 +291,22 @@ docker exec headscale-tab5 headscale preauthkeys create --user 1 --reusable --ex
 ```
 
 - `dns.override_local_dns: false` と `dns.nameservers.global` を設定しないと起動しない
-- **Rancher Desktop のポートフォワードは localhost 限定**なので、実機から届かない。
-  `tools/` には置いていないが `0.0.0.0` で待って `127.0.0.1` に中継するだけの
-  TCP プロキシを挟むと通る
+- **DERP のエントリが最低 1 つ要る**。無いと `initial DERPMap is empty` で即終了する。
+  外に出たくないので `derp.server.enabled: true`（埋め込み DERP）にしておく
+- **v0.29.3 は capver 113 以上しか受け付けない**（`/key?v=<capver>` が
+  `unsupported client version` を返す）。`ts-login` の既定は 131 なので素通りする
+- **config と DB は消えない場所に置く。** scratchpad に置くとセッションをまたいで
+  掃除され、**「起動はするが users も nodes も消えている」**という形で出る
+- **ポートフォワードが localhost 限定かは毎回確かめる。** Rancher Desktop でも
+  `*:8080` で待つことがある（`lsof -nP -iTCP:8080 -sTCP:LISTEN` で見る）。
+  LAN の IP に curl が通るなら中継プロキシは要らない
 - 実機・ホストの IP は変わるので、接続先は毎回確認する
+- **素の Headscale では「スマホで QR を読んでブラウザで承認」を検証できない。**
+  `/register/...` が返すのは承認画面ではなく「サーバで `headscale auth register
+  --auth-id ... --user ...` を実行しろ」という案内ページで、**OIDC を設定しない限り
+  人間がブラウザで完了する経路が無い**。URL が `http://` なのでスマホ側が弾く問題もある
+  （URL を決めるのは制御プレーンなので端末側に直す場所は無い）。
+  この経路は SaaS か OIDC 付き Headscale でしか通せない
 
 ## ホストテストの依存
 
