@@ -6,13 +6,14 @@
 #include <cstdio>
 #include <cstring>
 
-#include <cerrno>
-#include <errno.h>
-#include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
-#include <unistd.h>
+
+#include "esp_crt_bundle.h"
+#include "esp_transport.h"
+#include "esp_transport_ssl.h"
+#include "esp_transport_tcp.h"
 
 #include "h2.hpp"
 #include "noise.hpp"
@@ -34,51 +35,75 @@ constexpr int      kAuthTimeoutSec     = 300;
 // netmap の long-poll を保持する時間。DISCO の往復はこのストリームが開いている間に起きる。
 constexpr int      kMapTimeoutSec      = 600;
 
-int connect_tcp(const char* host, uint16_t port, int timeout_sec)
-{
-    char port_str[8];
-    std::snprintf(port_str, sizeof(port_str), "%u", port);
+// 制御プレーンとの I/O。**平文と TLS を同じ型で扱う** (#68)。
+// esp_transport は tcp と ssl が同じハンドルを返すので、切り替えは init だけで済む。
+//
+// **戻り値の規約が recv と違う。ここで吸収せず、そのまま呼び出し側に見せる:**
+//   0   = タイムアウト（recv なら -1/EAGAIN）
+//   -1  = 相手が閉じた FIN（recv なら 0）
+//   <-1 = その他のエラー
+// 取り違えると long-poll が keepalive の隙間で毎回落ちるので、混ぜないこと。
+// **esp_transport は getaddrinfo の先頭 1 件しか試さない**（旧 connect_tcp は
+// ai_next を辿っていた）。この構成では実害が無い: `CONFIG_LWIP_DNS_MAX_HOST_IP=1` なので
+// lwIP はそもそも 1 件しか返さず（旧ループは既に死にコードだった）、AF_UNSPEC の既定は
+// `LWIP_DNS_ADDRTYPE_IPV4_IPV6` = 「IPv4 を先に引き、失敗したときだけ IPv6」。
+// ponytail: 複数アドレスへのフォールバックが要るようになったら、
+// LWIP_DNS_MAX_HOST_IP を増やしたうえで esp-tls を直に使う（addr_family を渡せる）。
+constexpr int kConnectTimeoutMs = 15000;  // TLS のハンドシェイクも含む
+constexpr int kReadTimeoutMs    = 65000;  // long-poll の keepalive より長く
+constexpr int kWriteTimeoutMs   = 15000;
 
-    addrinfo hints{};
-    hints.ai_family   = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    addrinfo* res     = nullptr;
-    if (getaddrinfo(host, port_str, &hints, &res) != 0 || !res) return -1;
+struct Transport {
+    esp_transport_handle_t h = nullptr;
 
-    // 候補を順に試す。最初の 1 件で諦めると、AAAA が先に返る環境で
-    // IPv6 の経路が無いだけで失敗してしまう。
-    int fd = -1;
-    for (addrinfo* ai = res; ai; ai = ai->ai_next) {
-        fd = socket(ai->ai_family, ai->ai_socktype, 0);
-        if (fd < 0) continue;
-        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
-        close(fd);
-        fd = -1;
+    explicit Transport(bool tls)
+    {
+        h = tls ? esp_transport_ssl_init() : esp_transport_tcp_init();
+        // ルート CA は ESP-IDF 同梱のバンドルを使う（自前で焼かない）。
+        if (h && tls) esp_transport_ssl_crt_bundle_attach(h, esp_crt_bundle_attach);
     }
-    freeaddrinfo(res);
-    if (fd >= 0) {
-        int one = 1;
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-        timeval tv{timeout_sec, 0};
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        // 送信側にも期限を入れる。入れないと相手が読まないときに永久にブロックする。
-        timeval snd{15, 0};
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd, sizeof(snd));
+    ~Transport()
+    {
+        if (!h) return;
+        esp_transport_close(h);
+        esp_transport_destroy(h);
     }
-    return fd;
-}
+    Transport(const Transport&)            = delete;
+    Transport& operator=(const Transport&) = delete;
 
-bool send_all(int fd, const void* p, size_t len)
-{
-    const uint8_t* b = static_cast<const uint8_t*>(p);
-    while (len > 0) {
-        const ssize_t n = send(fd, b, len, 0);
-        if (n <= 0) return false;
-        b += n;
-        len -= static_cast<size_t>(n);
+    bool ok() const { return h != nullptr; }
+
+    bool connect(const char* host, uint16_t port)
+    {
+        if (!h || esp_transport_connect(h, host, port, kConnectTimeoutMs) != 0) return false;
+        // **Nagle を切る。** ts2021 は小さな書き込みの連続（HTTP/2 preface、seal_send の
+        // フレームごと、WINDOW_UPDATE / PING ACK）なので、相手の遅延 ACK と噛むと
+        // やり取りごとに ~40ms 乗る。esp-tls は RCVTIMEO/SNDTIMEO しか設定しない。
+        const int sock = esp_transport_get_socket(h);
+        if (sock >= 0) {
+            int one = 1;
+            setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        }
+        return true;
     }
-    return true;
-}
+    int read(void* p, size_t n, int timeout_ms)
+    {
+        return esp_transport_read(h, static_cast<char*>(p), static_cast<int>(n), timeout_ms);
+    }
+    // 部分書き込みを畳む。esp_transport_write は書けた分だけ返す。
+    bool write_all(const void* p, size_t n)
+    {
+        const char* q    = static_cast<const char*>(p);
+        size_t      left = n;
+        while (left > 0) {
+            const int w = esp_transport_write(h, q, static_cast<int>(left), kWriteTimeoutMs);
+            if (w <= 0) return false;
+            q += w;
+            left -= static_cast<size_t>(w);
+        }
+        return true;
+    }
+};
 
 }  // namespace
 
@@ -104,28 +129,31 @@ bool Client::set_keys(const uint8_t machine_priv[32], const uint8_t node_priv[32
 bool Client::fetch_server_key(uint8_t out[32])
 {
     st_.state = ClientStatus::State::kFetchingKey;
-    const int fd = connect_tcp(cfg_.host.c_str(), cfg_.port, 5);
-    if (fd < 0) {
-        set_error("cannot connect for /key");
+    Transport tr(cfg_.tls);
+    if (!tr.connect(cfg_.host.c_str(), cfg_.port)) {
+        set_error(cfg_.tls ? "cannot connect for /key (TLS)" : "cannot connect for /key");
         return false;
     }
     char      req[256];
+    // **Host には authority を入れる**（既定以外のポートと IPv6 のブラケット）。
+    const std::string authority = http_authority(cfg_.host, cfg_.port, cfg_.tls);
     const int n = std::snprintf(req, sizeof(req),
                                 "GET /key?v=%u HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
-                                cfg_.capability_version, cfg_.host.c_str());
-    bool ok = (n > 0) && send_all(fd, req, static_cast<size_t>(n));
+                                cfg_.capability_version, authority.c_str());
+    bool ok = (n > 0) && tr.write_all(req, static_cast<size_t>(n));
 
     std::string resp;
     if (ok) {
         char buf[512];
         for (;;) {
-            const ssize_t r = recv(fd, buf, sizeof(buf), 0);
+            const int r = tr.read(buf, sizeof(buf), kReadTimeoutMs);
+            // ここは 0（タイムアウト）も終端扱いでよい。応答は小さく、
+            // Connection: close なので相手が閉じるまで読み切る。
             if (r <= 0) break;
             resp.append(buf, static_cast<size_t>(r));
             if (resp.size() > 8192) break;
         }
     }
-    close(fd);
 
     std::string key_str;
     if (!json_find_string(resp, "publicKey", &key_str)) {
@@ -201,22 +229,18 @@ bool Client::run_once()
     }
 
     st_.state    = ClientStatus::State::kConnecting;
-    const int fd = connect_tcp(cfg_.host.c_str(), cfg_.port, 65);  // long-poll の keepalive より長く
-    if (fd < 0) {
-        set_error("connect failed");
+    Transport tr(cfg_.tls);
+    if (!tr.connect(cfg_.host.c_str(), cfg_.port)) {
+        set_error(cfg_.tls ? "connect failed (TLS handshake or DNS)" : "connect failed");
         st_.state = ClientStatus::State::kFailed;
         return false;
     }
 
-    struct Closer {
-        int fd;
-        ~Closer() { if (fd >= 0) close(fd); }
-    } closer{fd};
-
     char         req[1024];
-    const size_t req_len = build_upgrade_request(req, sizeof(req), cfg_.host.c_str(), msg1,
-                                                 sizeof(msg1));
-    if (req_len == 0 || !send_all(fd, req, req_len)) {
+    const std::string authority = http_authority(cfg_.host, cfg_.port, cfg_.tls);
+    const size_t      req_len =
+        build_upgrade_request(req, sizeof(req), authority.c_str(), msg1, sizeof(msg1));
+    if (req_len == 0 || !tr.write_all(req, req_len)) {
         set_error("sending upgrade request failed");
         st_.state = ClientStatus::State::kFailed;
         return false;
@@ -227,7 +251,7 @@ bool Client::run_once()
     UpgradeResult        up;
     for (;;) {
         uint8_t       buf[2048];
-        const ssize_t r = recv(fd, buf, sizeof(buf), 0);
+        const int r = tr.read(buf, sizeof(buf), kReadTimeoutMs);
         if (r <= 0) {
             set_error("closed while reading upgrade response");
             st_.state = ClientStatus::State::kFailed;
@@ -259,7 +283,7 @@ bool Client::run_once()
             const size_t elen = static_cast<size_t>((in[1] << 8) | in[2]);
             while (in.size() < 3 + elen) {
                 uint8_t       buf[512];
-                const ssize_t r = recv(fd, buf, sizeof(buf), 0);
+                const int r = tr.read(buf, sizeof(buf), kReadTimeoutMs);
                 if (r <= 0) break;
                 in.insert(in.end(), buf, buf + r);
             }
@@ -271,7 +295,7 @@ bool Client::run_once()
         }
         if (in.size() >= kResponseLen) break;
         uint8_t       buf[2048];
-        const ssize_t r = recv(fd, buf, sizeof(buf), 0);
+        const int r = tr.read(buf, sizeof(buf), kReadTimeoutMs);
         if (r <= 0) {
             set_error("closed while reading noise response");
             st_.state = ClientStatus::State::kFailed;
@@ -313,23 +337,19 @@ bool Client::run_once()
         }
         if (progressed) return true;
 
-        timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        uint8_t       buf[2048];
-        const ssize_t r = recv(fd, buf, sizeof(buf), 0);
-        if (r == 0) {
-            set_error("connection closed by peer");
+        uint8_t   buf[2048];
+        const int r = tr.read(buf, sizeof(buf), timeout_ms);
+        // **recv と規約が逆。0 は EOF ではなくタイムアウト。**
+        // ここを取り違えると、long-poll が keepalive の隙間で毎回落ちる。
+        if (r < 0) {
+            // タイムアウト以外で回し続けると、死んだ接続で CPU を焼いたうえに
+            // 「稼働中」と誤認する。
+            set_error(r == ERR_TCP_TRANSPORT_CONNECTION_CLOSED_BY_FIN
+                          ? "connection closed by peer"
+                          : "read failed");
             return false;
         }
-        if (r < 0) {
-            // タイムアウトだけを続行扱いにする。他のエラーで回し続けると
-            // 死んだソケットで CPU を焼き、しかも「稼働中」と誤認する。
-            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-                set_error(std::string("recv failed: ") + std::strerror(errno));
-                return false;
-            }
-            return true;
-        }
+        if (r == 0) return true;  // タイムアウトだけを続行扱いにする
         in.insert(in.end(), buf, buf + r);
         if (in.size() > kMaxBuffered || plain.size() > kMaxBuffered) {
             set_error("receive buffer limit exceeded");
@@ -355,7 +375,7 @@ bool Client::run_once()
             const size_t chunk = (len < kMaxPlaintextLen) ? len : kMaxPlaintextLen;
             uint8_t      wire[kMaxMessageSize];
             const size_t n = rec.seal(wire, sizeof(wire), p, chunk);
-            if (n == 0 || !send_all(fd, wire, n)) return false;
+            if (n == 0 || !tr.write_all(wire, n)) return false;
             p += chunk;
             len -= chunk;
         }

@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -298,6 +299,121 @@ void test_review_regressions()
     }
 }
 
+
+// 接続先 URL のパース (#68)。**TLS にするかをここだけで決める**ので、
+// 誤読は「暗号化されているつもりで平文」に直結する。
+void test_control_url()
+{
+    auto parse = [](const char* in, uint16_t arg_port) {
+        ts::ControlEndpoint e;
+        const bool          ok = ts::parse_control_url(in, arg_port, &e);
+        return std::make_pair(ok, e);
+    };
+
+    // スキーム無し = 現状維持（平文 80）。既存のプロファイルが無変更で動くこと。
+    {
+        auto [ok, e] = parse("headscale.example.com", 0);
+        CHECK(ok);
+        EXPECT(e.host, "headscale.example.com");
+        CHECK(e.port == 80);
+        CHECK(!e.tls);
+    }
+    // https は 443、http は 80
+    {
+        auto [ok, e] = parse("https://controlplane.tailscale.com", 0);
+        CHECK(ok);
+        EXPECT(e.host, "controlplane.tailscale.com");
+        CHECK(e.port == 443);
+        CHECK(e.tls);
+    }
+    {
+        auto [ok, e] = parse("http://192.168.0.101", 0);
+        CHECK(ok);
+        CHECK(e.port == 80);
+        CHECK(!e.tls);
+    }
+    // **443 以外の TLS が書けること。** これが案 A を落とした理由そのもの。
+    {
+        auto [ok, e] = parse("https://headscale.example.com:8443", 0);
+        CHECK(ok);
+        EXPECT(e.host, "headscale.example.com");
+        CHECK(e.port == 8443);
+        CHECK(e.tls);
+    }
+    // ポートの優先順位: URL > 引数 > スキームの既定
+    {
+        auto [ok, e] = parse("https://h:8443", 9999);
+        CHECK(ok);
+        CHECK(e.port == 8443);  // URL が勝つ
+    }
+    {
+        auto [ok, e] = parse("https://h", 9999);
+        CHECK(ok);
+        CHECK(e.port == 9999);  // URL に無ければ引数
+    }
+    {
+        auto [ok, e] = parse("https://h", 0);
+        CHECK(ok);
+        CHECK(e.port == 443);  // どちらも無ければスキームの既定
+    }
+    // スキーム無し + 引数 port = 今の `ts <host> <authkey> <port>` の形
+    {
+        auto [ok, e] = parse("192.168.0.101", 8080);
+        CHECK(ok);
+        CHECK(e.port == 8080);
+        CHECK(!e.tls);
+    }
+    // パス以降は捨てる（ブラウザからのコピペ）
+    {
+        auto [ok, e] = parse("https://h:8443/some/path", 0);
+        CHECK(ok);
+        EXPECT(e.host, "h");
+        CHECK(e.port == 8443);
+    }
+    {
+        auto [ok, e] = parse("https://h/", 0);
+        CHECK(ok);
+        EXPECT(e.host, "h");
+        CHECK(e.port == 443);
+    }
+    // IPv6 リテラル。**']' より後ろの ':' だけがポート区切り**
+    {
+        auto [ok, e] = parse("http://[::1]:8080", 0);
+        CHECK(ok);
+        EXPECT(e.host, "::1");
+        CHECK(e.port == 8080);
+    }
+    {
+        auto [ok, e] = parse("[fd7a:115c:a1e0::1]", 0);
+        CHECK(ok);
+        EXPECT(e.host, "fd7a:115c:a1e0::1");
+        CHECK(e.port == 80);
+    }
+    // **黙って誤読しない**もの
+    CHECK(!parse("::1", 0).first);              // 裸の IPv6 は曖昧
+    CHECK(!parse("h:", 0).first);               // ポートが空
+    CHECK(!parse("h:0", 0).first);              // 0 番
+    CHECK(!parse("h:70000", 0).first);          // 範囲外
+    CHECK(!parse("h:80x", 0).first);            // 数字でない
+    CHECK(!parse("", 0).first);                 // 空
+    CHECK(!parse("https://", 0).first);         // ホストが無い
+    CHECK(!parse("http:///path", 0).first);     // ホストが無い
+}
+
+// Host ヘッダの authority (#68)。ポート無しだと vhost 振り分けが別ホスト扱いになり、
+// ブラケット無しの IPv6 は不正なヘッダになる。
+void test_http_authority()
+{
+    EXPECT(ts::http_authority("h", 80, false), "h");           // http の既定は省く
+    EXPECT(ts::http_authority("h", 443, true), "h");           // https の既定も省く
+    EXPECT(ts::http_authority("h", 8443, true), "h:8443");     // 既定以外は付ける
+    EXPECT(ts::http_authority("h", 8080, false), "h:8080");
+    EXPECT(ts::http_authority("h", 443, false), "h:443");      // 平文の 443 は既定ではない
+    EXPECT(ts::http_authority("h", 80, true), "h:80");         // TLS の 80 も既定ではない
+    EXPECT(ts::http_authority("::1", 8080, false), "[::1]:8080");
+    EXPECT(ts::http_authority("fd7a:115c:a1e0::1", 80, false), "[fd7a:115c:a1e0::1]");
+    EXPECT(ts::http_authority("h", 0, true), "h");             // 0 = 未解決なら付けない
+}
 }  // namespace
 
 int main()
@@ -310,6 +426,8 @@ int main()
     test_map_request();
     test_json_extract();
     test_review_regressions();
+    test_control_url();
+    test_http_authority();
     std::printf("ok: %d checks passed\n", g_checks);
     return 0;
 }

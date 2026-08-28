@@ -199,6 +199,22 @@ void test_endpoint_must_be_literal()
     CHECK(has_warning(c, "IPv4"));
 }
 
+// port を書かない設定は 0（未指定）で通り、飛ばされないこと (#68)。
+// スキームから決めるので、ここで 80 を埋めてはいけない。
+void test_tailscale_port_unset_is_kept()
+{
+    auto c = prof::parse(R"({"version":1,"profiles":[
+        {"name":"ts","type":"tailscale","control":"https://controlplane.tailscale.com",
+         "authkey":"ts.key"}]})");
+    CHECK(c.profiles.size() == 1);
+    // **check() は abort せず続ける**ので、添字の前に必ず数を見る（見ないと
+    // 失敗時に空 vector を触って SIGSEGV になり、FAIL の行も出ないまま落ちる）。
+    if (c.profiles.size() == 1) {
+        CHECK(c.profiles[0].port == 0);
+        CHECK(c.profiles[0].control == "https://controlplane.tailscale.com");
+    }
+}
+
 void test_tailscale_port_range()
 {
     const prof::Config c = prof::parse(R"({"version":1,"profiles":[
@@ -347,6 +363,7 @@ int main()
     test_password_auth_still_checks_key();
     test_default_route_rejected();
     test_endpoint_must_be_literal();
+    test_tailscale_port_unset_is_kept();
     test_tailscale_port_range();
     test_via_is_reported_but_not_fatal();
     test_limits();

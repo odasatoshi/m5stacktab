@@ -7,7 +7,7 @@ M5Stack Tab5 (ESP32-P4) 用ファームウェア。SSH コンソール・VPN・�
 | 機能 | 状態 |
 |---|---|
 | **SSH コンソール** | 秘密鍵認証で実機接続まで動作。VT100 エミュレータは自作（ホストテスト 172 チェック） |
-| **VPN** | Tailscale の制御プロトコル (ts2021) と WireGuard データプレーンを実装。ローカル Headscale 相手に登録と netmap 取得を実証済み |
+| **VPN** | Tailscale の制御プロトコル (ts2021) と WireGuard データプレーンを実装。**本家 Tailscale (SaaS) に TLS で接続**して AuthURL を受け取るところまで、ローカル Headscale 相手には登録と netmap 取得まで実証済み |
 | **日本語入力** | SKK 辞書 17.5 万語をフラッシュから mmap して検索（実機 160〜272μs、RAM 消費ゼロ）。12 キーフリック入力 |
 
 詳細は [Issues](https://github.com/odasatoshi/m5stacktab/issues) を参照。
@@ -83,7 +83,7 @@ USB Type-C のシリアルコンソール（`screen /dev/cu.usbmodem101 115200`�
 | `wg <tunnel-ip> [pubkey] [host:port]` | WireGuard トンネルの netif |
 | `wg stat` / `wg disco` / `wg down` | 統計・DISCO 状態・停止 |
 | `ts <host> <authkey> [port] [capver]` | Tailscale / Headscale の制御プレーンに接続 |
-| `ts-login <host> [port] [capver]` | authkey 無しで参加する（AuthURL を QR で出す） |
+| `ts-login [host] [port] [capver]` | authkey 無しで参加する（AuthURL を QR で出す）。**引数なしで本家 Tailscale** |
 
 ## WiFi の接続先
 
@@ -107,15 +107,28 @@ USB Type-C のシリアルコンソール（`screen /dev/cu.usbmodem101 115200`�
 
 ## Tailscale に対話ログインで参加する
 
-`ts-login <host>` は authkey を使わずに参加する。制御プレーンが返す `AuthURL` を
+`ts-login` は authkey を使わずに参加する。制御プレーンが返す `AuthURL` を
 **画面に QR で出して、承認されるまで待つ**。
 
+接続先は **スキームで書く**。`https://` なら TLS、`http://` と スキーム無しは平文
+（スキーム無しは以前と同じ挙動なので、既存の設定はそのまま動く）。ポートは
+**URL の `:port` > 引数 > スキームの既定 (https=443 / http=80)** の順で決まる。
+
 ```
-ts-login 192.168.0.10 8080
+ts-login                             # 本家 Tailscale (https://controlplane.tailscale.com)
+ts-login http://192.168.0.10:8080    # ローカルの Headscale
+ts-login 192.168.0.10 8080           # 同上（従来の書き方）
 ```
 
+**本家は https でしか受け付けない**（平文は 302 で https へ飛ばされる）ので、
+SaaS を相手にするには TLS が要る。ルート CA は ESP-IDF 同梱の `esp_crt_bundle` を使う。
+
+本家の AuthURL は `https://login.tailscale.com/a/<コード>` なので、画面には
+**固定部とコードを分けて出す**。QR が読めなくてもコードだけ見て手で打てる。
+
 - **端末は URL を見せて待つだけ。** Google なり GitHub なりの認証は、人間が手元の
-  スマホ／PC のブラウザで済ませる。**端末に OAuth クライアントも TLS の証明書検証も要らない**
+  スマホ／PC のブラウザで済ませる。**端末に OAuth クライアントは要らない**
+  （制御プレーンへの接続そのものには TLS が要る。本家は平文を受けない）
 - URL を画面から手で打つのは無理なので QR にする（読めなかったとき用に URL も併記する）
 - 承認されるまで 3 秒おきに register を投げ直す。**HTTP/2 のストリーム id は増える奇数**
   でなければならないので、投げ直すたびに新しい id を使う（固定の 1 / 3 だと 2 回目が

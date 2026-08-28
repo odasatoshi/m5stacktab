@@ -775,7 +775,10 @@ int cmd_profiles(int argc, char** argv)
                 std::printf("%s -> %s", p.address.c_str(), p.peer.endpoint.c_str());
                 break;
             case prof::Type::kTailscale:
-                std::printf("%s:%u", p.control.c_str(), (unsigned)p.port);
+                // **port 0 は「書かれていない」**（スキームから決まる）ので出さない。
+                // 出すと `https://controlplane.tailscale.com:0` になり、壊れた設定に見える。
+                std::printf("%s", p.control.c_str());
+                if (p.port != 0) std::printf(":%u", (unsigned)p.port);
                 break;
         }
         std::printf("\n");
@@ -1333,6 +1336,9 @@ void ts_task(void* arg)
 // 対話ログイン (#59) の QR。定義はこの下（ts の状態表示の側）。
 void term_note(const char* color, const std::string& text);
 
+// 本家 Tailscale の制御プレーン。`ts-login` を引数なしで叩いたときの既定 (#68)。
+constexpr const char* kTailscaleSaas = "https://controlplane.tailscale.com";
+
 bool ts_start(const std::string& host, const std::string& authkey, uint16_t port, uint16_t capver,
               bool interactive = false)
 {
@@ -1342,6 +1348,17 @@ bool ts_start(const std::string& host, const std::string& authkey, uint16_t port
     // 差し替えることになる（use-after-free）。
     if (s_ts_task) {
         std::printf("already running (ts-status で状態、ts-stop で停止)\n");
+        return false;
+    }
+    // 接続先の文字列を分解する (#68)。**TLS にするかをここだけで決める**ので、
+    // `ts` / `ts-login` / メニュー (connect_vpn_profile) が同じ規則になる。
+    // **鍵を作る前に弾く。** 後ろに置くと、打ち間違えただけで machine / node / disco の
+    // 鍵を生成して NVS に書き、s_ts_keys_ready を立てたまま戻ることになる。
+    ts::ControlEndpoint endpoint;
+    if (!ts::parse_control_url(host, port, &endpoint)) {
+        std::printf("接続先が読めない: \"%s\"（例: https://controlplane.tailscale.com、"
+                    "http://192.168.0.101:8080）\n",
+                    host.c_str());
         return false;
     }
     // machine / node / disco の 3 つは別の鍵にする（役割ごとに分離する）。
@@ -1400,9 +1417,10 @@ bool ts_start(const std::string& host, const std::string& authkey, uint16_t port
 
     static ts::Client client;
     ts::ClientConfig  cfg;
-    cfg.host     = host;
+    cfg.host     = endpoint.host;
     cfg.auth_key = authkey;
-    cfg.port     = port;
+    cfg.port     = endpoint.port;
+    cfg.tls      = endpoint.tls;
     cfg.capability_version = capver;
     cfg.interactive = interactive;
     cfg.hostname = "m5stack-tab5";
@@ -1448,7 +1466,8 @@ bool ts_start(const std::string& host, const std::string& authkey, uint16_t port
     // 保持する（それが正しい動作で、DISCO の往復はこのストリームが開いている
     // 間に起きる）。コンソールタスクから呼ぶと 10 分間 REPL が死んで、
     // ストリームを開けたまま `wg disco` を見ることすらできない。
-    std::printf("connecting to %s:%u (capver %u) in background...\n", cfg.host.c_str(), cfg.port,
+    std::printf("connecting to %s://%s:%u (capver %u) in background...\n",
+                cfg.tls ? "https" : "http", cfg.host.c_str(), cfg.port,
                 cfg.capability_version);
     // 起動できてから公開する。先に入れると、鍵導出や xTaskCreate で失敗した後に
     // ts-status が「一度も動いていないのに finished」と表示する。
@@ -1471,8 +1490,10 @@ int cmd_ts(int argc, char** argv)
         std::printf("usage: ts <host> <authkey> [port] [capver]\n");
         return 1;
     }
+    // **port の既定は 0 = 未指定** (#68)。スキームから決まるので、ここでは埋めない
+    // （埋めると "https://h" が 80 に落ちる）。
     return ts_start(argv[1], argv[2],
-                    (argc > 3) ? static_cast<uint16_t>(atoi(argv[3])) : 80,
+                    (argc > 3) ? static_cast<uint16_t>(atoi(argv[3])) : 0,
                     (argc > 4) ? static_cast<uint16_t>(atoi(argv[4])) : 131)
                ? 0
                : 1;
@@ -1482,12 +1503,11 @@ int cmd_ts(int argc, char** argv)
 // 人間がブラウザで承認するまで register を投げ直す。
 int cmd_ts_login(int argc, char** argv)
 {
-    if (argc < 2) {
-        std::printf("usage: ts-login <host> [port] [capver]\n");
-        return 1;
-    }
-    return ts_start(argv[1], /*authkey=*/"",
-                    (argc > 2) ? static_cast<uint16_t>(atoi(argv[2])) : 80,
+    // **引数なしは本家 Tailscale。** 対話ログインで一番使う相手なので既定にする
+    // （ローカルの Headscale は `ts-login http://<ip>:8080` と書く）。
+    const char* host = (argc > 1) ? argv[1] : kTailscaleSaas;
+    return ts_start(host, /*authkey=*/"",
+                    (argc > 2) ? static_cast<uint16_t>(atoi(argv[2])) : 0,
                     (argc > 3) ? static_cast<uint16_t>(atoi(argv[3])) : 131,
                     /*interactive=*/true)
                ? 0
@@ -1524,9 +1544,17 @@ void draw_auth_qr_modules(esp_qrcode_handle_t qr, void* user_data)
     // 静穏帯 (quiet zone) を 4 モジュール取る。無いと読み取れない端末がある。
     constexpr int kQuiet = 4;
     const int     total  = n + kQuiet * 2;
-    // 文字 2 行ぶん (上 40 / 下 64) を除いて入る大きさにする。
-    const int scale =
-        std::max(2, std::min((avail - 104) / total, static_cast<int>(display.width()) / total));
+    // **本家 Tailscale なら固定部とコードを分けて出す** (#68)。
+    // `https://login.tailscale.com/a/<コード>` なので、固定部さえ知っていれば
+    // コードだけ見て手で打てる（Headscale の hskey-authreq-<24文字> は打てない）。
+    static constexpr char kSaasAuthPrefix[] = "https://login.tailscale.com/a/";
+    const bool            is_saas           = (url->rfind(kSaasAuthPrefix, 0) == 0);
+    // **QR の下に置く行数ぶんを空ける。** 空けないと「Esc で中止」がコードを
+    // 上書きして、コードの末尾しか読めなくなる（実機で踏んだ）。
+    // 上 40 + 下（本文 1〜2 行 + Esc 行）。
+    const int reserve = is_saas ? 152 : 112;
+    const int scale   = std::max(
+        2, std::min((avail - reserve) / total, static_cast<int>(display.width()) / total));
     const int side  = total * scale;
     const int qx    = ((int)display.width() - side) / 2;
     const int qy    = top + 40;
@@ -1540,9 +1568,20 @@ void draw_auth_qr_modules(esp_qrcode_handle_t qr, void* user_data)
                              TFT_BLACK);
         }
     }
-    // QR が読めない場合のために URL も出す（打つのは辛いが、手がかりにはなる）。
-    display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    display.drawString(url->c_str(), 24, qy + side + 12);
+    // QR が読めない場合のために URL も出す。
+    if (is_saas) {
+        display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+        display.drawString("login.tailscale.com/a/ を開いて、このコードを打つ:", 24,
+                           qy + side + 8);
+        // コードだけ大きく出す。ここを読み違えると承認できない。
+        display.setFont(&fonts::efontJA_24_b);
+        display.setTextColor(TFT_WHITE, TFT_BLACK);
+        display.drawString(url->c_str() + sizeof(kSaasAuthPrefix) - 1, 24, qy + side + 40);
+        display.setFont(&fonts::efontJA_24);
+    } else {
+        display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+        display.drawString(url->c_str(), 24, qy + side + 12);
+    }
     display.setTextColor(0x8410, TFT_BLACK);
     display.drawString("Esc で中止", 24, top + avail - 32);
     display.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -4046,7 +4085,8 @@ void register_term_commands()
         {"ts", "Tailscale/Headscale の制御プレーンに接続（別タスク）",
          "<host> <authkey> [port] [capver]", &cmd_ts, nullptr, nullptr, nullptr},
         {"ts-status", "ts の状態を見る", nullptr, &cmd_ts_status, nullptr, nullptr, nullptr},
-        {"ts-login", "authkey 無しで参加する（AuthURL を QR で出す）", "<host> [port] [capver]",
+        {"ts-login", "authkey 無しで参加する（AuthURL を QR で出す。引数なしで本家）",
+         "[host] [port] [capver]",
          &cmd_ts_login, nullptr, nullptr, nullptr},
         {"ts-stop", "ts の long-poll を止める", nullptr, &cmd_ts_stop, nullptr, nullptr, nullptr},
         {"ping", "ICMP echo を投げる（トンネル越しの到達性確認）", "<ip> [count]",

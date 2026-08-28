@@ -322,8 +322,12 @@ Config parse(const std::string& json)
             case Type::kTailscale: {
                 p.control = get_string(item, "control");
                 p.authkey = get_string(item, "authkey");
-                const int port = get_int(item, "port", 80);
-                if (port <= 0 || port > 65535) {
+                // **既定は 0 = 未指定** (#68)。TLS かどうかは control のスキームで決まるので、
+                // ここで 80 を埋めると "https://h" が平文 80 に落ちる。
+                const int port = get_int(item, "port", 0);
+                // **0 は「書かれていない」なので通す。** 範囲外だけを弾く
+                // （0 まで弾くと port を書いていない設定が全部消える）。
+                if (port < 0 || port > 65535) {
                     warn(&cfg, where + " \"" + p.name + "\": port が範囲外なので飛ばした");
                     ok = false;
                     break;
