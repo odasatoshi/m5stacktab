@@ -77,3 +77,8 @@ CONFIG_MBEDTLS_ERROR_STRINGS=y
 CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FATFS_MAX_LFN=255
 CONFIG_FATFS_API_ENCODING_UTF_8=y
+
+# **1 に固定する。** ts_client は esp_transport で繋ぐが、esp-tls は getaddrinfo の
+# 先頭 1 件しか試さない。lwIP が 1 件しか返さないことが前提になっているので、
+# 増やすなら ts_client 側にフォールバックを足すこと（#68 の ponytail コメント）。
+CONFIG_LWIP_DNS_MAX_HOST_IP=1
