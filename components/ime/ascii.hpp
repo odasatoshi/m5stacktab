@@ -33,7 +33,28 @@ struct AsciiKey {
     const char* shift = nullptr;
     AsciiMod    mod   = AsciiMod::kNone;  // kNone 以外は送らずにラッチを操作する
     uint8_t     span  = 1;                // 横に占める列数（space だけ 4）
+    // 送るときに必ず付ける修飾ビット（PAD の `^C` のように、キー 1 つで
+    // Ctrl 付きを送るため）。**HID と同じ並び**で、kbd_key_to_bytes に渡す。
+    uint8_t     send_mod = 0;
 };
+
+// PAD 面（端末に薄く重ねる小さなパッド）。**行数を削らない**ので、出力を読みながら
+// 矢印で辿るときに使う。span は全部 1 なので当たり判定は割り算だけ（描画側でやる）。
+//
+//   Esc  ↑  Tab  ^C
+//   ←    ↓  →    Enter
+//
+// **Ctrl 単体は置かない。** PAD に文字キーが無いので、ラッチしても掛ける先が無い
+// （`kbd_key_to_bytes` の Ctrl は 1 文字のキー名にしか効かない）。端末で本当に要るのは
+// `Ctrl-C` なので、それをキー 1 つにしてある。
+// Ctrl の修飾ビット。`main/kbd_keys.hpp` の kKbdModCtrl と同じ値でなければならない
+// （ここは main に依存させたくないので持ち直している。一致はホストテストで見る）。
+constexpr uint8_t kCtrlBit = 0x01;
+
+constexpr int kPadCols = 4;
+constexpr int kPadRows = 2;
+// 範囲外なら nullptr。
+const AsciiKey* pad_key(int row, int col);
 
 class AsciiKeyboard {
 public:
