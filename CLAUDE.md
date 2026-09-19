@@ -119,6 +119,20 @@ python tools/serial_log.py --seconds 20      # ログ採取
   - **電源もリセットも自分で書かなくてよい。** CAM_EN は IO エクスパンダ 0x43 の
     pin6 で、`display.init()` が書く `0b01110110` に含まれる（C6 が 0x44 pin0 なのと
     同じ構図）。**ただし display.init() より前に呼ぶとハンドルが無くて失敗する**
+  - **取り込みは画面と同じロックの中で呼ぶ。** `STREAMON` はセンサに SCCB で
+    「流し始めろ」と指示するので、M5GFX のタッチ読み取りと重なると
+    **`VIDIOC_STREAMON failed: errno=16` (EBUSY) になる**。実機で確認:
+    ロックの外に出すと毎回失敗し、中に戻すと通る。
+    「SCCB を触るのは初期化のときだけだから取り込みは外に出せる」は**誤り**
+  - **`DQBUF` は既定で永久に待つ。** `esp_video` は `dqbuf_timeout_ticks` を
+    `portMAX_DELAY` で初期化しているので、`VIDIOC_S_DQBUF_TIMEOUT` を投げること。
+    立ち上げでは「STREAMON は通るのに 1 枚も来ない」が普通にあり、**そこで
+    永久に待つと呼んだタスクごと固まる**。画面のロックを握ったまま固まると
+    描画も SSH も 2 秒ごとに lock timeout を吐いて、電源を切るまで直らない
+    （**実機で踏んだ**: タイムアウトを外したらコンソールタスクが固まり、
+    PSRAM も 3.6MB 握られたままになった）。
+    **上限は TermGuard の 2 秒より十分短くする** — 取り込みはロックを握ったまま
+    走るので、待つだけでロックのタイムアウトを誘発する。実測 46ms に対して 500ms
   - **`CONFIG_ESP_VIDEO_ENABLE_DVP_VIDEO_DEVICE` は切る。** esp_video 2.5.0 の DVP は
     ESP-IDF v5.5.1 に無い `cam_ctlr_format_conv_config_t` /
     `esp_cam_ctlr_format_conversion()` を使うので、有効のままだとコンポーネントの

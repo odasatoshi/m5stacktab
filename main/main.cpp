@@ -3748,8 +3748,13 @@ int cmd_nvsstat(int, char**)
 // SCCB が 0x36 に届くか / LDO (chan3) が取れるか / どの解像度が通るか。
 int cmd_camtest(int, char**)
 {
-    // **画面・タッチと同じロックの下で呼ぶ。** センサの SCCB は M5GFX が握っている
-    // I2C (G31/G32) にぶら下がっているので、タッチの読み取りと重ねられない。
+    // **ロックが要るのは立ち上げだけ。** センサの SCCB は M5GFX が握っている I2C
+    // (G31/G32) にぶら下がっているので、初期化はタッチの読み取りと重ねられない。
+    // **取り込みは SCCB を一切触らない**（DMA と ISP だけ）ので、ロックの外でやる。
+    //
+    // **取り込みをロックの中でやってはいけない。** 1 枚 46ms かかるうえ、
+    // 来なければタイムアウトまで 500ms 待つ。その間ずっと画面のロックを握ると、
+    // 描画ループが TermGuard の 2 秒に当たる。
     TermGuard guard;
     if (!guard.ok()) {
         std::printf("busy\n");
@@ -3760,6 +3765,7 @@ int cmd_camtest(int, char**)
         std::printf("  上のログに esp_video / esp_cam_sensor の理由が出ている\n");
         return 1;
     }
+
     cam::Info info;
     if (esp_err_t err = cam::probe(&info); err != ESP_OK) {
         std::printf("素性を読めない: %s\n", esp_err_to_name(err));

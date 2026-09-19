@@ -9,6 +9,7 @@
 #include <esp_log.h>
 #include <driver/i2c_master.h>
 #include <esp_video_init.h>
+#include <esp_video_ioctl.h>
 #include <linux/videodev2.h>
 #include <sys/ioctl.h>
 
@@ -23,6 +24,18 @@ constexpr const char* kDevice = "/dev/video0";
 // **2 枚要る。** MIPI-CSI のドライバはバックアップバッファを持たない設定なので、
 // 1 枚だと DMA の差し替え先が無い。
 constexpr uint32_t kBufferCount = 2;
+
+// **DQBUF は既定で永久に待つ。** esp_video は `dqbuf_timeout_ticks` を
+// `portMAX_DELAY` で初期化しており、`VIDIOC_S_DQBUF_TIMEOUT` を投げないとそのまま。
+// **立ち上げで «STREAMON は通るのに 1 枚も来ない» のは普通にある**（MIPI のレーン設定
+// 違い・ISP の停止・センサが実は流していない）。そこで永久に待つと、取り込みを
+// 呼んだタスクごと固まる。**このコマンドはまさにその状態を診断するためのもの**
+// なので、待ち切らずに «来なかった» と言えないと役に立たない。
+// **短くしておく理由がもう 1 つある。** 取り込みは画面のロックを握ったまま走る
+// （STREAMON が SCCB を使うので外に出せない）ので、ここで待つ間は描画が止まる。
+// TermGuard の 2 秒より十分短くしないと、待っただけでロックのタイムアウトを誘発する。
+// 実測 46ms に対して 10 倍の余裕。
+constexpr int kDqbufTimeoutMs = 500;
 
 bool s_ready = false;
 int  s_fd    = -1;
@@ -127,6 +140,18 @@ esp_err_t capture(Frame* out)
     if (!out) return ESP_ERR_INVALID_ARG;
     if (!s_ready) return ESP_ERR_INVALID_STATE;
 
+    // **RGB565 であることを確かめてから統計を取る。** 下の計算は
+    // リトルエンディアン RGB565 の緑を決め打ちで取り出している。ISP が外れて
+    // RAW8 が返るようになると、**min != max は成り立つので «成功» と言えてしまい、
+    // 数字だけが無意味になる**（いちばん気づきにくい壊れ方）。
+    Info info;
+    if (esp_err_t err = probe(&info); err != ESP_OK) return err;
+    if (info.pixelformat != V4L2_PIX_FMT_RGB565) {
+        ESP_LOGE(TAG, "画素形式が RGB565 ではない (%s)。統計の計算が合わない",
+                 fourcc(info.pixelformat).c_str());
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
     // **バッファは 2 枚要る。** MIPI-CSI のドライバはバックアップバッファを持たない
     // 設定 (`..._BACKUP_BUFFER` が既定 n) なので、1 枚だと DMA の差し替え先が無い。
     v4l2_requestbuffers req = {};
@@ -186,8 +211,23 @@ esp_err_t capture(Frame* out)
         }
     }
 
+    // **待ち時間の上限を入れてから流し始める。** 順序が逆だと、設定する前に
+    // DQBUF へ入る経路ができる。
+    timeval tv = {};
+    tv.tv_sec  = kDqbufTimeoutMs / 1000;
+    tv.tv_usec = (kDqbufTimeoutMs % 1000) * 1000;
+    if (ioctl(s_fd, VIDIOC_S_DQBUF_TIMEOUT, &tv) != 0) {
+        // 設定できなくても取り込みは試せる。**ただし来なければ固まる**ので残す。
+        ESP_LOGW(TAG, "DQBUF のタイムアウトを設定できない: errno=%d (来ないと待ち続ける)", errno);
+    }
+
     if (ioctl(s_fd, VIDIOC_STREAMON, &type) != 0) {
-        ESP_LOGE(TAG, "VIDIOC_STREAMON failed: errno=%d", errno);
+        // **errno 16 (EBUSY) はたいてい I2C の奪い合い。** STREAMON はセンサに
+        // SCCB で「流し始めろ」と指示するので、M5GFX のタッチ読み取りと重なると
+        // ここで落ちる。**取り込みは画面と同じロックの中で呼ぶこと**（実機で確認:
+        // ロックの外に出すと毎回 errno 16 になり、中に戻すと通る）。
+        ESP_LOGE(TAG, "VIDIOC_STREAMON failed: errno=%d%s", errno,
+                 errno == 16 ? " (画面のロックの中で呼んでいるか?)" : "");
         cleanup();
         return ESP_FAIL;
     }
@@ -198,7 +238,19 @@ esp_err_t capture(Frame* out)
     got.type          = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     got.memory        = V4L2_MEMORY_MMAP;
     if (ioctl(s_fd, VIDIOC_DQBUF, &got) != 0) {
-        ESP_LOGE(TAG, "VIDIOC_DQBUF failed: errno=%d", errno);
+        // **タイムアウトはここに来る。** 「STREAMON は通ったのに 1 枚も来ない」は
+        // MIPI のレーン設定・ISP・センサのどれかが流していないということ。
+        ESP_LOGE(TAG, "VIDIOC_DQBUF failed: errno=%d (%dms 待っても 1 枚も来なかった)", errno,
+                 kDqbufTimeoutMs);
+        cleanup();
+        return ESP_ERR_TIMEOUT;
+    }
+    // **ドライバは «成功 + 長さ 0 + ERROR フラグ» を返すことがある。**
+    // 見ないと「全画素が同じ値」に落ちて、**レンズを疑わせる**（原因は別）。
+    if (got.flags & V4L2_BUF_FLAG_ERROR) {
+        ESP_LOGE(TAG, "DQBUF returned a buffer flagged as errored (bytesused=%u)",
+                 (unsigned)got.bytesused);
+        ioctl(s_fd, VIDIOC_QBUF, &got);
         cleanup();
         return ESP_FAIL;
     }
