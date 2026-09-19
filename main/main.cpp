@@ -3769,6 +3769,41 @@ int cmd_keytest(int, char**)
     const char* nl = std::strchr(buf, '\n');
     std::printf("key: %d bytes, header=%.*s\n", (int)len, (int)(nl ? nl - buf : 0), buf);
 
+    // **公開鍵が続けて書いてあるかを出す (#75)。** ECDSA はこれが無いと
+    // 認証まで進めない（libssh2 が秘密鍵から導出しようとして RSA しか扱えない）。
+    // ここで見えないと、繋いでみるまで気づけない。
+    std::string detail;
+    if (!ssh_key_split_selftest(&detail)) {
+        std::printf("!! 鍵の切り分けの自己テストが落ちた: %s\n", detail.c_str());
+    }
+    {
+        std::string priv, pub;
+        // `len` までが鍵。パーティションの中身をそのまま渡す。
+        ssh_key_split(std::string(buf, len), &priv, &pub);
+        if (pub.empty()) {
+            std::printf("公開鍵: 無し（RSA ならこのままで良い。ECDSA には要る）\n");
+        } else {
+            const size_t sp = pub.find(' ');
+            std::printf("公開鍵: %.*s (%d バイト)\n",
+                        (int)(sp == std::string::npos ? pub.size() : sp), pub.c_str(),
+                        (int)pub.size());
+        }
+        // **本番と同じ経路を通す。** 生 PEM を mbedTLS に通すだけだと
+        // 「parse ok なのに繋ぐと落ちる」（named curve でない / パスフレーズが違う）を
+        // 取りこぼす。EC でなければ何も出さない。
+        std::string der;
+        if (priv.find("EC PRIVATE KEY") != std::string::npos ||
+            priv.find("BEGIN PRIVATE KEY") != std::string::npos) {
+            SshConfig saved;
+            ssh_config_load(saved);  // パスフレーズは接続時と同じものを使う
+            if (ssh_key_ec_to_der(priv, saved.password, &der)) {
+                std::printf("EC → DER: %d バイト（libssh2 に渡せる）\n", (int)der.size());
+            } else {
+                std::printf("!! EC → DER に失敗した。このままでは接続時に -0x3d00 になる\n");
+            }
+        }
+    }
+
     mbedtls_pk_context pk;
     mbedtls_pk_init(&pk);
     // mbedTLS は鍵データの末尾が NUL であることを要求する（pkparse.c の実装）。

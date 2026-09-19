@@ -46,10 +46,21 @@ python $IDF_PATH/components/partition_table/parttool.py --port /dev/cu.usbmodem1
     write_partition --partition-name dict --input build/dict.bin
 
 ssh-keygen -t rsa -b 2048 -m PEM -N '' -f ~/.ssh/id_rsa_tab5   # ed25519 は使えない
-# ECDSA なら named curve 形式にする（ssh-keygen が作る形式は mbedTLS が読めない）
-# openssl ecparam -name prime256v1 -genkey -noout -out ~/.ssh/id_ecdsa_tab5.pem
 python $IDF_PATH/components/partition_table/parttool.py --port /dev/cu.usbmodem101 \
     write_partition --partition-name sshkey --input ~/.ssh/id_rsa_tab5
+```
+
+ECDSA は **named curve 形式**にしたうえで、**公開鍵を秘密鍵の後ろに続けて**書く (#75)。
+公開鍵が無いと libssh2 が秘密鍵から導出しようとして `Key type not supported` になる
+（mbedTLS バックエンドのその実装は RSA 決め打ち）。**RSA は今までどおり秘密鍵だけでよい。**
+
+```sh
+openssl ecparam -name prime256v1 -genkey -noout -out ~/.ssh/id_ecdsa_tab5.pem
+ssh-keygen -y -f ~/.ssh/id_ecdsa_tab5.pem > ~/.ssh/id_ecdsa_tab5.pub
+cat ~/.ssh/id_ecdsa_tab5.pub >> ~/.ssh/authorized_keys        # 接続先で
+cat ~/.ssh/id_ecdsa_tab5.pem ~/.ssh/id_ecdsa_tab5.pub > /tmp/ec_combined.pem
+python $IDF_PATH/components/partition_table/parttool.py --port /dev/cu.usbmodem101 \
+    write_partition --partition-name sshkey --input /tmp/ec_combined.pem
 ```
 
 ## コンソールコマンド
@@ -162,7 +173,7 @@ tab5> profiles clear    # 取り込んだものを全部消す
 - パスワードは書けるが既定にしない。`"auth": "password"` で `password` を書かなければ、
   繋ぐときに画面から入力させる（入力中はエコーしない）
 - 鍵の形式の制約は `sshkey` パーティションと同じ（**PEM のみ。OpenSSH 形式と ed25519 は不可**。
-  ECDSA は named curve）
+  ECDSA は named curve + 公開鍵を続けて書く）
 - 未知のキーは黙って無視、未知の `type`・必須項目の欠け・**上限超え**・**鍵の取り込み失敗**は
   **その項目だけ**飛ばす（理由が `profiles import` と画面に出る）
 - **上限は SSH 5 件 / VPN 5 件**（別枠で数える。`via` は SSH 1 件が VPN 1 件を要求するので、
