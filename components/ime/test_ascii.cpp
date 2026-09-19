@@ -83,6 +83,34 @@ void test_names_reach_terminal()
     }
 }
 
+// PAD 面も同じ不変条件（名前が端末に届く）を満たすこと。
+void test_pad_table()
+{
+    for (int row = 0; row < ime::kPadRows; ++row) {
+        for (int col = 0; col < ime::kPadCols; ++col) {
+            const ime::AsciiKey* k = ime::pad_key(row, col);
+            CHECK(k != nullptr);
+            CHECK(k->span == 1);
+            if (k->mod != ime::AsciiMod::kNone) {
+                CHECK(k->name[0] == '\0');
+                continue;
+            }
+            CHECK(!kbd_key_to_bytes(k->name, k->send_mod, false).empty());
+            // **修飾を付けるキーは、付けない場合と違うバイトになること。**
+            // 同じなら、そのキーは修飾を付けているつもりで素のまま送っている。
+            if (k->send_mod) {
+                CHECK(kbd_key_to_bytes(k->name, k->send_mod, false) !=
+                      kbd_key_to_bytes(k->name, 0, false));
+            }
+        }
+    }
+    CHECK(ime::pad_key(-1, 0) == nullptr);
+    CHECK(ime::pad_key(0, ime::kPadCols) == nullptr);
+    CHECK(ime::pad_key(ime::kPadRows, 0) == nullptr);
+    // **表を 2 か所に持っている。** ずれると PAD の `^C` が黙って `c` になる。
+    CHECK(ime::kCtrlBit == kKbdModCtrl);
+}
+
 // 各キーの中心を押したらそのキーが返ること。span 付きの space も含む。
 void test_hit()
 {
@@ -130,6 +158,7 @@ int main()
 {
     test_table();
     test_names_reach_terminal();
+    test_pad_table();
     test_hit();
     test_modifiers();
     std::printf("ok (%d checks)\n", g_checks);

@@ -135,6 +135,8 @@ int                            s_status_h = 0;
 // 高さの計算はここ 1 箇所しかない。分散させると片方だけ直して重なる。
 void apply_layout();
 // 画面キーボードの出し入れ（コンソールもダブルタップも通す唯一の経路）。
+// 端末を描く唯一の下回り（PAD の重ね直しを含む）。定義は下。
+void render_term_raw(bool force);
 void set_keyboard_mode(KeyboardUi::Mode m);
 void set_keyboard_visible(bool show);
 // メニューの表示を切り替える。キーボードの表示と端末の行数も一緒に動く。
@@ -1162,7 +1164,7 @@ int cmd_flip(int argc, char** argv)
             } else {
                 if (keyboard->visible()) keyboard->draw();
                 hide_auth_qr(/*redraw=*/false);  // 塗り直すので QR は畳む (#59)
-                renderer->render(*term, /*force=*/true);
+                render_term_raw(/*force=*/true);
             }
         }
     }
@@ -1172,33 +1174,47 @@ int cmd_flip(int argc, char** argv)
 }
 
 
+// PAD を重ね直すのにかかった時間。段が PAD でなければ 0。
+// **端末を描くたびに上乗せされる**ので、bench はこれを込みで出す。
+uint32_t pad_overlay_us()
+{
+    if (!keyboard || keyboard->mode() != KeyboardUi::Mode::kPad) return 0;
+    return keyboard->last_overlay_us();
+}
+
 // 差分転送の効き目を測る。1 文字ずつ書いたときの再描画コストを見る。
 int cmd_bench(int, char**)
 {
     // 計測中に別タスクが描画すると値が混ざるので、区間全体を押さえる。
     TermGuard guard;
     render_term(/*force=*/true);
-    const uint32_t full_us = renderer->last_render_us();
-    const uint32_t full_px = renderer->last_pixels();
+    const uint32_t full_us  = renderer->last_render_us();
+    const uint32_t full_px  = renderer->last_pixels();
+    // **重ね直しは render の計測区間の外**（TermRenderer は自分の時間しか測らない）。
+    // 直後に読まないと、次の描画の値に上書きされて別の区間の数字を出してしまう。
+    const uint32_t full_pad = pad_overlay_us();
 
     // 1 文字入力を 20 回。実際のタイプ入力に相当する。
-    uint32_t typing_us = 0, typing_px = 0;
+    uint32_t typing_us = 0, typing_px = 0, typing_pad = 0;
     for (int i = 0; i < 20; ++i) {
         term->write("x");
         render_term();
         typing_us += renderer->last_render_us();
         typing_px += renderer->last_pixels();
+        typing_pad += pad_overlay_us();
     }
     term->write("\r\n");
     render_term();
 
-    std::printf("full screen: %u us (%u px)\n", (unsigned)full_us, (unsigned)full_px);
-    std::printf("20 keystrokes: %u us total, %u us each (%u px each)\n", (unsigned)typing_us,
-                (unsigned)(typing_us / 20), (unsigned)(typing_px / 20));
+    std::printf("full screen: %u us (%u px) + pad %u us = %u us\n", (unsigned)full_us,
+                (unsigned)full_px, (unsigned)full_pad, (unsigned)(full_us + full_pad));
+    std::printf("20 keystrokes: %u us each (%u px each) + pad %u us each = %u us each\n",
+                (unsigned)(typing_us / 20), (unsigned)(typing_px / 20),
+                (unsigned)(typing_pad / 20), (unsigned)((typing_us + typing_pad) / 20));
     return 0;
 }
 
-// `kbd [off|ascii|kana|next]`。**指と同じ関数を通す** — 分けると
+// `kbd [off|ascii|kana|pad|next]`。**指と同じ関数を通す** — 分けると
 // 「コマンドでは切り替わるが指では切り替わらない」（またはその逆）になる。
 int cmd_kbd(int argc, char** argv)
 {
@@ -1211,10 +1227,12 @@ int cmd_kbd(int argc, char** argv)
             m = KeyboardUi::Mode::kAscii;
         } else if (a == "kana") {
             m = KeyboardUi::Mode::kKana;
+        } else if (a == "pad") {
+            m = KeyboardUi::Mode::kPad;
         } else if (a == "next") {
             m = KeyboardUi::next_mode(s_kbd_mode);
         } else if (a != "on") {
-            std::printf("usage: kbd [off|ascii|kana|next]\n");
+            std::printf("usage: kbd [off|ascii|kana|pad|next]\n");
             return 1;
         }
     }
@@ -1623,7 +1641,7 @@ void hide_auth_qr(bool redraw)
     s_auth_qr_active = false;
     // **URL は残す。** メニューから戻ったときに出し直せるようにする
     // （ts::Client は同じ URL では二度と handler を呼ばない）。
-    if (redraw && renderer && term) renderer->render(*term, /*force=*/true);
+    if (redraw && renderer && term) render_term_raw(/*force=*/true);
 }
 
 bool auth_qr_input(const std::string& in)
@@ -1821,17 +1839,21 @@ void set_keyboard_mode(KeyboardUi::Mode m)
         return;
     }
     if (keyboard->mode() == m) return;
-    const bool was_visible = keyboard->visible();
+    // **visible() ではなく高さで見る。** PAD は出ていても帯を占めない（行数を削らない）
+    // ので、ABC → PAD は visible() が true のままなのに 13 行 → 29 行に戻る。
+    const int  was_h   = keyboard->height();
+    // PAD を抜けるときは、重ねてある画素を端末で塗り潰さないと残る。
+    const bool was_pad = (keyboard->mode() == KeyboardUi::Mode::kPad);
     keyboard->set_mode(m);  // 出すときも面を変えるときも KeyboardUi 側が描く
     // **面が変わるだけなら端末には触らない。** 行数も帯の位置も同じなので、
     // force render は全画面の PPA 転送を無駄に 1 回出すだけになる。
-    if (keyboard->visible() != was_visible) {
+    if (keyboard->height() != was_h || was_pad) {
         apply_layout();
         // **QR は端末領域に描いてある。** 畳まずに塗り直すと、消えたのにフラグが
         // 残って端末が二度と更新されなくなる。
         hide_auth_qr(/*redraw=*/false);
         // 隠すときはキーボードが居た帯まで端末の行が伸びるので、force で全部塗り直す。
-        renderer->render(*term, /*force=*/true);
+        render_term_raw(/*force=*/true);
     }
     if (status_bar) status_bar->draw(gather_status(), /*force=*/true);
     ESP_LOGI(TAG, "keyboard %s, terminal %dx%d", KeyboardUi::mode_label(m), renderer->cols(),
@@ -1842,6 +1864,15 @@ void set_keyboard_mode(KeyboardUi::Mode m)
 void set_keyboard_visible(bool show)
 {
     set_keyboard_mode(show ? s_kbd_face : KeyboardUi::Mode::kOff);
+}
+
+// 対話ログインの QR は端末領域を塗り潰す (#59)。帯を持つ段 (ABC / かな) は
+// `keyboard->height()` の分だけ避けてもらえるが、**PAD は高さ 0 なので QR に
+// 覆われる**。見えていないのに当たり判定だけ生きていると、右下のタップが
+// `Esc`（＝承認待ちの中止）や `^C` を送ることになる。
+bool pad_hidden_by_qr()
+{
+    return s_auth_qr_active && keyboard && keyboard->mode() == KeyboardUi::Mode::kPad;
 }
 
 void touch_down_at(int x, int y)
@@ -1863,7 +1894,7 @@ void touch_down_at(int x, int y)
     } else if (menu->visible()) {
         // メニュー表示中はキーボードを隠しているので、ここで全部食う。
         if (menu->touch_down(x, y)) menu->draw();
-    } else if (!keyboard->touch_down(x, y)) {
+    } else if (pad_hidden_by_qr() || !keyboard->touch_down(x, y)) {
         // キーボード外 = 端末領域。縦スワイプでスクロールバックを見る。
         s_swipe_start_y      = y;
         s_swipe_start_offset = term->view_offset();
@@ -1907,6 +1938,18 @@ void touch_up_at(int x, int y)
     if (!keyboard->touch_up(x, y)) ESP_LOGI(TAG, "touch up");
 }
 
+// 端末を描いて、その上に浮いている PAD を描き直す。
+// **PAD は端末の差分描画で欠ける** — 下の文字が動いた分だけ穴が開くので、
+// 端末に触ったら必ずここを通す（`renderer->render` を直に呼ばない）。
+void render_term_raw(bool force)
+{
+    if (!renderer || !term) return;
+    renderer->render(*term, force);
+    // 1 画素も塗っていないなら PAD も欠けていない。重ね直しは PSRAM から
+    // 数 ms かかるので、変化が無いフレームでは出さない。
+    if (keyboard && renderer->last_pixels() > 0) keyboard->draw_overlay();
+}
+
 void render_term(bool force)
 {
     if (!renderer || !term) return;
@@ -1915,7 +1958,7 @@ void render_term(bool force)
     if (menu && menu->visible()) return;
     // QR を出している間も同じ（上書きすると読めなくなる）(#59)。
     if (s_auth_qr_active) return;
-    renderer->render(*term, force);
+    render_term_raw(force);
 }
 
 void cancel_line_prompt();
@@ -1945,7 +1988,7 @@ void set_menu_visible(bool show)
         menu->draw(/*force=*/true);
     } else {
         // キーボードは set_visible(true) が中で描いている。ここで描くと二度塗り。
-        renderer->render(*term, /*force=*/true);
+        render_term_raw(/*force=*/true);
         // **まだ承認待ちなら QR を出し直す (#59)。** ts::Client は同じ URL では
         // 二度と handler を呼ばないので、ここで戻さないと二度と出せない。
         if (!s_auth_qr_url.empty() && s_ts_client &&
@@ -3995,6 +4038,10 @@ int cmd_termcheck(int, char**)
                 renderer->ppa_enabled() ? "PPA" : "pushSprite", bad == 0 ? "ok" : "FAILED");
     status_bar->draw(gather_status(), /*force=*/true);
     if (menu_was_shown) menu->draw(/*force=*/true);
+    // **PAD も戻す。** 上の render は端末を全部塗り直しているので、重ねてある
+    // パッドが消えている（画素を読む前に重ねると、診断が PAD の色を読みかねない
+    // ので、読み終わってからにする）。
+    if (keyboard) keyboard->draw_overlay();
     return bad == 0 ? 0 : 1;
 }
 
@@ -4128,7 +4175,8 @@ void register_term_commands()
         {"kbdhw", "純正キーボード (Ext.Port1 I2C) の状態を見る／読み取りを立て直す", nullptr,
          &cmd_kbdhw, nullptr, nullptr, nullptr},
         {"kbdlog", "打鍵をシリアルに出す", "[off]", &cmd_kbdlog, nullptr, nullptr, nullptr},
-        {"kbd", "画面キーボードの段", "[off|ascii|kana|next]", &cmd_kbd, nullptr, nullptr, nullptr},
+        {"kbd", "画面キーボードの段", "[off|ascii|kana|pad|next]", &cmd_kbd, nullptr, nullptr,
+         nullptr},
         {"menu", "初期メニューの操作", "[show|hide|up|down|enter|esc|left|right]", &cmd_menu,
          nullptr, nullptr, nullptr},
         {"tap", "タッチを合成する（実タッチと同じ経路）", "<x> <y>", &cmd_tap, nullptr, nullptr,

@@ -17,12 +17,16 @@
 
 class KeyboardUi {
 public:
-    KeyboardUi(M5GFX& gfx, TermRenderer& renderer) : gfx_(gfx), renderer_(renderer) {}
+    KeyboardUi(M5GFX& gfx, TermRenderer& renderer)
+        : gfx_(gfx), renderer_(renderer), pad_(&gfx)
+    {
+    }
 
-    // 段。**switch に default を置かない** — PAD を足したときに、
+    // 段。**switch に default を置かない** — 段を足したときに、
     // 巡回とラベルの両方がコンパイルエラーで見つかるようにする。
-    // ponytail: PAD（端末に薄く重ねる矢印パッド）は #65 の後半で kKana の次に挿す。
-    enum class Mode : uint8_t { kOff, kAscii, kKana };
+    //
+    // **kPad だけは端末に重なる。** 行数を削らないので height() は 0 を返す。
+    enum class Mode : uint8_t { kOff, kAscii, kKana, kPad };
 
     // 巡回の順序とラベルはここにしか置かない（複製すると片方が取り残される）。
     static Mode        next_mode(Mode m);
@@ -35,7 +39,17 @@ public:
     Mode mode() const { return mode_; }
     void set_mode(Mode m);
     bool visible() const { return mode_ != Mode::kOff; }
-    int  height() const { return visible() ? height_ : 0; }
+    // **画面下部から奪う高さ。** PAD は端末に重ねるので 0（行数を削らない）。
+    int  height() const
+    {
+        return (mode_ == Mode::kAscii || mode_ == Mode::kKana) ? height_ : 0;
+    }
+
+    // 端末を描いた後に呼ぶ。**PAD は端末の差分描画で欠ける**ので、重ね直す。
+    // PAD 以外の段では何もしない。
+    void draw_overlay();
+    // 直近の重ね直しにかかった時間 (us)。端末の描画に毎回上乗せされるので測れるようにする。
+    uint32_t last_overlay_us() const { return last_overlay_us_; }
 
     // タッチイベントを渡す。キーボードが処理したら true。
     bool touch_down(int x, int y);
@@ -58,6 +72,10 @@ public:
 
 private:
     void draw_key(int row, int col, bool pressed);
+    void build_pad();
+    void draw_pad_key(int row, int col, bool pressed);
+    bool pad_hit(int x, int y, int* row, int* col) const;
+    bool pad_touch_up();
     void draw_ascii_key(int row, int index, bool pressed);
     void draw_ascii();
     void draw_status();
@@ -68,6 +86,11 @@ private:
     TermRenderer&       renderer_;
     ime::FlickKeyboard  kb_;
     ime::AsciiKeyboard  ascii_;
+    // PAD は市松に間引いたスプライトを透過色つきで重ねる（作り方の理由は .cpp）。
+    LGFX_Sprite         pad_;
+    int                 pad_x_ = 0;
+    int                 pad_y_ = 0;
+    uint32_t            last_overlay_us_ = 0;
     ime::Ime            ime_;
     Mode                mode_       = Mode::kOff;
     int                 height_     = 0;
