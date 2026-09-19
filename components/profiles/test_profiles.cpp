@@ -326,6 +326,46 @@ void test_referenced_keys()
     CHECK(prof::referenced_keys(e).empty());
 }
 
+void test_remove_profile()
+{
+    std::string out;
+    CHECK(prof::remove_profile(kGood, "bastion", &out));
+    const prof::Config c = prof::parse(out);
+    CHECK(c.error.empty());
+    CHECK(prof::find(c, "bastion") == nullptr);
+    // 他の項目は残っている（消したのは 1 件だけ）
+    CHECK(c.profiles.size() == prof::parse(kGood).profiles.size() - 1);
+
+    // **飛ばされた項目より後ろを消しても、ずれない。** ここが index で消せない理由:
+    // parse は "broken" を飛ばすので profiles[1] は "b" だが、JSON の配列では 2 番目。
+    const char* skewed = R"({"version":1,"profiles":[
+        {"name":"a","type":"ssh","host":"h","user":"u"},
+        {"name":"broken","type":"l2tp","host":"h"},
+        {"name":"b","type":"ssh","host":"h2","user":"u"}]})";
+    const prof::Config s = prof::parse(skewed);
+    CHECK(s.profiles.size() == 2 && s.profiles[1].name == "b");
+    CHECK(prof::remove_profile(skewed, "b", &out));
+    const prof::Config t = prof::parse(out);
+    CHECK(t.profiles.size() == 1 && t.profiles[0].name == "a");
+
+    // **飛ばされた項目と名前がぶつかったら消さない。** parse の重複検査は
+    // 受け入れた項目どうししか見ないので、この JSON は error にならない。
+    const char* dup = R"({"version":1,"profiles":[
+        {"name":"work","type":"ssh","host":"h1"},
+        {"name":"work","type":"ssh","host":"h2","user":"u"}]})";
+    const prof::Config d = prof::parse(dup);
+    CHECK(d.error.empty() && d.profiles.size() == 1);  // 1 件目は user 欠けで飛ぶ
+    out = "untouched";
+    CHECK(!prof::remove_profile(dup, "work", &out));
+    CHECK(out == "untouched");
+
+    // 無い名前・空の名前・壊れた JSON では out に触らず false
+    CHECK(!prof::remove_profile(kGood, "nosuch", &out));
+    CHECK(!prof::remove_profile(kGood, "", &out));
+    CHECK(!prof::remove_profile("{ broken", "a", &out));
+    CHECK(out == "untouched");
+}
+
 void test_cidr()
 {
     std::string a;
@@ -368,6 +408,7 @@ int main()
     test_via_is_reported_but_not_fatal();
     test_limits();
     test_referenced_keys();
+    test_remove_profile();
     test_cidr();
 
     std::printf("%d checks, %d failed\n", g_checks, g_fails);

@@ -24,6 +24,8 @@ enum : int {
     kIdWifiConn = 21,
     kIdWifiDel  = 22,
     kIdWifiMan  = 23,
+    kIdProfConn = 24,  // 接続先の詳細から繋ぐ (#73)
+    kIdProfDel  = 25,  // 接続先の詳細から消す (#73)
     kIdBack     = 99,
     // **index を埋めて返す帯域。互いに重ならないように離してある。**
     // 下の static_assert が、上限を上げたときの食い込みを止める。
@@ -101,6 +103,7 @@ void MenuUi::rebuild()
             add("Terminal", kIdTerminal, true);
             break;
         case Screen::kSsh:
+            if (note_[0]) add(note_, 0, false);
             add_profiles(/*ssh=*/true, &n);
             // NVS の 1 件はいつでも残す。SD が読めなくても繋げる経路が要る。
             std::snprintf(buf, sizeof(buf), "保存済み: %s",
@@ -109,6 +112,7 @@ void MenuUi::rebuild()
             add("< Back", kIdBack, true);
             break;
         case Screen::kVpn:
+            if (note_[0]) add(note_, 0, false);
             std::snprintf(buf, sizeof(buf), "Tailscale: %s", info_.ts_state);
             add(buf, 0, false);
             std::snprintf(buf, sizeof(buf), "WireGuard: %s", info_.wg_state);
@@ -133,7 +137,7 @@ void MenuUi::rebuild()
         case Screen::kWifi:
             // 注記は「スキャン中…」「5 件で満杯」など。**画面に理由を出す唯一の場所**
             // （端末に書いてもメニューを出している間は描かれない）。
-            if (wifi_note_[0]) add(wifi_note_, 0, false);
+            if (note_[0]) add(note_, 0, false);
             if (wifi_nets_) {
                 for (size_t i = 0; i < wifi_nets_->size() && i < kMaxWifiNets; ++i) {
                     add((*wifi_nets_)[i].c_str(), kIdWifiNet + static_cast<int>(i), true);
@@ -152,8 +156,30 @@ void MenuUi::rebuild()
             add("削除", kIdWifiDel, true);
             add("< Back", kIdBack, true);
             break;
+        case Screen::kProfile: {
+            if (note_[0]) add(note_, 0, false);
+            // WiFi と同じ「一覧 → 詳細 → 削除」の 2 段。**確認ダイアログの代わり**に
+            // なっているので、一覧から直に消せるようにはしない。
+            const prof::Profile* p = nullptr;
+            if (profiles_ && prof_sel_ >= 0 &&
+                prof_sel_ < static_cast<int>(profiles_->profiles.size())) {
+                p = &profiles_->profiles[prof_sel_];
+            }
+            add(p ? p->name.c_str() : "(消えた)", 0, false);
+            if (p) {
+                std::snprintf(buf, sizeof(buf), "%s  %s", prof::type_name(p->type),
+                              p->type == prof::Type::kSsh ? p->host.c_str()
+                              : p->type == prof::Type::kTailscale ? p->control.c_str()
+                                                                  : p->peer.endpoint.c_str());
+                add(buf, 0, false);
+            }
+            add("接続", kIdProfConn, p != nullptr);
+            add("削除", kIdProfDel, p != nullptr);
+            add("< Back", kIdBack, true);
+            break;
+        }
         case Screen::kWifiScan: {
-            if (wifi_note_[0]) add(wifi_note_, 0, false);
+            if (note_[0]) add(note_, 0, false);
             int shown = 0;
             if (wifi_scan_) {
                 for (size_t i = 0; i < wifi_scan_->size() && shown < kMaxWifiScanRows; ++i) {
@@ -173,20 +199,28 @@ void MenuUi::rebuild()
 
 // **戻り先を 1 か所にまとめる。** 入れ子が 2 段になったので、"< Back" と Esc が
 // 別々に kRoot へ飛ぶと、WiFi の中から一気に最上位まで戻ってしまう。
-MenuUi::Screen MenuUi::parent_of(Screen s)
+MenuUi::Screen MenuUi::parent_of(Screen s) const
 {
     switch (s) {
         case Screen::kWifi:     return Screen::kSettings;
         case Screen::kWifiNet:  return Screen::kWifi;
         case Screen::kWifiScan: return Screen::kWifi;
+        // 同じ詳細画面に SSH 画面からも VPN 画面からも入るので、入り口を覚えて戻す。
+        case Screen::kProfile:  return prof_parent_;
         default:                return Screen::kRoot;
     }
 }
 
-void MenuUi::set_wifi_note(const std::string& s)
+bool MenuUi::shows_note(Screen s)
 {
-    std::snprintf(wifi_note_, sizeof(wifi_note_), "%s", s.c_str());
-    if (screen_ == Screen::kWifi || screen_ == Screen::kWifiScan) {
+    return s == Screen::kWifi || s == Screen::kWifiScan || s == Screen::kSsh ||
+           s == Screen::kVpn || s == Screen::kProfile;
+}
+
+void MenuUi::set_note(const std::string& s)
+{
+    std::snprintf(note_, sizeof(note_), "%s", s.c_str());
+    if (shows_note(screen_)) {
         // 選択位置は保たない。注記が増減すると行がずれるので、先頭から選び直す。
         rebuild();
         dirty_ = true;
@@ -195,6 +229,12 @@ void MenuUi::set_wifi_note(const std::string& s)
 
 void MenuUi::show_wifi_scan() { enter(Screen::kWifiScan); }
 void MenuUi::show_wifi_list() { enter(Screen::kWifi); }
+
+void MenuUi::show_profile_list()
+{
+    prof_sel_ = -1;
+    enter(prof_parent_);
+}
 
 // 接続先を並べる。**id に index を埋めて返す**ので、並び順が変わっても
 // 選んだ項目と繋ぐ先がずれない。
@@ -264,9 +304,13 @@ bool MenuUi::key(ui::Key k)
 
 void MenuUi::activate(int id)
 {
-    // SD の接続先。id に埋めた index をそのまま渡す。
+    // SD の接続先。id に埋めた index で詳細画面に入る (#73)。
+    // **一覧から直に繋がない。** 繋ぐのも消すのも詳細画面の中でだけできるようにして、
+    // 削除に「1 段挟む」という確認を持たせる（WiFi と同じ形）。
     if (id >= kIdProfile) {
-        if (action_) action_(Action::kConnectProfile, id - kIdProfile);
+        prof_sel_    = id - kIdProfile;
+        prof_parent_ = screen_;
+        enter(Screen::kProfile);
         return;
     }
     // **上から順に見る。** 帯域が広いほうから判定しないと、スキャン結果の id が
@@ -281,8 +325,14 @@ void MenuUi::activate(int id)
         return;
     }
     switch (id) {
-        case kIdSsh: enter(Screen::kSsh); break;
-        case kIdVpn: enter(Screen::kVpn); break;
+        case kIdSsh:
+            note_[0] = '\0';
+            enter(Screen::kSsh);
+            break;
+        case kIdVpn:
+            note_[0] = '\0';
+            enter(Screen::kVpn);
+            break;
         case kIdSettings: enter(Screen::kSettings); break;
         case kIdTerminal:
             if (action_) action_(Action::kShowTerminal, -1);
@@ -300,7 +350,7 @@ void MenuUi::activate(int id)
             if (action_) action_(Action::kReloadProfiles, -1);
             break;
         case kIdWifi:
-            wifi_note_[0] = '\0';
+            note_[0] = '\0';
             enter(Screen::kWifi);
             break;
         case kIdWifiNew:
@@ -317,6 +367,12 @@ void MenuUi::activate(int id)
             break;
         case kIdWifiMan:
             if (action_) action_(Action::kWifiAddManual, -1);
+            break;
+        case kIdProfConn:
+            if (action_) action_(Action::kConnectProfile, prof_sel_);
+            break;
+        case kIdProfDel:
+            if (action_) action_(Action::kDeleteProfile, prof_sel_);
             break;
         case kIdBack: enter(parent_of(screen_)); break;
         default: break;
@@ -356,6 +412,8 @@ void MenuUi::draw(bool force)
         case Screen::kWifi:
         case Screen::kWifiNet: title = "WiFi"; break;
         case Screen::kWifiScan: title = "WiFi scan"; break;
+        // 詳細画面は入ってきた一覧の見出しを引き継ぐ（どこから入ったか分かるように）。
+        case Screen::kProfile: title = (prof_parent_ == Screen::kVpn) ? "VPN" : "SSH"; break;
         case Screen::kRoot: break;
     }
     gfx_.setTextColor(TFT_CYAN, kBg);
