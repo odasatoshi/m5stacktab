@@ -109,6 +109,26 @@ python tools/serial_log.py --seconds 20      # ログ採取
   - GPIO31/32 の I2C は M5GFX が `I2C_NUM_1` で握っている。別のポートで同じピンに
     `i2c_new_master_bus` すると GPIO マトリクスの出力選択を奪い合うので、
     このピンを触りたいときは M5GFX 側の I2C を使う
+- **カメラ (SC202CS / MIPI-CSI) は I2C バスを M5GFX から借りる** (#77)。
+  センサの SCCB は G31/G32 = **M5GFX が I2C_NUM_1 で握っているバス**にぶら下がっている。
+  - `esp_video` に `init_sccb = true` で作らせると **`I2C bus id(1) has already been
+    acquired`** で落ちる（実機で確認）。別のポートで同じピンに master bus を作る手も
+    あるが、GPIO マトリクスの出力選択を奪い合う
+  - **`i2c_master_get_bus_handle(1, &bus)` で取得済みのハンドルを貰い、
+    `init_sccb = false` で渡す。** 所有権は M5GFX のまま、使わせるだけにできる
+  - **電源もリセットも自分で書かなくてよい。** CAM_EN は IO エクスパンダ 0x43 の
+    pin6 で、`display.init()` が書く `0b01110110` に含まれる（C6 が 0x44 pin0 なのと
+    同じ構図）。**ただし display.init() より前に呼ぶとハンドルが無くて失敗する**
+  - **`CONFIG_ESP_VIDEO_ENABLE_DVP_VIDEO_DEVICE` は切る。** esp_video 2.5.0 の DVP は
+    ESP-IDF v5.5.1 に無い `cam_ctlr_format_conv_config_t` /
+    `esp_cam_ctlr_format_conversion()` を使うので、有効のままだとコンポーネントの
+    ビルドが通らない。Tab5 に DVP の配線は無い
+  - **取り込んだらバッファを返す (`VIDIOC_REQBUFS` count=0)。** 1280x720 の RGB565 が
+    2 枚で 3.6MB あり、返さないと **PSRAM を握ったまま**になる（30.2MB → 26.5MB のまま
+    戻らないのを確認した）
+  - **「取れた」を枚数やエラーコードで判断しない。** 全部 0 のバッファでも DQBUF は
+    成功する。輝度の min/max を見て **min != max** を確かめる（`camtest` が出す）。
+    フレーム間で mean が揺れていればセンサが生きている（ノイズ）
 - **純正キーボード (A164) は USB ではなく I2C**。Ext.Port1 (G0=SDA / G1=SCL / INT=G50) に
   STM32 が居て、アドレスは 0x6D。**電源は自分で入れなくてよい** — Ext.Port1 の 5V は
   IO エクスパンダ 0x43 の bit2 (EXT5V_EN) で、M5GFX の Tab5 初期化が OUT_SET に

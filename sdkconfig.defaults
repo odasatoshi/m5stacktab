@@ -82,3 +82,18 @@ CONFIG_FATFS_API_ENCODING_UTF_8=y
 # 先頭 1 件しか試さない。lwIP が 1 件しか返さないことが前提になっているので、
 # 増やすなら ts_client 側にフォールバックを足すこと（#68 の ponytail コメント）。
 CONFIG_LWIP_DNS_MAX_HOST_IP=1
+
+# --- カメラ (#77) ---
+# Tab5 のセンサは SC202CS (SC2356)。**他のセンサのドライバは入れない**
+# （esp_cam_sensor は既定で全部ビルドするので、バイナリが無駄に膨らむ）。
+CONFIG_CAMERA_SC202CS=y
+CONFIG_CAMERA_SC202CS_AUTO_DETECT_MIPI_INTERFACE_SENSOR=y
+# QR は 1280x720 で 7.2 px/モジュール取れる（ECDSA 鍵なら QR は version 13 相当）。
+# **1600x1200 は ISP の上限 (1920x1080) を高さで超える**ので既定にしない。
+CONFIG_CAMERA_SC202CS_MIPI_RAW8_1280X720_30FPS=y
+CONFIG_CAMERA_SC202CS_MIPI_DEFAULT_FMT_RAW8_1280X720_30FPS=y
+# **DVP (パラレル) は切る。** esp_video 2.5.0 の DVP デバイスは ESP-IDF v5.5.1 に
+# 無い `cam_ctlr_format_conv_config_t` / `esp_cam_ctlr_format_conversion()` を使うので、
+# 有効のままだとコンポーネントのビルドが通らない。Tab5 のカメラは MIPI-CSI で、
+# DVP は配線されていないため要らない。
+CONFIG_ESP_VIDEO_ENABLE_DVP_VIDEO_DEVICE=n

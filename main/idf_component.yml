@@ -11,3 +11,7 @@ dependencies:
   # Tailscale の対話ログイン (#59) で AuthURL を QR にする。
   # 自前で書かない（生成多項式とマスク選択を持つ必要がある）。依存なしの小さな実装。
   espressif/qrcode: "^0.2.0"
+  # カメラ (#77)。QR で接続先を取り込むための土台。
+  # MIPI-CSI + ISP を V4L2 で扱う。SC202CS (Tab5 のセンサ) のドライバは
+  # esp_cam_sensor 側にあり、これが引き込む。
+  espressif/esp_video: "^2.5"
