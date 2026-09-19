@@ -25,7 +25,13 @@ CONFIG_CACHE_L2_CACHE_LINE_128B=y
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 
 CONFIG_FREERTOS_HZ=1000
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+# **メインループのスタック。** 描画・メニュー・タッチが全部ここで走る。
+# 8192 だと**平常時ですら残り 3200 バイト**しかなく、接続先の削除 (#73) で
+# cJSON を通すと 1660 バイトまで落ちた（実機で指でタップして測定）。
+# **`menu enter` はコンソールタスク (32KB) で走るので 27484 バイトに見えていて、
+# 実機を触らないと出てこない数字だった。**
+# ワーカタスクに逃がしても平常時の細さは変わらないので、ここを広げる。
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 CONFIG_COMPILER_CXX_EXCEPTIONS=y
 
 # --- ESP32-C6 経由の WiFi (esp-hosted / SDIO) ---
