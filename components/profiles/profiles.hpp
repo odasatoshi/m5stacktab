@@ -80,4 +80,16 @@ const char* type_name(Type t);
 // **成功も失敗も同じ 1 か所で畳む**ために切り出してある（片方だけ畳むと本数が食い違う）。
 std::vector<std::string> referenced_keys(const Config& cfg);
 
+// JSON から name の 1 件を落として書き戻す (#73)。消せたら true。
+//
+// **index ではなく name で引く。** parse は壊れた項目を飛ばすので、
+// `Config::profiles[i]` の i は JSON の配列添字と一致しない
+// （飛ばした項目より後ろを消すと 1 つずれた別の接続先が消える）。
+//
+// **同名が 2 つ以上あるときは消さずに false を返す。** parse の重複検査は
+// 受け入れた項目どうししか見ないので、飛ばされた項目とは名前がぶつかれる。
+// どちらを指しているか決められないまま先頭を消すと、一覧に残っている方ではなく
+// 壊れている方が消えて「押したのに何も起きない」になる。
+bool remove_profile(const std::string& json, const std::string& name, std::string* out);
+
 }  // namespace prof
