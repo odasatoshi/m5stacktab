@@ -256,16 +256,39 @@ python $IDF_PATH/components/partition_table/parttool.py --port /dev/cu.usbmodem1
 - **ed25519 は使えない**（`LIBSSH2_ED25519 = 0`）
 - **OpenSSH 形式 (`-----BEGIN OPENSSH PRIVATE KEY-----`) は使えない**。mbedTLS は PKCS#1 / SEC1 の
   PEM しか解釈しないので `ssh-keygen -m PEM` が必須
-- **RSA (PEM) は動作確認済み**
-- **ECDSA は「named curve」形式でないと通らない**。`ssh-keygen -t ecdsa -m PEM` が作る鍵は
-  曲線パラメータを**明示的に展開**した形（ASN.1 に `prime-field` から全部入る）で、
-  mbedTLS は named curve（OID）しか解釈できず `-0x3d00 (PK - Invalid key tag or value)` になる。
-  openssl で作るか変換すれば通る:
+- **ECDSA は 2 つの条件を両方満たさないと通らない** (#75):
+  1. **named curve 形式であること。** `ssh-keygen -t ecdsa -m PEM` が作る鍵は曲線パラメータを
+     **明示的に展開**した形（ASN.1 に `prime-field` から全部入る）で、mbedTLS は named curve
+     (OID) しか解釈できない。openssl で作るか変換する
+  2. **公開鍵を秘密鍵の後ろに続けて書くこと。** 公開鍵を渡さないと libssh2 は秘密鍵から
+     導出する経路に入るが、mbedTLS バックエンドのその実装
+     (`_libssh2_mbedtls_pub_priv_key`) は **RSA 決め打ち**で、`Key type not supported`
+     になる（上流 master でも未修正）
 
-```sh
-openssl ecparam -name prime256v1 -genkey -noout -out key.pem          # 新規作成
-openssl ec -in ssh_key -out key.pem -param_enc named_curve            # 既存を変換
-```
+  ```sh
+  openssl ecparam -name prime256v1 -genkey -noout -out key.pem   # 新規作成
+  openssl ec -in ssh_key -out key.pem -param_enc named_curve     # 既存を変換
+  ssh-keygen -y -f key.pem > key.pub
+  cat key.pem key.pub > key_combined.pem      # この順で 1 つのパーティションに書く
+  ```
+
+- **`-0x3d00 (PK - Invalid key tag or value)` を曲線形式のせいだと決めつけない。**
+  named curve の正しい鍵でも同じ番号が出る経路がある。libssh2 の
+  `_libssh2_mbedtls_ecdsa_new_private_frommemory` (`mbedtls.c:1335`) は
+  `data_len + 1` を `LIBSSH2_ALLOC`（= malloc）して `data_len` バイトしか埋めず、
+  `data_len + 1` で `mbedtls_pk_parse_key` に渡す。mbedTLS は
+  「`key[keylen-1] != '\0'` なら PEM ではない」と判断するので、**未初期化の 1 バイト**で
+  結果が決まる（実機では常に `0x4f` が入り、**間欠ではなく毎回**失敗した）。
+  **同じファイルの RSA 版は `mbedtls_calloc` を使っていて無事** — 誰かが RSA だけ直して
+  ECDSA を直し忘れている。上流 master では修正済み (`f7fa81ca5956`) だが、
+  **リリースにも ESP のコンポーネントにも入っていない**（libssh2 の最新安定版は 1.11.1、
+  `skuodi/libssh2_esp` の最新 1.1.0 が手元と同じ）。
+  - **回避は「DER で渡す」。** DER なら mbedTLS が ASN.1 の SEQUENCE 長から終端を
+    引き直すので、その 1 バイトを読まない。渡すバッファは libssh2 が確保するため
+    **呼び出し側から末尾バイトは触れず、これがライブラリに手を入れずに済む唯一の経路**。
+    `main/ssh.cpp` の `ec_pem_to_der()` が EC のときだけ詰め替える
+  - **RSA は触らない。** libssh2 側が無事で PEM のまま動いているものを変える理由がない
+- **RSA (PEM) は動作確認済み**（公開鍵は付けても付けなくても通る）
 
 鍵のパースだけを確かめたいときは実機の `keytest` コマンドを使う。
 失敗理由は文字列で出る（`CONFIG_MBEDTLS_ERROR_STRINGS` は ESP-IDF の既定が `y`。`sdkconfig.defaults` に明示してあるのは意図を残すためで、これを消しても出る）。**`CONFIG_MBEDTLS_ERROR_C` という symbol は存在しない** ので、書いても `sdkconfig` 再生成のときに `unknown kconfig symbol` の警告が出るだけ。

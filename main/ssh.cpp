@@ -13,6 +13,9 @@
 #include <freertos/task.h>
 #include <lwip/netdb.h>
 #include <lwip/sockets.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/pk.h>
 #include <mbedtls/sha256.h>
 #include <errno.h>
 #include <esp_check.h>
@@ -113,6 +116,106 @@ bool verify_host_key(LIBSSH2_SESSION* session, const char* host, uint16_t port)
     return ok;
 }
 
+// 秘密鍵 PEM の後ろに `.pub` の行が続いていれば切り分ける (#75)。
+//
+// **PEM の終端で切る。** 行数や「空行が区切り」では切らない — PEM の本体には
+// 改行しか無く、`ssh-keygen -y` が吐く公開鍵は 1 行なので、終端マーカーが
+// 唯一の確実な境目になる。
+//
+// 公開鍵が無い鍵（今までの `sshkey` パーティション）では pub が空になり、
+// 呼び出し側が nullptr を渡す = 従来どおりの動作。
+void split_key_blob(const std::string& blob, std::string* priv, std::string* pub)
+{
+    priv->assign(blob);
+    pub->clear();
+    const size_t end = blob.rfind("-----END ");
+    if (end == std::string::npos) return;
+    const size_t eol = blob.find('\n', end);
+    if (eol == std::string::npos) return;
+
+    std::string rest = blob.substr(eol + 1);
+    // 前後の空白を落とす。改行だけが残っている（= 公開鍵は無い）のが普通。
+    const size_t b = rest.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return;
+    const size_t e = rest.find_last_not_of(" \t\r\n");
+    rest = rest.substr(b, e - b + 1);
+    // **`.pub` の行に見えるものだけ受ける。** ここに PEM の続きや案内文が
+    // 入っていると、libssh2 に渡した時点で鍵ごと弾かれる。
+    if (rest.compare(0, 4, "ssh-") != 0 && rest.compare(0, 6, "ecdsa-") != 0) return;
+
+    priv->assign(blob, 0, eol + 1);
+    pub->assign(rest);
+}
+
+// 鍵のパースに要る乱数源。EC は座標ブラインディングで f_rng を必須にしている。
+// 初回だけ種をまく。失敗したら nullptr（呼び出し側は PEM のまま進む）。
+mbedtls_ctr_drbg_context* ssh_drbg()
+{
+    static mbedtls_ctr_drbg_context ctr;
+    static mbedtls_entropy_context  ent;
+    static bool                     ready = false;
+    static bool                     tried = false;
+    if (!tried) {
+        tried = true;
+        mbedtls_ctr_drbg_init(&ctr);
+        mbedtls_entropy_init(&ent);
+        static const char* pers = "ssh-key";
+        ready = (mbedtls_ctr_drbg_seed(&ctr, mbedtls_entropy_func, &ent,
+                                       reinterpret_cast<const unsigned char*>(pers),
+                                       std::strlen(pers)) == 0);
+    }
+    return ready ? &ctr : nullptr;
+}
+
+// EC の秘密鍵を PEM から DER に詰め直す (#75)。詰め替えたら true。
+//
+// **libssh2 の ECDSA frommemory 経路が PEM を受け取れない。**
+// `_libssh2_mbedtls_ecdsa_new_private_frommemory` (mbedtls.c:1335) は
+// `data_len + 1` を `LIBSSH2_ALLOC`（= malloc）して `data_len` バイトしか埋めず、
+// `data_len + 1` で `mbedtls_pk_parse_key` に渡す。mbedTLS は
+// 「`key[keylen-1] != '\0'` なら PEM ではない」と判断するので、**未初期化の
+// 1 バイト**で結果が決まる（実機では常に 0x4f が入り、毎回 `-0x3d00` で失敗した）。
+// **同じファイルの RSA 版は `mbedtls_calloc` を使っていて無事**なので、
+// 誰かが RSA だけ直して ECDSA を直し忘れている。上流の master では修正済み
+// (f7fa81ca5956) だが、リリースにも ESP のコンポーネントにも入っていない。
+//
+// **DER なら ASN.1 の SEQUENCE 長から終端を引き直すので、その 1 バイトを読まない。**
+// 渡すバッファは libssh2 が確保するので、呼び出し側から末尾バイトは触れない。
+// これが「ライブラリに手を入れずに済む唯一の経路」。
+//
+// **RSA は触らない。** libssh2 側が無事で、PEM のまま動いているものを変える理由がない。
+bool ec_pem_to_der(const std::string& pem, std::string* der)
+{
+    // EC でなければ何もしない（安い先読み。パースしてから判定すると RSA でも毎回
+    // 鍵を展開することになる）。
+    if (pem.find("EC PRIVATE KEY") == std::string::npos &&
+        pem.find("BEGIN PRIVATE KEY") == std::string::npos) {
+        return false;
+    }
+    // mbedTLS は鍵データの末尾が NUL であることを要求する。std::string の data() は
+    // data()[size()] が '\0' なので、長さに +1 して渡せばよい。
+    mbedtls_pk_context pk;
+    mbedtls_pk_init(&pk);
+    mbedtls_ctr_drbg_context* drbg = ssh_drbg();
+    if (!drbg ||
+        mbedtls_pk_parse_key(&pk, reinterpret_cast<const unsigned char*>(pem.data()),
+                             pem.size() + 1, nullptr, 0, mbedtls_ctr_drbg_random, drbg) != 0) {
+        mbedtls_pk_free(&pk);
+        return false;
+    }
+    if (mbedtls_pk_get_type(&pk) != MBEDTLS_PK_ECKEY) {
+        mbedtls_pk_free(&pk);
+        return false;
+    }
+    // mbedtls_pk_write_key_der は**バッファの末尾から前向きに**書き、長さを返す。
+    unsigned char buf[1024];
+    const int     len = mbedtls_pk_write_key_der(&pk, buf, sizeof(buf));
+    mbedtls_pk_free(&pk);
+    if (len <= 0) return false;
+    der->assign(reinterpret_cast<const char*>(buf) + sizeof(buf) - len, static_cast<size_t>(len));
+    return true;
+}
+
 // 秘密鍵は専用パーティションから読む。NVS の blob 長制限も base64 変換も要らない。
 std::string load_private_key()
 {
@@ -148,10 +251,26 @@ bool authenticate(LIBSSH2_SESSION* session, const SshConfig& cfg)
     // 無ければ従来どおり sshkey パーティション。
     const std::string key = cfg.key_pem.empty() ? load_private_key() : cfg.key_pem;
     if (!key.empty()) {
-        // 公開鍵は渡さない。OpenSSH 形式の秘密鍵には公開鍵が含まれているため libssh2 が導出する。
+        // **公開鍵が続けて書いてあれば渡す (#75)。** 渡さないと libssh2 は秘密鍵から
+        // 公開鍵を導出する経路に入るが、mbedTLS バックエンドのその実装
+        // (`_libssh2_mbedtls_pub_priv_key`) は **RSA 決め打ち**で、ECDSA を
+        // "Key type not supported" で弾く（`LIBSSH2_ECDSA` は 1 で、署名側の
+        // `_libssh2_mbedtls_ecdsa_sign` は実装されているのに、ここだけが塞いでいる）。
+        // 渡せば導出を飛ばし、種別は公開鍵の側から決まる。
+        //
+        // 無ければ今までどおり nullptr。RSA はそれで動いているので壊さない。
+        std::string priv, pub;
+        split_key_blob(key, &priv, &pub);
+        // **EC だけ DER に詰め替える (#75)。** 理由は ec_pem_to_der のコメント。
+        std::string der;
+        if (ec_pem_to_der(priv, &der)) {
+            ESP_LOGI(TAG, "EC key: re-encoded PEM -> DER (%d bytes) for libssh2", (int)der.size());
+            priv = der;
+        }
         // パスフレーズ付きの鍵なら cfg.password をパスフレーズとして使う。
         const int rc = libssh2_userauth_publickey_frommemory(
-            session, cfg.user.c_str(), cfg.user.size(), nullptr, 0, key.data(), key.size(),
+            session, cfg.user.c_str(), cfg.user.size(), pub.empty() ? nullptr : pub.data(),
+            pub.size(), priv.data(), priv.size(),
             cfg.password.empty() ? nullptr : cfg.password.c_str());
         if (rc == 0) {
             ESP_LOGI(TAG, "authenticated with private key (%d bytes)", (int)key.size());
@@ -343,6 +462,46 @@ void ssh_task(void*)
 }
 
 }  // namespace
+
+// 秘密鍵 PEM と、続けて書かれた `.pub` を切り分ける (#75)。切り方は上の
+// split_key_blob にしかない（`keytest` が同じ関数を見るようにするための口）。
+void ssh_key_split(const std::string& blob, std::string* priv, std::string* pub)
+{
+    split_key_blob(blob, priv, pub);
+}
+
+// 鍵の切り分けの自己テスト (#75)。**切り方を間違えると「鍵が壊れている」と
+// しか見えない**（libssh2 は秘密鍵ごと弾く）ので、合成入力で固めておく。
+// `keytest` から呼ぶ。失敗したら最初に落ちたケースを detail に入れる。
+bool ssh_key_split_selftest(std::string* detail)
+{
+    const std::string pem = "-----BEGIN EC PRIVATE KEY-----\nMHcC\n-----END EC PRIVATE KEY-----\n";
+    const std::string pub = "ecdsa-sha2-nistp256 AAAAE2Vj tab5";
+    struct Case {
+        const char* what;
+        std::string blob;
+        std::string want_priv;
+        std::string want_pub;
+    };
+    const Case cases[] = {
+        {"公開鍵なし（従来の鍵）", pem, pem, ""},
+        {"公開鍵つき", pem + pub + "\n", pem, pub},
+        {"公開鍵つき（空行を挟む）", pem + "\n\n" + pub, pem, pub},
+        {"ssh-rsa の公開鍵", pem + "ssh-rsa AAAAB3 x", pem, "ssh-rsa AAAAB3 x"},
+        // **公開鍵に見えないゴミは渡さない。** 渡すと鍵ごと弾かれる。
+        {"末尾がゴミ", pem + "# memo\n", pem + "# memo\n", ""},
+        {"PEM の終端が無い", "garbage", "garbage", ""},
+    };
+    for (const Case& c : cases) {
+        std::string priv, p;
+        split_key_blob(c.blob, &priv, &p);
+        if (priv == c.want_priv && p == c.want_pub) continue;
+        if (detail) *detail = std::string(c.what) + ": priv=" + std::to_string(priv.size()) +
+                              "B pub=\"" + p + "\"";
+        return false;
+    }
+    return true;
+}
 
 esp_err_t ssh_config_load(SshConfig& out)
 {
