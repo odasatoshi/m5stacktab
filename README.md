@@ -25,6 +25,8 @@ WiFi         : ESP32-C6 経由 (esp-hosted / SDIO)、切断時は指数バック
                接続先を 5 件まで NVS に保存し、画面から追加・選択・削除できる
 SSH          : RSA (PEM) 秘密鍵で認証、PTY 106x16
 かな漢字変換  : にほんご→日本語 160us / かんじ→12 候補 272us
+カメラ        : SC202CS (MIPI-CSI 1 レーン) 1280x720 RGB565、1 枚 46ms
+               SCCB は M5GFX が持つ I2C_NUM_1 のバスを借りる
 WireGuard    : netif 100.64.0.0/10 mtu 1280、keepalive と rekey 実装
 DISCO        : NaCl crypto_box（公式テストベクタで全層一致）
 ```
@@ -92,6 +94,7 @@ USB Type-C のシリアルコンソール（`screen /dev/cu.usbmodem101 115200`�
 | `kbdinject <key-name> [mod]` | 打鍵を合成する（mod: 1=Ctrl 4=Alt）。遠隔で送出経路を確かめる |
 | `flip [0\|1\|on\|off]` | 画面を 180 度反転（純正キーボードを付けた向き） |
 | `menu [show\|hide\|up\|down\|enter\|esc]` | メニューの操作（指なしで検証するため） |
+| `camtest` | カメラ (MIPI-CSI) を立ち上げて 1 枚取り込む (#77) |
 | `wgtest` | WireGuard の暗号とハンドシェイクを実機で検証 |
 | `wg <tunnel-ip> [pubkey] [host:port]` | WireGuard トンネルの netif |
 | `wg stat` / `wg disco` / `wg down` | 統計・DISCO 状態・停止 |

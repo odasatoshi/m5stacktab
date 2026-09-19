@@ -57,6 +57,7 @@
 #include "menu_ui.hpp"
 #include "nvs_store.hpp"
 #include "profiles.hpp"
+#include "camera.hpp"
 #include "sdcard.hpp"
 #include "status_bar.hpp"
 #include "tap_gesture.hpp"
@@ -3743,6 +3744,53 @@ int cmd_nvsstat(int, char**)
     return 0;
 }
 
+// カメラを立ち上げて素性を出す (#77)。**最初の実機確認はこれ 1 つで 3 つ判定できる**:
+// SCCB が 0x36 に届くか / LDO (chan3) が取れるか / どの解像度が通るか。
+int cmd_camtest(int, char**)
+{
+    // **ロックが要るのは立ち上げだけ。** センサの SCCB は M5GFX が握っている I2C
+    // (G31/G32) にぶら下がっているので、初期化はタッチの読み取りと重ねられない。
+    // **取り込みは SCCB を一切触らない**（DMA と ISP だけ）ので、ロックの外でやる。
+    //
+    // **取り込みをロックの中でやってはいけない。** 1 枚 46ms かかるうえ、
+    // 来なければタイムアウトまで 500ms 待つ。その間ずっと画面のロックを握ると、
+    // 描画ループが TermGuard の 2 秒に当たる。
+    TermGuard guard;
+    if (!guard.ok()) {
+        std::printf("busy\n");
+        return 1;
+    }
+    if (esp_err_t err = cam::init(); err != ESP_OK) {
+        std::printf("カメラを開けない: %s\n", esp_err_to_name(err));
+        std::printf("  上のログに esp_video / esp_cam_sensor の理由が出ている\n");
+        return 1;
+    }
+
+    cam::Info info;
+    if (esp_err_t err = cam::probe(&info); err != ESP_OK) {
+        std::printf("素性を読めない: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+    std::printf("driver=%s card=%s\n", info.driver.c_str(), info.card.c_str());
+    std::printf("%ux%u %s (stride %u, %u バイト/枚)\n", (unsigned)info.width,
+                (unsigned)info.height, cam::fourcc(info.pixelformat).c_str(),
+                (unsigned)info.bytesperline, (unsigned)info.sizeimage);
+
+    // **列挙だけでは「動いた」と言えない。** 1 枚取って中身を数字で見る。
+    cam::Frame f;
+    if (esp_err_t err = cam::capture(&f); err != ESP_OK) {
+        std::printf("取り込めない: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+    std::printf("1 枚取得: %u バイト / %u us、輝度 min=%u max=%u mean=%u\n", (unsigned)f.bytes,
+                (unsigned)f.us, (unsigned)f.min, (unsigned)f.max, (unsigned)f.mean);
+    if (f.min == f.max) {
+        std::printf("!! 全画素が同じ値。レンズを塞いでいないなら画が来ていない\n");
+        return 1;
+    }
+    return 0;
+}
+
 // sshkey パーティションの鍵を mbedTLS で直接パースして、失敗理由を表示する。
 // libssh2 経由だと LIBSSH2_ERROR_FILE (-16) しか分からないため（#17）。
 int cmd_keytest(int, char**)
@@ -4230,6 +4278,8 @@ void register_term_commands()
          &cmd_discoloop, nullptr, nullptr, nullptr},
         {"keytest", "sshkey パーティションの鍵を mbedTLS で直接パースする", nullptr, &cmd_keytest,
          nullptr, nullptr, nullptr},
+        {"camtest", "カメラ (MIPI-CSI) を立ち上げて素性を出す", nullptr, &cmd_camtest, nullptr,
+         nullptr, nullptr},
         {"nvsstat", "NVS の使用量と中身を見る（#57 の設計用）", nullptr, &cmd_nvsstat, nullptr,
          nullptr, nullptr},
         {"screencap", "画面をシリアルに吸い出す（PNG は tools/screencap.py）", "[step]",
