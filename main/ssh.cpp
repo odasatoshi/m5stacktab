@@ -16,6 +16,7 @@
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/pk.h>
+#include <mbedtls/platform_util.h>
 #include <mbedtls/sha256.h>
 #include <errno.h>
 #include <esp_check.h>
@@ -139,6 +140,12 @@ void split_key_blob(const std::string& blob, std::string* priv, std::string* pub
     if (b == std::string::npos) return;
     const size_t e = rest.find_last_not_of(" \t\r\n");
     rest = rest.substr(b, e - b + 1);
+    // **1 行目だけを取る。** `memory_read_publickey` は「最初の空白の次から次の空白まで」を
+    // base64 として読むので、2 行目が続いていると `AAAA\nssh-rsa` を食わせることになり、
+    // `Invalid key data, not base64 encoded` で鍵認証ごと落ちる。
+    rest = rest.substr(0, rest.find('\n'));
+    // 行末の CR も落とす（CRLF で書かれた鍵）。
+    while (!rest.empty() && (rest.back() == '\r' || rest.back() == ' ')) rest.pop_back();
     // **`.pub` の行に見えるものだけ受ける。** ここに PEM の続きや案内文が
     // 入っていると、libssh2 に渡した時点で鍵ごと弾かれる。
     if (rest.compare(0, 4, "ssh-") != 0 && rest.compare(0, 6, "ecdsa-") != 0) return;
@@ -184,7 +191,7 @@ mbedtls_ctr_drbg_context* ssh_drbg()
 // これが「ライブラリに手を入れずに済む唯一の経路」。
 //
 // **RSA は触らない。** libssh2 側が無事で、PEM のまま動いているものを変える理由がない。
-bool ec_pem_to_der(const std::string& pem, std::string* der)
+bool ec_pem_to_der(const std::string& pem, const std::string& passphrase, std::string* der)
 {
     // EC でなければ何もしない（安い先読み。パースしてから判定すると RSA でも毎回
     // 鍵を展開することになる）。
@@ -199,7 +206,16 @@ bool ec_pem_to_der(const std::string& pem, std::string* der)
     mbedtls_ctr_drbg_context* drbg = ssh_drbg();
     if (!drbg ||
         mbedtls_pk_parse_key(&pk, reinterpret_cast<const unsigned char*>(pem.data()),
-                             pem.size() + 1, nullptr, 0, mbedtls_ctr_drbg_random, drbg) != 0) {
+                             pem.size() + 1,
+                             passphrase.empty() ? nullptr
+                                                : reinterpret_cast<const unsigned char*>(
+                                                      passphrase.data()),
+                             passphrase.size(), mbedtls_ctr_drbg_random, drbg) != 0) {
+        // **ここで黙って返ってはいけない。** EC の鍵だと分かっているのに展開できないのは
+        // 「曲線パラメータが展開形式」か「パスフレーズが違う」。PEM のまま進むと
+        // libssh2 の未初期化 1 バイト経路に落ちて `-0x3d00` になり、
+        // **CLAUDE.md が「この番号を曲線形式のせいだと決めつけるな」と書いた罠を自分で踏む**。
+        ESP_LOGW(TAG, "EC key: cannot parse (named curve でないか、パスフレーズが違う)");
         mbedtls_pk_free(&pk);
         return false;
     }
@@ -211,9 +227,16 @@ bool ec_pem_to_der(const std::string& pem, std::string* der)
     unsigned char buf[1024];
     const int     len = mbedtls_pk_write_key_der(&pk, buf, sizeof(buf));
     mbedtls_pk_free(&pk);
-    if (len <= 0) return false;
-    der->assign(reinterpret_cast<const char*>(buf) + sizeof(buf) - len, static_cast<size_t>(len));
-    return true;
+    if (len > 0) {
+        der->assign(reinterpret_cast<const char*>(buf) + sizeof(buf) - len,
+                    static_cast<size_t>(len));
+    } else {
+        ESP_LOGW(TAG, "EC key: cannot re-encode to DER (%d)", len);
+    }
+    // **平文の秘密鍵をスタックに残さない。** この領域は戻った先で libssh2 の
+    // 送受信バッファに使い回される。
+    mbedtls_platform_zeroize(buf, sizeof(buf));
+    return len > 0;
 }
 
 // 秘密鍵は専用パーティションから読む。NVS の blob 長制限も base64 変換も要らない。
@@ -263,7 +286,7 @@ bool authenticate(LIBSSH2_SESSION* session, const SshConfig& cfg)
         split_key_blob(key, &priv, &pub);
         // **EC だけ DER に詰め替える (#75)。** 理由は ec_pem_to_der のコメント。
         std::string der;
-        if (ec_pem_to_der(priv, &der)) {
+        if (ec_pem_to_der(priv, cfg.password, &der)) {
             ESP_LOGI(TAG, "EC key: re-encoded PEM -> DER (%d bytes) for libssh2", (int)der.size());
             priv = der;
         }
@@ -470,6 +493,14 @@ void ssh_key_split(const std::string& blob, std::string* priv, std::string* pub)
     split_key_blob(blob, priv, pub);
 }
 
+// EC の鍵を本番と同じ手順で DER に詰め直せるか確かめる口 (#75)。
+// **`keytest` が本番経路を通るためにある** — 生 PEM を mbedTLS に通すだけでは
+// 「parse ok なのに繋ぐと落ちる」を取りこぼす。
+bool ssh_key_ec_to_der(const std::string& pem, const std::string& passphrase, std::string* der)
+{
+    return ec_pem_to_der(pem, passphrase, der);
+}
+
 // 鍵の切り分けの自己テスト (#75)。**切り方を間違えると「鍵が壊れている」と
 // しか見えない**（libssh2 は秘密鍵ごと弾く）ので、合成入力で固めておく。
 // `keytest` から呼ぶ。失敗したら最初に落ちたケースを detail に入れる。
@@ -490,6 +521,9 @@ bool ssh_key_split_selftest(std::string* detail)
         {"ssh-rsa の公開鍵", pem + "ssh-rsa AAAAB3 x", pem, "ssh-rsa AAAAB3 x"},
         // **公開鍵に見えないゴミは渡さない。** 渡すと鍵ごと弾かれる。
         {"末尾がゴミ", pem + "# memo\n", pem + "# memo\n", ""},
+        // **2 行目は捨てる。** 続けて書かれていると base64 に改行が混ざって鍵認証ごと落ちる。
+        {"公開鍵の後ろに 1 行", pem + pub + "\nssh-rsa BBB\n", pem, pub},
+        {"CRLF", pem + pub + "\r\n", pem, pub},
         {"PEM の終端が無い", "garbage", "garbage", ""},
     };
     for (const Case& c : cases) {

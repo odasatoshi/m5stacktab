@@ -3788,6 +3788,20 @@ int cmd_keytest(int, char**)
                         (int)(sp == std::string::npos ? pub.size() : sp), pub.c_str(),
                         (int)pub.size());
         }
+        // **本番と同じ経路を通す。** 生 PEM を mbedTLS に通すだけだと
+        // 「parse ok なのに繋ぐと落ちる」（named curve でない / パスフレーズが違う）を
+        // 取りこぼす。EC でなければ何も出さない。
+        std::string der;
+        if (priv.find("EC PRIVATE KEY") != std::string::npos ||
+            priv.find("BEGIN PRIVATE KEY") != std::string::npos) {
+            SshConfig saved;
+            ssh_config_load(saved);  // パスフレーズは接続時と同じものを使う
+            if (ssh_key_ec_to_der(priv, saved.password, &der)) {
+                std::printf("EC → DER: %d バイト（libssh2 に渡せる）\n", (int)der.size());
+            } else {
+                std::printf("!! EC → DER に失敗した。このままでは接続時に -0x3d00 になる\n");
+            }
+        }
     }
 
     mbedtls_pk_context pk;
