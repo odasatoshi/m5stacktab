@@ -138,8 +138,30 @@ esp_err_t capture(Frame* out)
         return ESP_FAIL;
     }
 
-    void*  mapped[kBufferCount] = {};
+    void*  mapped[kBufferCount]     = {};
     size_t mapped_len[kBufferCount] = {};
+    bool   streaming                = false;
+    int    type                     = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+    // **後始末は 1 か所にまとめる。** 途中で失敗したときに unmap と REQBUFS(0) を
+    // 忘れると、**1 回の失敗ごとに 3.6MB の PSRAM が消える**（成功経路だけ直しても
+    // 気づけない。失敗するのはたいてい繰り返し試しているときなので、なお悪い）。
+    auto cleanup = [&]() {
+        if (streaming) ioctl(s_fd, VIDIOC_STREAMOFF, &type);
+        for (uint32_t i = 0; i < kBufferCount; ++i) {
+            if (mapped[i] && mapped[i] != MAP_FAILED) munmap(mapped[i], mapped_len[i]);
+        }
+        // 1280x720 の RGB565 が 2 枚で 3.6MB。返さないと握ったままになる
+        // （実機で 30.2MB → 26.5MB のまま戻らないのを確認した）。
+        v4l2_requestbuffers rel = {};
+        rel.count               = 0;
+        rel.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        rel.memory              = V4L2_MEMORY_MMAP;
+        if (ioctl(s_fd, VIDIOC_REQBUFS, &rel) != 0) {
+            ESP_LOGW(TAG, "バッファを返せない: errno=%d (PSRAM を握ったままになる)", errno);
+        }
+    };
+
     for (uint32_t i = 0; i < req.count && i < kBufferCount; ++i) {
         v4l2_buffer b = {};
         b.type        = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -147,80 +169,76 @@ esp_err_t capture(Frame* out)
         b.index       = i;
         if (ioctl(s_fd, VIDIOC_QUERYBUF, &b) != 0) {
             ESP_LOGE(TAG, "VIDIOC_QUERYBUF(%u) failed: errno=%d", (unsigned)i, errno);
+            cleanup();
             return ESP_FAIL;
         }
         mapped[i] = mmap(nullptr, b.length, PROT_READ, MAP_SHARED, s_fd, b.m.offset);
         if (mapped[i] == MAP_FAILED) {
             ESP_LOGE(TAG, "mmap(%u) failed: errno=%d", (unsigned)i, errno);
+            cleanup();
             return ESP_ERR_NO_MEM;
         }
         mapped_len[i] = b.length;
         if (ioctl(s_fd, VIDIOC_QBUF, &b) != 0) {
             ESP_LOGE(TAG, "VIDIOC_QBUF(%u) failed: errno=%d", (unsigned)i, errno);
+            cleanup();
             return ESP_FAIL;
         }
     }
 
-    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (ioctl(s_fd, VIDIOC_STREAMON, &type) != 0) {
         ESP_LOGE(TAG, "VIDIOC_STREAMON failed: errno=%d", errno);
+        cleanup();
         return ESP_FAIL;
     }
+    streaming = true;
 
-    const int64_t t0 = esp_timer_get_time();
+    const int64_t t0  = esp_timer_get_time();
     v4l2_buffer   got = {};
     got.type          = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     got.memory        = V4L2_MEMORY_MMAP;
-    esp_err_t ret     = ESP_OK;
     if (ioctl(s_fd, VIDIOC_DQBUF, &got) != 0) {
         ESP_LOGE(TAG, "VIDIOC_DQBUF failed: errno=%d", errno);
-        ret = ESP_FAIL;
-    } else {
-        out->bytes = got.bytesused;
-        out->us    = static_cast<uint32_t>(esp_timer_get_time() - t0);
-
-        // **画が来ているかを数字で見る。** RGB565 の緑 (6bit) を 8bit に伸ばして
-        // 最小・最大・平均を取る。**全部 0 のバッファを「成功」と言わないため**で、
-        // 画面が見られない環境ではこれが唯一の手がかりになる。
-        const auto* p    = static_cast<const uint8_t*>(mapped[got.index]);
-        const size_t n   = got.bytesused;
-        uint32_t     sum = 0;
-        uint32_t     cnt = 0;
-        uint8_t      lo  = 255;
-        uint8_t      hi  = 0;
-        // 全画素は舐めない（1280x720 で 92 万画素）。16 画素ごとで足りる。
-        for (size_t i = 0; i + 1 < n; i += 32) {
-            const uint16_t px = static_cast<uint16_t>(p[i] | (p[i + 1] << 8));
-            const uint8_t  g  = static_cast<uint8_t>(((px >> 5) & 0x3F) << 2);
-            lo = g < lo ? g : lo;
-            hi = g > hi ? g : hi;
-            sum += g;
-            ++cnt;
-        }
-        out->min  = cnt ? lo : 0;
-        out->max  = cnt ? hi : 0;
-        out->mean = cnt ? static_cast<uint8_t>(sum / cnt) : 0;
-        ioctl(s_fd, VIDIOC_QBUF, &got);
+        cleanup();
+        return ESP_FAIL;
+    }
+    // **index は信用して使う前に確かめる。** mmap していない枠を返されると
+    // null を舐めることになる。
+    if (got.index >= kBufferCount || !mapped[got.index] || mapped[got.index] == MAP_FAILED) {
+        ESP_LOGE(TAG, "DQBUF returned unmapped index %u", (unsigned)got.index);
+        cleanup();
+        return ESP_FAIL;
     }
 
-    ioctl(s_fd, VIDIOC_STREAMOFF, &type);
-    for (uint32_t i = 0; i < req.count && i < kBufferCount; ++i) {
-        if (mapped[i] && mapped[i] != MAP_FAILED) munmap(mapped[i], mapped_len[i]);
+    out->bytes = got.bytesused;
+    out->us    = static_cast<uint32_t>(esp_timer_get_time() - t0);
+
+    // **画が来ているかを数字で見る。** RGB565 の緑 (6bit) を 8bit に伸ばして
+    // 最小・最大・平均を取る。**全部 0 のバッファでも DQBUF は成功する**ので、
+    // 画面が見られない環境ではこれが「本当に撮れたか」の唯一の手がかりになる。
+    const auto*  p   = static_cast<const uint8_t*>(mapped[got.index]);
+    const size_t n   = got.bytesused < mapped_len[got.index] ? got.bytesused
+                                                             : mapped_len[got.index];
+    uint32_t     sum = 0;
+    uint32_t     cnt = 0;
+    uint8_t      lo  = 255;
+    uint8_t      hi  = 0;
+    // 全画素は舐めない（1280x720 で 92 万画素）。16 画素ごとで足りる。
+    for (size_t i = 0; i + 1 < n; i += 32) {
+        const uint16_t px = static_cast<uint16_t>(p[i] | (p[i + 1] << 8));
+        const uint8_t  g  = static_cast<uint8_t>(((px >> 5) & 0x3F) << 2);
+        lo = g < lo ? g : lo;
+        hi = g > hi ? g : hi;
+        sum += g;
+        ++cnt;
     }
-    // **バッファを返す。** 1280x720 の RGB565 が 2 枚で 3.6MB あり、**返さないと
-    // 取り込みが終わっても PSRAM を握ったまま**になる（実機で 30.2MB → 26.5MB のまま
-    // 戻らないのを確認した）。取り込みは「シャッターを切る」使い方なので、
-    // 毎回確保し直してよい。
-    v4l2_requestbuffers rel = {};
-    rel.count               = 0;
-    rel.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    rel.memory              = V4L2_MEMORY_MMAP;
-    if (ioctl(s_fd, VIDIOC_REQBUFS, &rel) != 0) {
-        // 返せなくても取り込み自体は成功している。次の取り込みで確保し直せるかは
-        // ドライバ次第なので、黙らせずに残す。
-        ESP_LOGW(TAG, "バッファを返せない: errno=%d (PSRAM を握ったままになる)", errno);
-    }
-    return ret;
+    out->min  = cnt ? lo : 0;
+    out->max  = cnt ? hi : 0;
+    out->mean = cnt ? static_cast<uint8_t>(sum / cnt) : 0;
+    ioctl(s_fd, VIDIOC_QBUF, &got);
+
+    cleanup();
+    return ESP_OK;
 }
 
 }  // namespace cam
