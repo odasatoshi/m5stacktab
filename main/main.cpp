@@ -3684,6 +3684,54 @@ void connect_profile(int index)
     start_connect(index, "", /*have_password=*/false);
 }
 
+// メニューから接続先を 1 件消す (#73)。**消すのは NVS だけ** — SD の原本は残るので、
+// `profiles import` でいつでも戻せる。
+//
+// **鍵 (`k_<name>`) は消さない。** 複数の接続先が同じ鍵を指すので、巻き添えになる
+// （`referenced_keys` で参照が絶えたか判定はできるが、1 本だけ消す NVS API が無い。
+// 掃除したければ `profiles clear` + `profiles import` で作り直せる）。
+//
+// ponytail: cJSON のパースと書き出しはここで同期にやる（`cmd_profiles` の
+// clear / reload と同じ形）。再帰の深さは profiles.json の構造ぶん (4 段) しか
+// 無いので 8KB の kbd タスクでも足りる — 実機のログに headroom を出して確かめる。
+// esp-hosted の RPC のように数秒ブロックはしないので、ワーカには逃がさない。
+void delete_profile(int index)
+{
+    if (index < 0 || index >= static_cast<int>(s_profiles.profiles.size())) return;
+    // **接続処理の最中は断る。** `connect_worker` は待っている間に index を引き直すので、
+    // ここで詰めると「選んだのと別の接続先に繋ぐ」が起きる。
+    if (s_connect_task) {
+        term_note("31", "接続処理が走っている（終わるまで待つ）");
+        return;
+    }
+    const std::string name = s_profiles.profiles[index].name;
+
+    std::string json;
+    if (esp_err_t err = nvs_profiles_load(&json); err != ESP_OK) {
+        term_note("31", std::string("消せない: ") + esp_err_to_name(err));
+        return;
+    }
+    std::string out;
+    if (!prof::remove_profile(json, name, &out)) {
+        term_note("31", "消せない: \"" + name + "\" が JSON に見つからない");
+        return;
+    }
+    if (esp_err_t err = nvs_profiles_store(out); err != ESP_OK) {
+        term_note("31", std::string("消せない: ") + esp_err_to_name(err));
+        return;
+    }
+    load_profiles();
+    ESP_LOGI(TAG, "profiles: deleted \"%s\" -> %s (stack headroom %u bytes)", name.c_str(),
+             s_profiles_status, (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+    // **詳細画面に残さない。** 消えた index を指したまま「接続」が押せてしまう。
+    if (menu) {
+        menu->show_profile_list();
+        menu->set_info(gather_menu_info(gather_status()));
+        menu->refresh();
+        menu->draw();
+    }
+}
+
 // 一覧から選ぶのと同じ経路を、指も画面も無しで叩く。
 int cmd_connect(int argc, char** argv)
 {
@@ -4334,6 +4382,9 @@ extern "C" void app_main(void)
         switch (a) {
             case MenuUi::Action::kConnectProfile:
                 connect_profile(index);
+                break;
+            case MenuUi::Action::kDeleteProfile:
+                delete_profile(index);
                 break;
             case MenuUi::Action::kReloadProfiles:
                 load_profiles();

@@ -364,4 +364,34 @@ Config parse(const std::string& json)
     return cfg;
 }
 
+bool remove_profile(const std::string& json, const std::string& name, std::string* out)
+{
+    if (!out || name.empty()) return false;
+    cJSON* root = cJSON_Parse(json.c_str());
+    if (!root) return false;
+
+    bool   removed = false;
+    cJSON* arr     = cJSON_GetObjectItemCaseSensitive(root, "profiles");
+    if (cJSON_IsArray(arr)) {
+        const int n = cJSON_GetArraySize(arr);
+        for (int i = 0; i < n; ++i) {
+            if (get_string(cJSON_GetArrayItem(arr, i), "name") != name) continue;
+            cJSON_DeleteItemFromArray(arr, i);
+            removed = true;
+            break;
+        }
+    }
+    if (removed) {
+        char* s = cJSON_PrintUnformatted(root);
+        if (s) {
+            out->assign(s);
+            cJSON_free(s);
+        } else {
+            removed = false;  // 書き出せないなら消えていないことにする（元の JSON を残す）
+        }
+    }
+    cJSON_Delete(root);
+    return removed;
+}
+
 }  // namespace prof

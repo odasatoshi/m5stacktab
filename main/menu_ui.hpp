@@ -29,7 +29,7 @@ static_assert(kMaxWifiScanRows > 0, "スキャン結果を並べる行が残ら�
 
 class MenuUi {
 private:
-    enum class Screen { kRoot, kSsh, kVpn, kSettings, kWifi, kWifiNet, kWifiScan };
+    enum class Screen { kRoot, kSsh, kVpn, kSettings, kWifi, kWifiNet, kWifiScan, kProfile };
 
 public:
     // メニューから起こす動作。main が実装を差す（この層は描画と選択だけを持つ）。
@@ -39,6 +39,7 @@ public:
         kWgUp,             // 保存済みの設定で WireGuard を上げる
         kShowTerminal,     // 端末に移る（メニューを閉じる）
         kConnectProfile,   // SD の profiles.json の N 番目に繋ぐ (#49)
+        kDeleteProfile,    // NVS から N 番目を消す (#73)。SD の原本は残る
         kReloadProfiles,   // SD を読み直す
         // --- WiFi (#56)。index は保存済み / スキャン結果の何番目か ---
         kWifiConnect,      // 保存済みの N 番目に繋ぐ
@@ -99,6 +100,11 @@ public:
     // 足した / 消したあとに一覧へ戻る。
     void show_wifi_list();
 
+    // 接続先を消したあとに、入ってきた一覧 (SSH / VPN) へ戻る (#73)。
+    // **消した後に詳細画面へ残してはいけない** — 消えた index を指したまま
+    // 「接続」が押せてしまう。
+    void show_profile_list();
+
     // キー入力。処理したら true。
     bool key(ui::Key k);
     // タップ。処理したら true。
@@ -108,7 +114,7 @@ public:
 
 private:
     // Esc / "< Back" の戻り先。入れ子が 2 段になった (#56) ので表にする。
-    static Screen parent_of(Screen s);
+    Screen parent_of(Screen s) const;
     void enter(Screen s);
     void activate(int id);
     void rebuild();
@@ -136,5 +142,10 @@ private:
     char                             wifi_note_[96] = {};
     // kWifiNet で見ている保存済みの index。
     int                              wifi_sel_ = -1;
+    // kProfile で見ている接続先の index と、そこへ入る前の一覧 (#73)。
+    // **戻り先は覚えておく。** 同じ詳細画面に SSH 画面からも VPN 画面からも入るので、
+    // parent_of() を型で分岐させると、消した後に戻る先が種類で変わる。
+    int                              prof_sel_    = -1;
+    Screen                           prof_parent_ = Screen::kSsh;
     std::function<void(Action, int)> action_;
 };
