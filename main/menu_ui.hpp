@@ -16,10 +16,10 @@
 // **画面に必要な行数と ui::Menu の上限を結び付ける。** rebuild() は "< Back" を
 // 最後に足すので、溢れると**指で抜ける唯一の経路が黙って消える**（残る行は
 // 全部 disabled で hit_test が -1 を返す）。上限を上げたらここで気づけるようにする。
-static_assert(ui::Menu::kMaxItems >= 2 + (int)prof::kMaxVpnProfiles + 1,
-              "VPN 画面: 状態 2 行 + プロファイル + \"< Back\" が入らない");
-static_assert(ui::Menu::kMaxItems >= (int)prof::kMaxSshProfiles + 1 + 1,
-              "SSH 画面: プロファイル + 保存済み 1 件 + \"< Back\" が入らない");
+static_assert(ui::Menu::kMaxItems >= 1 + 2 + (int)prof::kMaxVpnProfiles + 1,
+              "VPN 画面: 注記 + 状態 2 行 + プロファイル + \"< Back\" が入らない");
+static_assert(ui::Menu::kMaxItems >= 1 + (int)prof::kMaxSshProfiles + 1 + 1,
+              "SSH 画面: 注記 + プロファイル + 保存済み 1 件 + \"< Back\" が入らない");
 // WiFi 画面 (#56): 注記 1 + 保存済み + "Create new wifi setting" + "< Back"。
 static_assert(ui::Menu::kMaxItems >= 1 + (int)kMaxWifiNets + 2,
               "WiFi 画面: 注記 + 保存済み + 追加 + \"< Back\" が入らない");
@@ -90,8 +90,11 @@ public:
     // wifi.cpp の都合で、この層は行を並べるだけ）。**呼び出し側が保持し続けること。**
     void set_wifi_nets(const std::vector<std::string>* v) { wifi_nets_ = v; }
     void set_wifi_scan(const std::vector<std::string>* v) { wifi_scan_ = v; }
-    // WiFi の画面の先頭に出す 1 行（「スキャン中…」「5 件で満杯」など）。空なら出さない。
-    void set_wifi_note(const std::string& s);
+    // 画面の先頭に出す 1 行（「スキャン中…」「5 件で満杯」「消せない理由」など）。
+    // **WiFi と接続先で同じ 1 本を使う** — 画面は同時に 1 つしか出ないので、
+    // 別々に持つと「どちらを消し忘れたか」だけが増える。空なら出さない。
+    void set_note(const std::string& s);
+    void set_wifi_note(const std::string& s) { set_note(s); }
     // 今 WiFi の一覧を見ているか。**スキャンの結果に飛ばしてよいかの判定に使う** —
     // 数秒待つ間に Back で抜けていたら、いきなり飛ばすと画面を奪うことになる。
     bool on_wifi_list() const { return screen_ == Screen::kWifi; }
@@ -115,6 +118,9 @@ public:
 private:
     // Esc / "< Back" の戻り先。入れ子が 2 段になった (#56) ので表にする。
     Screen parent_of(Screen s) const;
+    // 先頭に注記の行を出す画面か。**set_note と rebuild で同じ表を見る**
+    // （片方だけ足すと、書いたのに出ない／消しても残るという形で出る）。
+    static bool shows_note(Screen s);
     void enter(Screen s);
     void activate(int id);
     void rebuild();
@@ -139,7 +145,7 @@ private:
     const prof::Config*              profiles_ = nullptr;
     const std::vector<std::string>*  wifi_nets_ = nullptr;
     const std::vector<std::string>*  wifi_scan_ = nullptr;
-    char                             wifi_note_[96] = {};
+    char                             note_[96] = {};
     // kWifiNet で見ている保存済みの index。
     int                              wifi_sel_ = -1;
     // kProfile で見ている接続先の index と、そこへ入る前の一覧 (#73)。

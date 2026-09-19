@@ -373,12 +373,22 @@ bool remove_profile(const std::string& json, const std::string& name, std::strin
     bool   removed = false;
     cJSON* arr     = cJSON_GetObjectItemCaseSensitive(root, "profiles");
     if (cJSON_IsArray(arr)) {
+        // **同じ名前が 2 つ以上あるなら消さない。** parse の重複検査は
+        // 受け入れた項目どうししか見ないので、**飛ばされた項目とは名前がぶつかれる**
+        // （`host` の無い "work" と、正しい "work" が並ぶ）。この状態で先頭を消すと、
+        // 一覧に出ている方ではなく壊れている方が消え、**見た目は何も起きない**。
+        // どちらを指しているか決められない以上、断るのが正しい
+        // （`profiles clear` + `import` で作り直せる）。
+        int found = -1;
+        int count = 0;
         const int n = cJSON_GetArraySize(arr);
         for (int i = 0; i < n; ++i) {
             if (get_string(cJSON_GetArrayItem(arr, i), "name") != name) continue;
-            cJSON_DeleteItemFromArray(arr, i);
+            if (count++ == 0) found = i;
+        }
+        if (count == 1) {
+            cJSON_DeleteItemFromArray(arr, found);
             removed = true;
-            break;
         }
     }
     if (removed) {

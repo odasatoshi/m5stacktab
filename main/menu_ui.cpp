@@ -103,6 +103,7 @@ void MenuUi::rebuild()
             add("Terminal", kIdTerminal, true);
             break;
         case Screen::kSsh:
+            if (note_[0]) add(note_, 0, false);
             add_profiles(/*ssh=*/true, &n);
             // NVS の 1 件はいつでも残す。SD が読めなくても繋げる経路が要る。
             std::snprintf(buf, sizeof(buf), "保存済み: %s",
@@ -111,6 +112,7 @@ void MenuUi::rebuild()
             add("< Back", kIdBack, true);
             break;
         case Screen::kVpn:
+            if (note_[0]) add(note_, 0, false);
             std::snprintf(buf, sizeof(buf), "Tailscale: %s", info_.ts_state);
             add(buf, 0, false);
             std::snprintf(buf, sizeof(buf), "WireGuard: %s", info_.wg_state);
@@ -135,7 +137,7 @@ void MenuUi::rebuild()
         case Screen::kWifi:
             // 注記は「スキャン中…」「5 件で満杯」など。**画面に理由を出す唯一の場所**
             // （端末に書いてもメニューを出している間は描かれない）。
-            if (wifi_note_[0]) add(wifi_note_, 0, false);
+            if (note_[0]) add(note_, 0, false);
             if (wifi_nets_) {
                 for (size_t i = 0; i < wifi_nets_->size() && i < kMaxWifiNets; ++i) {
                     add((*wifi_nets_)[i].c_str(), kIdWifiNet + static_cast<int>(i), true);
@@ -155,6 +157,7 @@ void MenuUi::rebuild()
             add("< Back", kIdBack, true);
             break;
         case Screen::kProfile: {
+            if (note_[0]) add(note_, 0, false);
             // WiFi と同じ「一覧 → 詳細 → 削除」の 2 段。**確認ダイアログの代わり**に
             // なっているので、一覧から直に消せるようにはしない。
             const prof::Profile* p = nullptr;
@@ -176,7 +179,7 @@ void MenuUi::rebuild()
             break;
         }
         case Screen::kWifiScan: {
-            if (wifi_note_[0]) add(wifi_note_, 0, false);
+            if (note_[0]) add(note_, 0, false);
             int shown = 0;
             if (wifi_scan_) {
                 for (size_t i = 0; i < wifi_scan_->size() && shown < kMaxWifiScanRows; ++i) {
@@ -208,10 +211,16 @@ MenuUi::Screen MenuUi::parent_of(Screen s) const
     }
 }
 
-void MenuUi::set_wifi_note(const std::string& s)
+bool MenuUi::shows_note(Screen s)
 {
-    std::snprintf(wifi_note_, sizeof(wifi_note_), "%s", s.c_str());
-    if (screen_ == Screen::kWifi || screen_ == Screen::kWifiScan) {
+    return s == Screen::kWifi || s == Screen::kWifiScan || s == Screen::kSsh ||
+           s == Screen::kVpn || s == Screen::kProfile;
+}
+
+void MenuUi::set_note(const std::string& s)
+{
+    std::snprintf(note_, sizeof(note_), "%s", s.c_str());
+    if (shows_note(screen_)) {
         // 選択位置は保たない。注記が増減すると行がずれるので、先頭から選び直す。
         rebuild();
         dirty_ = true;
@@ -316,8 +325,14 @@ void MenuUi::activate(int id)
         return;
     }
     switch (id) {
-        case kIdSsh: enter(Screen::kSsh); break;
-        case kIdVpn: enter(Screen::kVpn); break;
+        case kIdSsh:
+            note_[0] = '\0';
+            enter(Screen::kSsh);
+            break;
+        case kIdVpn:
+            note_[0] = '\0';
+            enter(Screen::kVpn);
+            break;
         case kIdSettings: enter(Screen::kSettings); break;
         case kIdTerminal:
             if (action_) action_(Action::kShowTerminal, -1);
@@ -335,7 +350,7 @@ void MenuUi::activate(int id)
             if (action_) action_(Action::kReloadProfiles, -1);
             break;
         case kIdWifi:
-            wifi_note_[0] = '\0';
+            note_[0] = '\0';
             enter(Screen::kWifi);
             break;
         case kIdWifiNew:

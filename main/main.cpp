@@ -3698,26 +3698,37 @@ void connect_profile(int index)
 void delete_profile(int index)
 {
     if (index < 0 || index >= static_cast<int>(s_profiles.profiles.size())) return;
+    // **理由はメニューの注記に出す。** term_note() は端末に書くが、render_term() は
+    // メニューが出ている間は早期 return するので、押した人には何も見えない
+    // （閉じたときに初めて出てくる）。
+    auto fail = [](const std::string& why) {
+        if (menu) {
+            menu->set_note(why);
+            menu->refresh();
+            menu->draw();
+        }
+        ESP_LOGW(TAG, "profiles: %s", why.c_str());
+    };
     // **接続処理の最中は断る。** `connect_worker` は待っている間に index を引き直すので、
     // ここで詰めると「選んだのと別の接続先に繋ぐ」が起きる。
     if (s_connect_task) {
-        term_note("31", "接続処理が走っている（終わるまで待つ）");
+        fail("接続処理が走っている（終わるまで待つ）");
         return;
     }
     const std::string name = s_profiles.profiles[index].name;
 
     std::string json;
     if (esp_err_t err = nvs_profiles_load(&json); err != ESP_OK) {
-        term_note("31", std::string("消せない: ") + esp_err_to_name(err));
+        fail(std::string("消せない: ") + esp_err_to_name(err));
         return;
     }
     std::string out;
     if (!prof::remove_profile(json, name, &out)) {
-        term_note("31", "消せない: \"" + name + "\" が JSON に見つからない");
+        fail("消せない: \"" + name + "\" を一意に引けない");
         return;
     }
     if (esp_err_t err = nvs_profiles_store(out); err != ESP_OK) {
-        term_note("31", std::string("消せない: ") + esp_err_to_name(err));
+        fail(std::string("消せない: ") + esp_err_to_name(err));
         return;
     }
     load_profiles();
@@ -3726,6 +3737,21 @@ void delete_profile(int index)
     // **詳細画面に残さない。** 消えた index を指したまま「接続」が押せてしまう。
     if (menu) {
         menu->show_profile_list();
+        // **消したことで壊れた設定を画面に出す。** VPN を消すと、それを `via` で
+        // 参照している SSH が黙って繋がらなくなる。parse は warning にしか
+        // 落とさないので、s_profiles_status は「N 件」としか言わない。
+        //
+        // **拾うのは「消した名前を指している」警告だけ。** warnings には前から
+        // あった分（壊れた項目など）も入っているので、先頭を出すと消したことと
+        // 無関係な行が出る（実機で確認: `hq` を消したのに "broken" の警告が出た）。
+        std::string note  = "消した: " + name;
+        const std::string via = "via \"" + name + "\"";
+        for (const auto& w : s_profiles.warnings) {
+            if (w.find(via) == std::string::npos) continue;
+            note += " / " + w;
+            break;
+        }
+        menu->set_note(note);
         menu->set_info(gather_menu_info(gather_status()));
         menu->refresh();
         menu->draw();

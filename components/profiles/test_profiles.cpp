@@ -348,8 +348,18 @@ void test_remove_profile()
     const prof::Config t = prof::parse(out);
     CHECK(t.profiles.size() == 1 && t.profiles[0].name == "a");
 
-    // 無い名前・空の名前・壊れた JSON では out に触らず false
+    // **飛ばされた項目と名前がぶつかったら消さない。** parse の重複検査は
+    // 受け入れた項目どうししか見ないので、この JSON は error にならない。
+    const char* dup = R"({"version":1,"profiles":[
+        {"name":"work","type":"ssh","host":"h1"},
+        {"name":"work","type":"ssh","host":"h2","user":"u"}]})";
+    const prof::Config d = prof::parse(dup);
+    CHECK(d.error.empty() && d.profiles.size() == 1);  // 1 件目は user 欠けで飛ぶ
     out = "untouched";
+    CHECK(!prof::remove_profile(dup, "work", &out));
+    CHECK(out == "untouched");
+
+    // 無い名前・空の名前・壊れた JSON では out に触らず false
     CHECK(!prof::remove_profile(kGood, "nosuch", &out));
     CHECK(!prof::remove_profile(kGood, "", &out));
     CHECK(!prof::remove_profile("{ broken", "a", &out));
