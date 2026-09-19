@@ -17,6 +17,19 @@ struct SshConfig {
     std::string key_pem;
 };
 
+// 秘密鍵 PEM と、続けて書かれた `.pub` を切り分ける (#75)。pub は無ければ空。
+// **ECDSA は公開鍵を渡さないと認証できない** — libssh2 の mbedTLS バックエンドは
+// 秘密鍵からの導出を RSA 決め打ちで実装しているため。
+void ssh_key_split(const std::string& blob, std::string* priv, std::string* pub);
+
+// EC の秘密鍵を本番と同じ手順で DER に詰め直す (#75)。EC でなければ false。
+// **`keytest` が本番経路を通るためにある。**
+bool ssh_key_ec_to_der(const std::string& pem, const std::string& passphrase, std::string* der);
+
+// 鍵の切り分け（秘密鍵 PEM + 続けて書いた .pub）の自己テスト (#75)。
+// `keytest` が呼ぶ。合成入力なので実機の鍵には触らない。
+bool ssh_key_split_selftest(std::string* detail);
+
 // NVS から接続先を読む / 書く（パスワードも NVS。画面から入力できるまでの手段）。
 esp_err_t ssh_config_load(SshConfig& out);
 
