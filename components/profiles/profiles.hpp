@@ -92,4 +92,12 @@ std::vector<std::string> referenced_keys(const Config& cfg);
 // 壊れている方が消えて「押したのに何も起きない」になる。
 bool remove_profile(const std::string& json, const std::string& name, std::string* out);
 
+// JSON に 1 件足して書き戻す (#82)。`entry` は profiles.json の 1 項目の JSON。
+// 足せたら true。`json` が空なら器から作る（1 件も取り込んでいない端末でも足せる）。
+//
+// **同じ name が既に有れば false。上書きしない。**
+// 新規作成の画面で既存と同じ名前を打っただけで接続先が差し替わると、
+// **繋ぐ先が変わったことに気づけない**。消してから足させる。
+bool add_profile(const std::string& json, const std::string& entry, std::string* out);
+
 }  // namespace prof
