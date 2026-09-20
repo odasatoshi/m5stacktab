@@ -192,10 +192,11 @@ std::string s_tunnel_peer_key;
 std::string s_tunnel_endpoint;
 bool        s_tunnel_peer_valid = false;
 
-// --- SD カードの接続先 (#49) ---
+// --- 接続先 (#49 / #60) ---
 //
-// **SD の中身は信用しない。** パーサが上限と書式を見ているので、ここは
-// 「読めたか」と「その理由」だけを持つ。読めなくても NVS の 1 件で繋げる。
+// **保存先は NVS**（SD は `profiles import` の取り込み元）。中身は信用しない —
+// パーサが上限と書式を見ているので、ここは「読めたか」と「その理由」だけを持つ。
+// 読めなくても NVS の 1 件で繋げる。
 constexpr const char* kProfilesPath = "/sdcard/tab5/profiles.json";
 constexpr const char* kKeysDir      = "/sdcard/tab5/keys/";
 
@@ -738,7 +739,7 @@ int import_profiles()
     return rc;
 }
 
-// SD の接続先を見る／読み直す。**飛ばした理由をここで出す** — 画面には
+// 接続先（NVS）を見る／読み直す。**飛ばした理由をここで出す** — 画面には
 // 1 行しか出ないので、書き損じを直すにはこれが要る。
 int cmd_profiles(int argc, char** argv)
 {
