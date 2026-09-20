@@ -109,12 +109,17 @@ python tools/serial_log.py --seconds 20      # ログ採取
   - GPIO31/32 の I2C は M5GFX が `I2C_NUM_1` で握っている。別のポートで同じピンに
     `i2c_new_master_bus` すると GPIO マトリクスの出力選択を奪い合うので、
     このピンを触りたいときは M5GFX 側の I2C を使う
-- **カメラ (SC202CS / MIPI-CSI) は I2C バスを M5GFX から借りる** (#77)。
-  センサの SCCB は G31/G32 = **M5GFX が I2C_NUM_1 で握っているバス**にぶら下がっている。
-  - `esp_video` に `init_sccb = true` で作らせると **`I2C bus id(1) has already been
-    acquired`** で落ちる（実機で確認）。別のポートで同じピンに master bus を作る手も
-    あるが、GPIO マトリクスの出力選択を奪い合う
-  - **`i2c_master_get_bus_handle(1, &bus)` で取得済みのハンドルを貰い、
+- **カメラ (SC202CS / MIPI-CSI) は撤去した (#77 → #83)。** QR で接続先を取り込む (#79)
+  の土台として入れたが、#79 は取り下げ、接続先はメニューから作れるようにした (#82)。
+  `main/camera.{cpp,hpp}` / `camtest` / `espressif/esp_video` の依存 /
+  `CONFIG_CAMERA_SC202CS*` / `CONFIG_ESP_VIDEO_ENABLE_DVP_VIDEO_DEVICE` を削った。
+  **コードは消したがハードの知見は残す**
+  （復活させるときは以下を踏まえて `git revert` で戻す）:
+  - **I2C バスは M5GFX から借りる。** センサの SCCB は G31/G32 = **M5GFX が
+    I2C_NUM_1 で握っているバス**にぶら下がっている。`esp_video` に `init_sccb = true`
+    で作らせると **`I2C bus id(1) has already been acquired`** で落ちる（実機で確認）。
+    別のポートで同じピンに master bus を作る手もあるが、GPIO マトリクスの出力選択を
+    奪い合う。**`i2c_master_get_bus_handle(1, &bus)` で取得済みのハンドルを貰い、
     `init_sccb = false` で渡す。** 所有権は M5GFX のまま、使わせるだけにできる
   - **電源もリセットも自分で書かなくてよい。** CAM_EN は IO エクスパンダ 0x43 の
     pin6 で、`display.init()` が書く `0b01110110` に含まれる（C6 が 0x44 pin0 なのと
@@ -137,12 +142,16 @@ python tools/serial_log.py --seconds 20      # ログ採取
     ESP-IDF v5.5.1 に無い `cam_ctlr_format_conv_config_t` /
     `esp_cam_ctlr_format_conversion()` を使うので、有効のままだとコンポーネントの
     ビルドが通らない。Tab5 に DVP の配線は無い
+  - **`CONFIG_CAMERA_SC202CS*` を明示的に入れる。** esp_cam_sensor のセンサは
+    **全部 `default n`** なので、放っておくと何も入らない（既定で全部ビルドでは無い）
   - **取り込んだらバッファを返す (`VIDIOC_REQBUFS` count=0)。** 1280x720 の RGB565 が
     2 枚で 3.6MB あり、返さないと **PSRAM を握ったまま**になる（30.2MB → 26.5MB のまま
-    戻らないのを確認した）
+    戻らないのを確認した）。失敗経路でも返すこと（後始末は 1 か所にまとめる）
   - **「取れた」を枚数やエラーコードで判断しない。** 全部 0 のバッファでも DQBUF は
-    成功する。輝度の min/max を見て **min != max** を確かめる（`camtest` が出す）。
-    フレーム間で mean が揺れていればセンサが生きている（ノイズ）
+    成功する。輝度の min/max を見て **min != max** を確かめる（`camtest` が出した）。
+    フレーム間で mean が揺れていればセンサが生きている（ノイズ）。
+    `V4L2_BUF_FLAG_ERROR`（成功 + 長さ 0 + エラーフラグ）と、ISP が外れて RAW8 に
+    なるケース（画素形式を確かめないと統計が無意味）も見る
 - **純正キーボード (A164) は USB ではなく I2C**。Ext.Port1 (G0=SDA / G1=SCL / INT=G50) に
   STM32 が居て、アドレスは 0x6D。**電源は自分で入れなくてよい** — Ext.Port1 の 5V は
   IO エクスパンダ 0x43 の bit2 (EXT5V_EN) で、M5GFX の Tab5 初期化が OUT_SET に
@@ -360,6 +369,21 @@ mtime ごと戻すので、**書き換えたまま作られたオブジェクト
 （他の .cpp は static_assert でコンパイル自体が失敗したので 5 のまま = 食い違う）。
 
 戻したら **`touch` するか `git checkout -- <file>` を使い、確認の後は `idf.py fullclean`** を挟む。
+
+## 依存を差し替えたらビルドが古いままになることがある
+
+`dependencies.lock` と `managed_components/` は gitignore なので、**lock を消した人から
+順に `^` 制約内の最新版へ静かに上がる**。そして component manager はキャッシュから
+ファイルをコピーするため **新しい版でも mtime が古く、ninja が再ビルドを飛ばす**。
+`.bin` のサイズが変わらないので「依存の変動は効いていない」と誤読する。
+
+実際に踏んだ (#83): m5gfx を `"0.2.27"` に厳密ピン留めしてビルド → 制約を `^0.2.27` に
+戻して再解決（lock 上で 0.2.29 になるのを確認）→ビルドしても `.bin` は 0.2.27 のまま。
+`idf.py fullclean` を挟んで初めて 0x36a500 → 0x36c6b0 に変わった。
+
+**サイズの前後比較は同じ依存解決で取ること**（lock を消して測り直すと、削除した量と
+-version の差分が混ざる）。m5gfx 0.2.29 は PSRAM の空きを 1.84MB 減らすので、
+ピン留めするか受け入れるかは #87 で決める。
 
 ## ホストテストで使う mbedTLS
 
