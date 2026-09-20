@@ -366,6 +366,58 @@ Config parse(const std::string& json)
     return cfg;
 }
 
+std::string to_json(const Profile& p)
+{
+    cJSON* o = cJSON_CreateObject();
+    auto   put = [o](const char* k, const std::string& v) {
+        if (!v.empty()) cJSON_AddStringToObject(o, k, v.c_str());
+    };
+    put("name", p.name);
+    cJSON_AddStringToObject(o, "type", type_name(p.type));
+    switch (p.type) {
+        case Type::kSsh:
+            put("host", p.host);
+            put("user", p.user);
+            cJSON_AddNumberToObject(o, "port", p.port ? p.port : 22);
+            put("key", p.key);
+            put("via", p.via);
+            // **鍵が無ければパスワード認証。** 書かないと parse が「鍵で繋ぐ」と
+            // 読み、鍵が無いまま接続して失敗する。パスワードそのものは書かない
+            // （NVS を読める人が全部読めてしまう）。繋ぐときに画面から聞く。
+            if (p.ask_password || p.key.empty()) cJSON_AddStringToObject(o, "auth", "password");
+            break;
+        case Type::kWireGuard: {
+            put("address", p.address);
+            put("private_key", p.private_key);
+            cJSON* peer = cJSON_AddObjectToObject(o, "peer");
+            if (!p.peer.pubkey.empty()) cJSON_AddStringToObject(peer, "pubkey", p.peer.pubkey.c_str());
+            if (!p.peer.endpoint.empty())
+                cJSON_AddStringToObject(peer, "endpoint", p.peer.endpoint.c_str());
+            if (!p.peer.allowed_ips.empty()) {
+                cJSON* arr = cJSON_AddArrayToObject(peer, "allowed_ips");
+                for (const auto& a : p.peer.allowed_ips) {
+                    cJSON_AddItemToArray(arr, cJSON_CreateString(a.c_str()));
+                }
+            }
+            break;
+        }
+        case Type::kTailscale:
+            put("control", p.control);
+            put("authkey", p.authkey);
+            // **0 は書かない。** 0 は「未指定」で、書くと parse が 0 番ポートとして扱う
+            // （TLS かどうかは control のスキームで決まる）。
+            if (p.port) cJSON_AddNumberToObject(o, "port", p.port);
+            break;
+    }
+    std::string out;
+    if (char* s = cJSON_PrintUnformatted(o); s) {
+        out.assign(s);
+        cJSON_free(s);
+    }
+    cJSON_Delete(o);
+    return out;
+}
+
 bool add_profile(const std::string& json, const std::string& entry, std::string* out)
 {
     if (!out || entry.empty()) return false;

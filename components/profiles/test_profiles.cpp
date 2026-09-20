@@ -414,6 +414,72 @@ void test_add_profile()
     CHECK(out == "untouched");
 }
 
+// **画面で作った設定が読み戻せることを 1 本で見る (#82)。** to_json と parse が
+// 食い違うと「保存はできたのに一覧に出ない」になり、実機でしか気づけない。
+void test_to_json_roundtrip()
+{
+    prof::Profile ssh;
+    ssh.type = prof::Type::kSsh;
+    ssh.name = "jump";
+    ssh.host = "10.0.0.5";
+    ssh.user = "user";
+    ssh.port = 2222;
+    ssh.key  = "id.pem";
+    std::string out;
+    CHECK(prof::add_profile("", prof::to_json(ssh), &out));
+    prof::Config c = prof::parse(out);
+    CHECK(c.error.empty());
+    const prof::Profile* got = prof::find(c, "jump");
+    CHECK(got && got->host == "10.0.0.5" && got->user == "user" && got->port == 2222);
+    CHECK(got && got->key == "id.pem" && !got->ask_password);
+
+    // **鍵が無ければパスワード認証になる。** auth を書かないと鍵で繋ごうとする。
+    prof::Profile pw = ssh;
+    pw.key.clear();
+    out.clear();
+    CHECK(prof::add_profile("", prof::to_json(pw), &out));
+    c   = prof::parse(out);
+    got = prof::find(c, "jump");
+    CHECK(got && got->ask_password);
+
+    prof::Profile wg;
+    wg.type           = prof::Type::kWireGuard;
+    wg.name           = "office";
+    wg.address        = "10.9.0.2/32";
+    wg.private_key    = "wg.key";
+    wg.peer.pubkey    = "abc=";
+    wg.peer.endpoint  = "192.168.0.5:51820";
+    wg.peer.allowed_ips = {"10.9.0.0/24"};
+    out.clear();
+    CHECK(prof::add_profile("", prof::to_json(wg), &out));
+    c   = prof::parse(out);
+    got = prof::find(c, "office");
+    CHECK(got && got->peer.endpoint == "192.168.0.5:51820");
+    CHECK(got && got->peer.allowed_ips.size() == 1 && got->address == "10.9.0.2/32");
+
+    // tailscale は authkey 無し = 対話ログイン。**port 0 は書かない**
+    // （書くと parse が 0 番ポートとして扱う）。
+    prof::Profile ts;
+    ts.type    = prof::Type::kTailscale;
+    ts.name    = "ts";
+    ts.control = "https://hs.example.com";
+    out.clear();
+    CHECK(prof::add_profile("", prof::to_json(ts), &out));
+    c   = prof::parse(out);
+    got = prof::find(c, "ts");
+    CHECK(got && got->authkey.empty() && got->port == 0);  // 既定は「未指定」
+    CHECK(prof::to_json(ts).find("port") == std::string::npos);
+
+    // **壊れた入力は parse が弾く。** 画面側で書式を検査せず、保存の前に
+    // parse に通して「一覧に出るか」で見る、という作りの土台。
+    prof::Profile bad = wg;
+    bad.name          = "bad";
+    bad.address       = "not-an-address";
+    out.clear();
+    CHECK(prof::add_profile("", prof::to_json(bad), &out));
+    CHECK(prof::find(prof::parse(out), "bad") == nullptr);
+}
+
 void test_cidr()
 {
     std::string a;
@@ -459,6 +525,7 @@ int main()
     test_referenced_keys();
     test_remove_profile();
     test_add_profile();
+    test_to_json_roundtrip();
     test_cidr();
 
     std::printf("%d checks, %d failed\n", g_checks, g_fails);
