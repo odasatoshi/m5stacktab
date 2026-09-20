@@ -366,6 +366,22 @@ Config parse(const std::string& json)
     return cfg;
 }
 
+std::vector<std::string> split_list(const std::string& s)
+{
+    std::vector<std::string> out;
+    std::string              cur;
+    for (char c : s) {
+        if (c == ',' || c == ' ' || c == '\t') {
+            if (!cur.empty()) out.push_back(cur);
+            cur.clear();
+            continue;
+        }
+        cur += c;
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+
 std::string to_json(const Profile& p)
 {
     cJSON* o = cJSON_CreateObject();

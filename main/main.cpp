@@ -2216,6 +2216,7 @@ int cmd_menu(int argc, char** argv)
         set_menu_visible(show);
         std::printf("menu %s, terminal %dx%d\n", show ? "shown" : "hidden", renderer->cols(),
                     renderer->rows());
+        if (show) std::printf("%s\n", menu->state_line().c_str());
         return 0;
     }
     if (!menu->visible()) {
@@ -2237,6 +2238,9 @@ int cmd_menu(int argc, char** argv)
     menu->refresh();
     menu->key(k);
     menu->draw();
+    // **押した後にどこに居るかを返す。** 画面を読まずに `menu down` を連投すると
+    // 詳細画面の `削除`（`接続` の 1 行下、確認なし）を踏む。実際に踏んだ。
+    std::printf("%s\n", menu->state_line().c_str());
     return 0;
 }
 
@@ -3986,18 +3990,9 @@ void form_save()
         return;
     }
     prof::Profile p = s_form;
-    if (p.type == prof::Type::kWireGuard) {
-        p.peer.allowed_ips.clear();
-        std::string cur;
-        for (char c : s_form_allowed + ",") {
-            if (c == ',' || c == ' ') {
-                if (!cur.empty()) p.peer.allowed_ips.push_back(cur);
-                cur.clear();
-                continue;
-            }
-            cur += c;
-        }
-    }
+    // **分け方はパーサ側に置いてある** (`prof::split_list`)。ここで書くと
+    // ホストでテストできない（1 本に潰れても parse は通ってしまう）。
+    if (p.type == prof::Type::kWireGuard) p.peer.allowed_ips = prof::split_list(s_form_allowed);
     std::string json;
     if (const esp_err_t err = nvs_profiles_load(&json);
         err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {

@@ -318,6 +318,33 @@ void MenuUi::add_profiles(bool ssh, int* n)
                             : "(VPN の接続先が無い)", 0, false);
 }
 
+// **見出しは 1 か所で決める。** 画面とコンソールで別々に持つと、片方だけ
+// 取り残されて「ログの画面名と実際の画面が違う」という一番たちの悪い形になる。
+const char* MenuUi::screen_name() const
+{
+    switch (screen_) {
+        case Screen::kSsh: return "SSH";
+        case Screen::kVpn: return "VPN";
+        case Screen::kMisc: return "Miscellanea";
+        case Screen::kWifi:
+        case Screen::kWifiNet: return "WiFi";
+        case Screen::kWifiScan: return "WiFi scan";
+        // 詳細画面は入ってきた一覧の見出しを引き継ぐ（どこから入ったか分かるように）。
+        case Screen::kProfile: return (prof_parent_ == Screen::kVpn) ? "VPN" : "SSH";
+        case Screen::kForm: return (form_parent_ == Screen::kVpn) ? "New VPN" : "New SSH";
+        case Screen::kRoot: break;
+    }
+    return "m5stacktab";
+}
+
+std::string MenuUi::state_line() const
+{
+    const int sel = menu_.selected();
+    const char* label = (sel >= 0 && sel < menu_.count()) ? menu_.item(sel).label : "(なし)";
+    return std::string(screen_name()) + " | > " + (label ? label : "(空)") + " | " +
+           std::to_string(sel + 1) + "/" + std::to_string(menu_.count());
+}
+
 bool MenuUi::key(ui::Key k)
 {
     if (!visible_) return false;
@@ -449,21 +476,8 @@ void MenuUi::draw(bool force)
     gfx_.setFont(&fonts::efontJA_24);
     gfx_.setTextDatum(textdatum_t::top_left);
 
-    const char* title = "m5stacktab";
-    switch (screen_) {
-        case Screen::kSsh: title = "SSH"; break;
-        case Screen::kVpn: title = "VPN"; break;
-        case Screen::kMisc: title = "Miscellanea"; break;
-        case Screen::kWifi:
-        case Screen::kWifiNet: title = "WiFi"; break;
-        case Screen::kWifiScan: title = "WiFi scan"; break;
-        // 詳細画面は入ってきた一覧の見出しを引き継ぐ（どこから入ったか分かるように）。
-        case Screen::kProfile: title = (prof_parent_ == Screen::kVpn) ? "VPN" : "SSH"; break;
-        case Screen::kForm: title = (form_parent_ == Screen::kVpn) ? "New VPN" : "New SSH"; break;
-        case Screen::kRoot: break;
-    }
     gfx_.setTextColor(TFT_CYAN, kBg);
-    gfx_.drawString(title, 24, top_ + 16);
+    gfx_.drawString(screen_name(), 24, top_ + 16);
 
     // 窓の中だけ描く。**hit_test と同じ first_visible を使う**（片方だけ直すと
     // 押した行と繋ぐ先がずれる）。
