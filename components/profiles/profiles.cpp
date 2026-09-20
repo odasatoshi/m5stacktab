@@ -366,6 +366,55 @@ Config parse(const std::string& json)
     return cfg;
 }
 
+bool add_profile(const std::string& json, const std::string& entry, std::string* out)
+{
+    if (!out || entry.empty()) return false;
+    cJSON* item = cJSON_Parse(entry.c_str());
+    if (!item || !cJSON_IsObject(item)) {
+        cJSON_Delete(item);
+        return false;
+    }
+    const std::string name = get_string(item, "name");
+    if (name.empty()) {
+        cJSON_Delete(item);
+        return false;
+    }
+
+    // **空なら器から作る。** 1 件も取り込んでいない端末でもメニューから足せるようにする。
+    cJSON* root = json.empty() ? nullptr : cJSON_Parse(json.c_str());
+    if (!root) {
+        root = cJSON_CreateObject();
+        cJSON_AddNumberToObject(root, "version", 1);
+        cJSON_AddItemToObject(root, "profiles", cJSON_CreateArray());
+    }
+    cJSON* arr = cJSON_GetObjectItemCaseSensitive(root, "profiles");
+    if (!cJSON_IsArray(arr)) {
+        cJSON_Delete(root);
+        cJSON_Delete(item);
+        return false;
+    }
+    // **同じ名前が有れば断る。** 上書きすると、名前を打ち間違えただけで繋ぐ先が
+    // 変わったことに気づけない。
+    const int n = cJSON_GetArraySize(arr);
+    for (int i = 0; i < n; ++i) {
+        if (get_string(cJSON_GetArrayItem(arr, i), "name") != name) continue;
+        cJSON_Delete(root);
+        cJSON_Delete(item);
+        return false;
+    }
+
+    cJSON_AddItemToArray(arr, item);  // item の所有権は root に移る
+    bool  ok = false;
+    char* s  = cJSON_PrintUnformatted(root);
+    if (s) {
+        out->assign(s);
+        cJSON_free(s);
+        ok = true;
+    }
+    cJSON_Delete(root);
+    return ok;
+}
+
 bool remove_profile(const std::string& json, const std::string& name, std::string* out)
 {
     if (!out || name.empty()) return false;

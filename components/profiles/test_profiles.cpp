@@ -384,6 +384,36 @@ void test_remove_profile()
     CHECK(out == "untouched");
 }
 
+void test_add_profile()
+{
+    const char* entry = R"({"name":"new","type":"ssh","host":"h","user":"u","key":"k.pem"})";
+    std::string out;
+    CHECK(prof::add_profile(kGood, entry, &out));
+    const prof::Config c = prof::parse(out);
+    CHECK(c.error.empty());
+    CHECK(prof::find(c, "new") != nullptr);
+    CHECK(c.profiles.size() == prof::parse(kGood).profiles.size() + 1);
+    CHECK(prof::find(c, "bastion") != nullptr);  // 元からあるものは残る
+
+    // **空から作れる。** 1 件も取り込んでいない端末にメニューから足す経路。
+    out.clear();
+    CHECK(prof::add_profile("", entry, &out));
+    const prof::Config e = prof::parse(out);
+    CHECK(e.error.empty() && e.profiles.size() == 1);
+
+    // **同じ名前は断る。** 上書きすると繋ぐ先が変わったことに気づけない。
+    out = "untouched";
+    CHECK(!prof::add_profile(kGood, R"({"name":"bastion","type":"ssh","host":"x","user":"u"})",
+                             &out));
+    CHECK(out == "untouched");
+
+    // 壊れた入力・name 無し・配列は断る
+    CHECK(!prof::add_profile(kGood, "{ broken", &out));
+    CHECK(!prof::add_profile(kGood, R"({"type":"ssh","host":"h","user":"u"})", &out));
+    CHECK(!prof::add_profile(kGood, "[]", &out));
+    CHECK(out == "untouched");
+}
+
 void test_cidr()
 {
     std::string a;
@@ -428,6 +458,7 @@ int main()
     test_limits();
     test_referenced_keys();
     test_remove_profile();
+    test_add_profile();
     test_cidr();
 
     std::printf("%d checks, %d failed\n", g_checks, g_fails);
