@@ -482,7 +482,40 @@ void test_to_json_roundtrip()
     bad.address       = "not-an-address";
     out.clear();
     CHECK(prof::add_profile("", prof::to_json(bad), &out));
-    CHECK(prof::find(prof::parse(out), "bad") == nullptr);
+    const prof::Config badcfg = prof::parse(out);
+    CHECK(prof::find(badcfg, "bad") == nullptr);
+}
+
+void test_split_list()
+{
+    // **本数が要**。1 本に潰れると allowed_ips が「経路 1 本の壊れた設定」になり、
+    // parse は通ってしまう（書式としては CIDR 1 本に見える）。
+    const auto a = prof::split_list("10.9.0.0/24,10.8.0.0/24");
+    CHECK(a.size() == 2 && a[0] == "10.9.0.0/24" && a[1] == "10.8.0.0/24");
+    const auto b = prof::split_list(" 10.9.0.0/24 , 10.8.0.0/24 ,");
+    CHECK(b.size() == 2 && b[0] == "10.9.0.0/24" && b[1] == "10.8.0.0/24");
+    CHECK(prof::split_list("").empty());
+    CHECK(prof::split_list(" , , ").empty());
+    const auto c = prof::split_list("10.9.0.0/24");
+    CHECK(c.size() == 1 && c[0] == "10.9.0.0/24");
+
+    // 画面から来た 1 行がそのまま WireGuard の設定になるところまで見る。
+    prof::Profile wg;
+    wg.type             = prof::Type::kWireGuard;
+    wg.name             = "wg2";
+    wg.address          = "10.9.0.3/32";
+    wg.private_key      = "wg_hq.key";
+    wg.peer.pubkey      = "abcd=";
+    wg.peer.endpoint    = "192.168.0.101:51820";
+    wg.peer.allowed_ips = prof::split_list("10.9.0.0/24,10.8.0.0/24");
+    std::string out;
+    CHECK(prof::add_profile("", prof::to_json(wg), &out));
+    // **Config は名前を付けて持つ。** `find(parse(out), ...)` は一時オブジェクトを
+    // 指すポインタを返すので、式の終わりで消える（実際にここで segfault した）。
+    const prof::Config   cfg = prof::parse(out);
+    const prof::Profile* got = prof::find(cfg, "wg2");
+    CHECK(got && got->peer.allowed_ips.size() == 2);
+    CHECK(got && got->peer.allowed_ips[1] == "10.8.0.0/24");
 }
 
 void test_cidr()
@@ -531,6 +564,7 @@ int main()
     test_remove_profile();
     test_add_profile();
     test_to_json_roundtrip();
+    test_split_list();
     test_cidr();
 
     std::printf("%d checks, %d failed\n", g_checks, g_fails);

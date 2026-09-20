@@ -105,6 +105,12 @@ bool remove_profile(const std::string& json, const std::string& name, std::strin
 // **繋ぐ先が変わったことに気づけない**。消してから足させる。
 bool add_profile(const std::string& json, const std::string& entry, std::string* out);
 
+// "10.9.0.0/24, 10.8.0.0/24" をカンマ / 空白で分ける (#82)。画面から複数の値を
+// 1 行で聞くのに使う。空の要素は落とす（", ," や末尾のカンマで空文字を作らない）。
+//
+// **パーサ側に置く。** 書式を知っているのはこちらで、ホストでテストできるのもこちら。
+std::vector<std::string> split_list(const std::string& s);
+
 // Profile を profiles.json の 1 項目 (JSON) にする (#82)。`add_profile` に渡す形。
 //
 // **書式の知識をここから出さない。** 画面で組み立てた接続先を main 側で文字列に

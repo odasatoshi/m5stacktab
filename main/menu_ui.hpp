@@ -130,6 +130,12 @@ public:
     // 「接続」が押せてしまう。
     void show_profile_list();
 
+    // 今どの画面の、どの行にいるか。**コンソールから盲目的に操作しないため** —
+    // 詳細画面では `削除` が `接続` の 1 行下にあり、確認も無い。画面を読まずに
+    // `menu down` を連投すると**別の接続先を消す**（Reality Check で実際に 2 件消した）。
+    // 書式: "SSH | > nb  user@10.0.0.7:22 | 3/8"
+    std::string state_line() const;
+
     // キー入力。処理したら true。
     bool key(ui::Key k);
     // タップ。処理したら true。
@@ -138,6 +144,8 @@ public:
     void draw(bool force = false);
 
 private:
+    // 画面の見出し。**描画とコンソールで同じものを見る。**
+    const char* screen_name() const;
     // Esc / "< Back" の戻り先。入れ子が 2 段になった (#56) ので表にする。
     Screen parent_of(Screen s) const;
     // 先頭に注記の行を出す画面か。**set_note と rebuild で同じ表を見る**
