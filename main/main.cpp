@@ -3881,7 +3881,11 @@ void form_note(const std::string& why)
     menu->set_note(why);
     menu->refresh();
     menu->draw();
-    ESP_LOGW(TAG, "form: %s", why.c_str());
+    // **断ったときも残量を出す。** 出すのが成功時だけだと、指で触った検証の
+    // ほとんど（書きかけで保存を押す）が数字を残さない。cJSON を通す重さは
+    // 断られる経路でも同じ（to_json → add_profile → parse までは走っている）。
+    ESP_LOGW(TAG, "form: %s (stack headroom %u bytes)", why.c_str(),
+             (unsigned)uxTaskGetStackHighWaterMark(nullptr));
 }
 
 void form_start(bool vpn)
