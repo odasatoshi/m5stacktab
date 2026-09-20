@@ -3913,8 +3913,22 @@ int cmd_keytest(int, char**)
         std::string priv, pub;
         // `len` までが鍵。パーティションの中身をそのまま渡す。
         ssh_key_split(std::string(buf, len), &priv, &pub);
+        SshConfig saved;
+        ssh_config_load(saved);  // パスフレーズは接続時と同じものを使う
         if (pub.empty()) {
-            std::printf("公開鍵: 無し（RSA ならこのままで良い。ECDSA には要る）\n");
+            // **繋がれていなければ、EC は秘密鍵から組み立てられる (#84)。**
+            // 組み立てられるのに理由を出さないと「公開鍵が無い＝繋げない」と
+            // 誤解して連結し直しに行く。RSA は libssh2 の導出が通るので空のままで良い。
+            std::string derived;
+            const EcPubKeyStatus st = ssh_key_ec_pubkey(priv, saved.password, &derived);
+            if (st == EcPubKeyStatus::kOk) {
+                std::printf("公開鍵: 無し -> 秘密鍵から組み立てられる (%d バイト)\n  %s\n",
+                            (int)derived.size(), derived.c_str());
+            } else if (st == EcPubKeyStatus::kNotEc) {
+                std::printf("公開鍵: 無し（RSA なのでこのままで良い）\n");
+            } else {
+                std::printf("公開鍵: 無し、%s\n", ec_pubkey_status_name(st));
+            }
         } else {
             const size_t sp = pub.find(' ');
             std::printf("公開鍵: %.*s (%d バイト)\n",
@@ -3927,8 +3941,6 @@ int cmd_keytest(int, char**)
         std::string der;
         if (priv.find("EC PRIVATE KEY") != std::string::npos ||
             priv.find("BEGIN PRIVATE KEY") != std::string::npos) {
-            SshConfig saved;
-            ssh_config_load(saved);  // パスフレーズは接続時と同じものを使う
             if (ssh_key_ec_to_der(priv, saved.password, &der)) {
                 std::printf("EC → DER: %d バイト（libssh2 に渡せる）\n", (int)der.size());
             } else {
