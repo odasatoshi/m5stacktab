@@ -433,11 +433,18 @@ bool add_profile(const std::string& json, const std::string& entry, std::string*
     }
 
     // **空なら器から作る。** 1 件も取り込んでいない端末でもメニューから足せるようにする。
-    cJSON* root = json.empty() ? nullptr : cJSON_Parse(json.c_str());
-    if (!root) {
+    //
+    // **読めない本文は器で置き換えない。** 置き換えると、壊れた JSON に 1 件足した
+    // つもりが**今まで取り込んだ接続先を全部捨てて 1 件だけにする**ことになり、
+    // 「保存した」としか出ない（remove_profile が同じ場合に false を返すのと揃える）。
+    cJSON* root = nullptr;
+    if (json.empty()) {
         root = cJSON_CreateObject();
         cJSON_AddNumberToObject(root, "version", 1);
         cJSON_AddItemToObject(root, "profiles", cJSON_CreateArray());
+    } else if (root = cJSON_Parse(json.c_str()); !root) {
+        cJSON_Delete(item);
+        return false;
     }
     cJSON* arr = cJSON_GetObjectItemCaseSensitive(root, "profiles");
     if (!cJSON_IsArray(arr)) {

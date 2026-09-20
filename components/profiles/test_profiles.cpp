@@ -407,6 +407,11 @@ void test_add_profile()
                              &out));
     CHECK(out == "untouched");
 
+    // **壊れた本文には足さない。** 器で置き換えると今までの接続先が消える。
+    out = "untouched";
+    CHECK(!prof::add_profile(R"({"profiles":[{"name":"a",)", entry, &out));
+    CHECK(out == "untouched");
+
     // 壊れた入力・name 無し・配列は断る
     CHECK(!prof::add_profile(kGood, "{ broken", &out));
     CHECK(!prof::add_profile(kGood, R"({"type":"ssh","host":"h","user":"u"})", &out));
