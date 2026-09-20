@@ -75,6 +75,12 @@ jobs:
               components/ui/menu.cpp
           /tmp/test_menu
 
+      - name: EC 秘密鍵 -> SSH 公開鍵の組み立て (#84)
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \
+              -I main -o /tmp/test_ecpub main/test_ec_pubkey.cpp main/ec_pubkey.cpp -lmbedcrypto
+          /tmp/test_ecpub
+
       - name: Tab5 keyboard key names -> terminal bytes
         run: |
           c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \

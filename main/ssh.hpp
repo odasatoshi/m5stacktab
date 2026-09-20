@@ -7,6 +7,8 @@
 
 #include <esp_err.h>
 
+#include "ec_pubkey.hpp"
+
 struct SshConfig {
     std::string host;
     std::string user;
@@ -25,6 +27,12 @@ void ssh_key_split(const std::string& blob, std::string* priv, std::string* pub)
 // EC の秘密鍵を本番と同じ手順で DER に詰め直す (#75)。EC でなければ false。
 // **`keytest` が本番経路を通るためにある。**
 bool ssh_key_ec_to_der(const std::string& pem, const std::string& passphrase, std::string* der);
+
+// EC の秘密鍵から SSH の公開鍵の行を組み立てる (#84)。公開鍵が繋がれていないときの
+// 救済で、本番の接続経路と同じ `ec_ssh_pubkey` を見る。
+// **P-256 のみ。** 判定理由は `ec_pubkey_status_name` で文字列にできる。
+EcPubKeyStatus ssh_key_ec_pubkey(const std::string& pem, const std::string& passphrase,
+                                 std::string* out);
 
 // 鍵の切り分け（秘密鍵 PEM + 続けて書いた .pub）の自己テスト (#75)。
 // `keytest` が呼ぶ。合成入力なので実機の鍵には触らない。

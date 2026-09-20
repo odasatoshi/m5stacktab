@@ -309,20 +309,22 @@ python $IDF_PATH/components/partition_table/parttool.py --port /dev/cu.usbmodem1
 - **ed25519 は使えない**（`LIBSSH2_ED25519 = 0`）
 - **OpenSSH 形式 (`-----BEGIN OPENSSH PRIVATE KEY-----`) は使えない**。mbedTLS は PKCS#1 / SEC1 の
   PEM しか解釈しないので `ssh-keygen -m PEM` が必須
-- **ECDSA は 2 つの条件を両方満たさないと通らない** (#75):
+- **ECDSA は named curve 形式であれば通る** (#75, #84):
   1. **named curve 形式であること。** `ssh-keygen -t ecdsa -m PEM` が作る鍵は曲線パラメータを
      **明示的に展開**した形（ASN.1 に `prime-field` から全部入る）で、mbedTLS は named curve
      (OID) しか解釈できない。openssl で作るか変換する
-  2. **公開鍵を秘密鍵の後ろに続けて書くこと。** 公開鍵を渡さないと libssh2 は秘密鍵から
-     導出する経路に入るが、mbedTLS バックエンドのその実装
+  2. 公開鍵は**秘密鍵の後ろに続けて書かなくてもよい** (#84)。書いてあればそれを使う。
+     無いときは `main/ec_pubkey.cpp` が秘密鍵から点 Q を取り出して SSH のワイヤ形式
+     (`string("ecdsa-sha2-nistp256") || string("nistp256") || string(Q)` を base64) に詰める。
+     libssh2 に導出させられない — mbedTLS バックエンドのその実装
      (`_libssh2_mbedtls_pub_priv_key`) は **RSA 決め打ち**で、`Key type not supported`
-     になる（上流 master でも未修正）
+     になる（上流 master でも未修正）。**P-256 だけ**（他の曲線は型名も点の長さも変わる）
 
   ```sh
   openssl ecparam -name prime256v1 -genkey -noout -out key.pem   # 新規作成
   openssl ec -in ssh_key -out key.pem -param_enc named_curve     # 既存を変換
-  ssh-keygen -y -f key.pem > key.pub
-  cat key.pem key.pub > key_combined.pem      # この順で 1 つのパーティションに書く
+  ssh-keygen -y -f key.pem >> ~/.ssh/authorized_keys             # 接続先には自分で足す
+  # 端末には key.pem だけでよい（公開鍵の連結は不要になった）
   ```
 
 - **`-0x3d00 (PK - Invalid key tag or value)` を曲線形式のせいだと決めつけない。**
@@ -449,9 +451,21 @@ docker exec headscale-tab5 headscale preauthkeys create --user 1 --reusable --ex
 
 ```sh
 brew install mbedtls@3 cjson   # mbedtls は 3.x を使う（4.x は API が合わない）
+brew install mbedtls@2         # CI と同じ 2.28 でも通す確認用 (#84)
 ```
 
-CI (Ubuntu) では `libmbedtls-dev` と `libcjson-dev`。
+CI (Ubuntu) では `libmbedtls-dev` と `libcjson-dev`。**CI のそれは 2.28 で、ESP-IDF は 3.6**
+なので、mbedTLS の新しい API を素で使うとホストテストだけ CI で落ちる
+（`mbedtls_pk_parse_key` の `f_rng` は 3.0 で追加、`mbedtls_ecp_keypair_get_group_id` は 3.6）。
+新しい mbedTLS API を呼ぶところは **CI と ESP-IDF の両方でビルドが通るか**を確かめること。
+手元で 2.28 を確かめるには:
+
+```sh
+M2=/opt/homebrew/opt/mbedtls@2
+c++ -std=c++17 -Wall -Wextra -Werror -O1 -I$M2/include -I main \
+    -o /tmp/test_ecpub228 main/test_ec_pubkey.cpp main/ec_pubkey.cpp -L$M2/lib -lmbedcrypto
+/tmp/test_ecpub228
+```
 
 ## コード方針
 
