@@ -3120,6 +3120,16 @@ void term_note(const char* color, const std::string& text)
 bool connect_vpn_profile(const prof::Profile& p, std::string* err)
 {
     if (p.type == prof::Type::kTailscale) {
+        // **authkey が無いプロファイルは対話ログイン (#67)。** `ts-login` と同じ
+        // interactive 経路にして、メニューとコンソールの食い違いを塞ぐ
+        // （空のまま ts_start に渡すと register が弾かれる）。
+        if (p.authkey.empty()) {
+            if (!ts_start(p.control, "", p.port, 131, /*interactive=*/true)) {
+                *err = "tailscale を起動できなかった（詳細はシリアル）";
+                return false;
+            }
+            return true;
+        }
         std::string authkey;
         if (!read_key(p.authkey, &authkey, err)) return false;
         // ファイルなので末尾の改行が付く。そのまま送るとヘッダが壊れる。

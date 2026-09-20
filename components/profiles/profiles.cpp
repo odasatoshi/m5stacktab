@@ -338,7 +338,9 @@ Config parse(const std::string& json)
                     ok = false;
                     break;
                 }
-                if (bad_key_name(p.authkey)) {
+                // **authkey は空でもよい** (#67)。空は対話ログイン（QR で承認）を意味する
+                // ので、SSH の key と同じく「書いてあるときだけ」書式を検査する。
+                if (!p.authkey.empty() && bad_key_name(p.authkey)) {
                     warn(&cfg, where + " \"" + p.name +
                                    "\": authkey はディレクトリを含まないファイル名にする");
                     ok = false;
