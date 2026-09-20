@@ -16,20 +16,27 @@
 // **画面に必要な行数と ui::Menu の上限を結び付ける。** rebuild() は "< Back" を
 // 最後に足すので、溢れると**指で抜ける唯一の経路が黙って消える**（残る行は
 // 全部 disabled で hit_test が -1 を返す）。上限を上げたらここで気づけるようにする。
-static_assert(ui::Menu::kMaxItems >= 1 + 2 + (int)prof::kMaxVpnProfiles + 1,
-              "VPN 画面: 注記 + 状態 2 行 + プロファイル + \"< Back\" が入らない");
-static_assert(ui::Menu::kMaxItems >= 1 + (int)prof::kMaxSshProfiles + 1 + 1,
-              "SSH 画面: 注記 + プロファイル + 保存済み 1 件 + \"< Back\" が入らない");
-// WiFi 画面 (#56): 注記 1 + 保存済み + "Create new wifi setting" + "< Back"。
-static_assert(ui::Menu::kMaxItems >= 1 + (int)kMaxWifiNets + 2,
-              "WiFi 画面: 注記 + 保存済み + 追加 + \"< Back\" が入らない");
+static_assert(ui::Menu::kMaxItems >= 1 + (int)prof::kMaxSshProfiles + 1 + 1 + 1,
+              "SSH 画面: 注記 + プロファイル + 保存済み 1 件 + 新規作成 + \"< Back\" が入らない");
+static_assert(ui::Menu::kMaxItems >= 1 + 2 + (int)prof::kMaxVpnProfiles + 1 + 1,
+              "VPN 画面: 注記 + 状態 2 行 + プロファイル + 新規作成 + \"< Back\" が入らない");
+// 新規作成の画面 (#82): 注記 1 + 項目 + "保存" + "< Back"。項目が一番多いのは
+// WireGuard の 7 つ (type / name / address / private_key / pubkey / endpoint / allowed_ips)。
+constexpr int kMaxFormFields = ui::Menu::kMaxItems - 3;
+static_assert(kMaxFormFields >= 7, "新規作成の画面: WireGuard の項目が入らない");
+// WiFi 画面 (#56, #82): 注記 1 + 状態 1 + 保存済み + "Create new wifi setting" + "< Back"。
+static_assert(ui::Menu::kMaxItems >= 2 + (int)kMaxWifiNets + 2,
+              "WiFi 画面: 注記 + 状態 + 保存済み + 追加 + \"< Back\" が入らない");
 // スキャン結果の画面はここまでしか並べない（注記 1 + 手入力 + "< Back" を残す）。
 constexpr int kMaxWifiScanRows = ui::Menu::kMaxItems - 3;
 static_assert(kMaxWifiScanRows > 0, "スキャン結果を並べる行が残らない");
 
 class MenuUi {
 private:
-    enum class Screen { kRoot, kSsh, kVpn, kSettings, kWifi, kWifiNet, kWifiScan, kProfile };
+    enum class Screen {
+        kRoot, kSsh, kVpn, kMisc, kWifi, kWifiNet, kWifiScan, kProfile,
+        kForm,  // 接続先の新規作成 (#82)。行の中身は呼び出し側が作る
+    };
 
 public:
     // メニューから起こす動作。main が実装を差す（この層は描画と選択だけを持つ）。
@@ -45,6 +52,10 @@ public:
         kWifiScan,         // AP を探し始める（終わったら show_wifi_scan を呼ばせる）
         kWifiAddScanned,   // スキャン結果の N 番目を足す（パスワードは呼び出し側が聞く）
         kWifiAddManual,    // SSID から手で入れる（隠し SSID 用）
+        // --- 接続先の新規作成 (#82) ---
+        kNewProfile,       // index: 0 = SSH の一覧から / 1 = VPN の一覧から
+        kFormEdit,         // index 番目の項目を編集する（文字を聞くか、候補を回すか）
+        kFormSave,         // 今の内容を保存する
     };
 
     // メニューに出す情報。呼び出し側が集める。
@@ -102,6 +113,21 @@ public:
     // 足した / 消したあとに一覧へ戻る。
     void show_wifi_list();
 
+    // --- 接続先の新規作成 (#82) ---
+    //
+    // 行の文字列は**呼び出し側が作る**（項目は type で変わり、候補の回し方も
+    // 呼び出し側の都合なので、この層は行を並べて何番目が押されたかを返すだけ）。
+    // **呼び出し側が保持し続けること。**
+    void set_form_rows(const std::vector<std::string>* v) { form_rows_ = v; }
+    // 新規作成の画面へ移る。`set_form_rows` の中身を作ってから呼ぶ。
+    // 1 項目ずつ聞くので**編集から戻るたびに呼ぶ**（set_visible(true) は kRoot に戻す）。
+    void show_form();
+    // 保存した後に、入ってきた一覧 (SSH / VPN) へ戻る (#82)。
+    void show_form_list();
+    // 今その画面を見ているか。**編集から戻ってよいかの判定に使う** —
+    // 入力の間に Esc でメニューごと閉じていたら、勝手に開き直さない。
+    bool on_form() const { return screen_ == Screen::kForm; }
+
     // 接続先を消したあとに、入ってきた一覧 (SSH / VPN) へ戻る (#73)。
     // **消した後に詳細画面へ残してはいけない** — 消えた index を指したまま
     // 「接続」が押せてしまう。
@@ -144,6 +170,7 @@ private:
     const prof::Config*              profiles_ = nullptr;
     const std::vector<std::string>*  wifi_nets_ = nullptr;
     const std::vector<std::string>*  wifi_scan_ = nullptr;
+    const std::vector<std::string>*  form_rows_ = nullptr;
     char                             note_[96] = {};
     // kWifiNet で見ている保存済みの index。
     int                              wifi_sel_ = -1;
@@ -152,5 +179,7 @@ private:
     // parent_of() を型で分岐させると、消した後に戻る先が種類で変わる。
     int                              prof_sel_    = -1;
     Screen                           prof_parent_ = Screen::kSsh;
+    // 新規作成の画面に入る前の一覧 (#82)。prof_parent_ と同じ理由で覚えておく。
+    Screen                           form_parent_ = Screen::kSsh;
     std::function<void(Action, int)> action_;
 };

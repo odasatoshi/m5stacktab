@@ -286,7 +286,7 @@ printf 'menu hide\r\n'   > /dev/cu.usbmodem101
 - 項目をタップすると、移動と決定を兼ねる（指で 2 度押しは使いにくい）
 - **ステータスバーをタップするとメニューを開閉する。** 判定は上から 56px
   （描画は 24px だが、指で当てるには 3.5mm は狭い）
-- VPN / Settings 画面の `< Back` をタップで戻れる
+- VPN / Miscellanea 画面の `< Back` をタップで戻れる
 
 メニュー表示中はキーボードを隠す。隠さないとメニューがキーボードの領域を覆わないので
 指でキーを押せてしまい、その出力が端末経由でメニューの矩形に描かれて崩れる。
@@ -297,6 +297,26 @@ printf 'menu hide\r\n'   > /dev/cu.usbmodem101
 |---|---|
 | キーボード表示 | 15 行 (360px) |
 | キーボード非表示 | 29 行 (696px) |
+
+## 接続先の新規作成（#82）
+
+メニューは `SSH` / `VPN` / `WiFi` / `Miscellanea`。**SD を挿さずに** 1 件作れることを見る。
+
+```sh
+printf 'menu\r\n'       > /dev/cu.usbmodem101
+printf 'menu down\r\n'  > /dev/cu.usbmodem101   # SSH を選ぶ
+printf 'menu enter\r\n' > /dev/cu.usbmodem101
+# 一覧の末尾 "Create new SSH connection" まで down して enter
+# 項目を選ぶ → 端末に戻って 1 行入力 → Enter で新規作成の画面に戻る
+printf 'profiles\r\n'   > /dev/cu.usbmodem101   # 保存されたか NVS 側で見る
+```
+
+- **コンソールの `menu` はコンソールタスク (32KB) の上で動く。** 指で触ったときの
+  スタックはメインループ (16KB) なので、**証跡は指で操作したログで取る**
+- 保存できたときは `form: saved "<name>" -> N 件 (stack headroom ...)` がログに出る
+- 断られたときは**理由がメニューの注記行に出る**（端末に書いても、メニューが
+  出ている間は描かれない）
+- 再起動して一覧に残っていることまで見る（NVS に書けていなければ消える）
 
 ## タッチの検証
 

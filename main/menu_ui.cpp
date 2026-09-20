@@ -13,22 +13,26 @@ constexpr uint16_t kHint    = 0x8410;  // 操作説明の灰
 enum : int {
     kIdSsh      = 1,
     kIdVpn      = 2,
-    kIdSettings = 3,
+    kIdMisc     = 3,
     kIdTerminal = 12,
     kIdSavedSsh = 13,  // NVS に保存した 1 件（接続先一覧とは別の最短経路）
     kIdReload   = 14,
-    kIdWifi     = 15,  // Settings から WiFi の一覧へ (#56)
+    kIdWifi     = 15,  // 最上位から WiFi の一覧へ (#56, #82)
     kIdWifiNew  = 20,
     kIdWifiConn = 21,
     kIdWifiDel  = 22,
     kIdWifiMan  = 23,
     kIdProfConn = 24,  // 接続先の詳細から繋ぐ (#73)
     kIdProfDel  = 25,  // 接続先の詳細から消す (#73)
+    kIdNewSsh   = 26,  // SSH の一覧から新規作成 (#82)
+    kIdNewVpn   = 27,  // VPN の一覧から新規作成 (#82)
+    kIdFormSave = 28,  // 新規作成の画面の "保存" (#82)
     kIdBack     = 99,
     // **index を埋めて返す帯域。互いに重ならないように離してある。**
     // 下の static_assert が、上限を上げたときの食い込みを止める。
     kIdWifiNet     = 200,   // 保存済みの N 番目
     kIdWifiScanned = 400,   // スキャン結果の N 番目
+    kIdFormField   = 600,   // 新規作成の画面の N 番目の項目 (#82)
     // NVS の接続先。id から profiles の index を戻せるようにしておく (#49)。
     kIdProfile  = 1000,
 };
@@ -95,10 +99,12 @@ void MenuUi::rebuild()
     char buf[96];
     switch (screen_) {
         case Screen::kRoot:
+            // **接続先の種類をそのまま並べる (#82)。** どれも「一覧 → 選ぶ →
+            // 接続 / 削除、末尾に新規作成」の同じ形で、WiFi だけ 1 段深いのをやめた。
             add("SSH", kIdSsh, true);
             add("VPN", kIdVpn, true);
-            add("Settings", kIdSettings, true);
-            add("Terminal", kIdTerminal, true);
+            add("WiFi", kIdWifi, true);
+            add("Miscellanea", kIdMisc, true);
             break;
         case Screen::kSsh:
             if (note_[0]) add(note_, 0, false);
@@ -108,6 +114,7 @@ void MenuUi::rebuild()
             std::snprintf(buf, sizeof(buf), "保存済み: %s",
                           info_.ssh_target[0] ? info_.ssh_target : "(未設定)");
             add(buf, kIdSavedSsh, info_.ssh_target[0] != '\0');
+            add("Create new SSH connection", kIdNewSsh, true);
             add("< Back", kIdBack, true);
             break;
         case Screen::kVpn:
@@ -117,14 +124,17 @@ void MenuUi::rebuild()
             std::snprintf(buf, sizeof(buf), "WireGuard: %s", info_.wg_state);
             add(buf, 0, false);
             add_profiles(/*ssh=*/false, &n);
+            add("Create new VPN connection", kIdNewVpn, true);
             // 指だけで戻れる経路。全項目が状態表示だと hit_test が常に -1 になり、
             // Esc を送る手段（シリアル）が無いと出られない。
             add("< Back", kIdBack, true);
             break;
-        case Screen::kSettings:
-            // ponytail: WiFi 以外は読み取り専用。編集はコンソールから（`ssh`）。
-            std::snprintf(buf, sizeof(buf), "WiFi: %s", info_.wifi);
-            add(buf, kIdWifi, true);
+        case Screen::kMisc:
+            // **どこにも属さないものだけを置く (#82)。** 接続先そのものは
+            // SSH / VPN / WiFi の 3 つに寄せてあるので、ここに来るのは
+            // 端末へ戻る経路と、接続先の読み込み結果の表示。
+            add("Terminal", kIdTerminal, true);
+            // ponytail: 表示は読み取り専用。編集はコンソールから（`ssh`）。
             std::snprintf(buf, sizeof(buf), "SSH: %s",
                           info_.ssh_target[0] ? info_.ssh_target : "(未設定)");
             add(buf, 0, false);
@@ -137,6 +147,10 @@ void MenuUi::rebuild()
             // 注記は「スキャン中…」「5 件で満杯」など。**画面に理由を出す唯一の場所**
             // （端末に書いてもメニューを出している間は描かれない）。
             if (note_[0]) add(note_, 0, false);
+            // **繋がっているかをここに出す (#82)。** Settings を畳んだので、
+            // 状態を出す場所がここしか残っていない。
+            std::snprintf(buf, sizeof(buf), "状態: %s", info_.wifi);
+            add(buf, 0, false);
             if (wifi_nets_) {
                 for (size_t i = 0; i < wifi_nets_->size() && i < kMaxWifiNets; ++i) {
                     add((*wifi_nets_)[i].c_str(), kIdWifiNet + static_cast<int>(i), true);
@@ -177,6 +191,22 @@ void MenuUi::rebuild()
             add("< Back", kIdBack, true);
             break;
         }
+        case Screen::kForm: {
+            // **行の中身は呼び出し側が作る。** 項目は type で変わるので、
+            // この層は並べて「何番目が押されたか」を返すだけにする (#82)。
+            if (note_[0]) add(note_, 0, false);
+            int fields = 0;
+            if (form_rows_) {
+                for (size_t i = 0; i < form_rows_->size() && fields < kMaxFormFields; ++i) {
+                    add((*form_rows_)[i].c_str(), kIdFormField + static_cast<int>(i), true);
+                    ++fields;
+                }
+            }
+            if (fields == 0) add("(項目が無い)", 0, false);
+            add("保存", kIdFormSave, fields > 0);
+            add("< Back", kIdBack, true);
+            break;
+        }
         case Screen::kWifiScan: {
             if (note_[0]) add(note_, 0, false);
             int shown = 0;
@@ -201,11 +231,14 @@ void MenuUi::rebuild()
 MenuUi::Screen MenuUi::parent_of(Screen s) const
 {
     switch (s) {
-        case Screen::kWifi:     return Screen::kSettings;
+        // **WiFi は最上位の下 (#82)。** Settings の中の 1 段は無くなった。
+        case Screen::kWifi:     return Screen::kRoot;
         case Screen::kWifiNet:  return Screen::kWifi;
         case Screen::kWifiScan: return Screen::kWifi;
         // 同じ詳細画面に SSH 画面からも VPN 画面からも入るので、入り口を覚えて戻す。
         case Screen::kProfile:  return prof_parent_;
+        // 新規作成も、SSH の一覧からも VPN の一覧からも入る (#82)。
+        case Screen::kForm:     return form_parent_;
         default:                return Screen::kRoot;
     }
 }
@@ -213,7 +246,7 @@ MenuUi::Screen MenuUi::parent_of(Screen s) const
 bool MenuUi::shows_note(Screen s)
 {
     return s == Screen::kWifi || s == Screen::kWifiScan || s == Screen::kSsh ||
-           s == Screen::kVpn || s == Screen::kProfile;
+           s == Screen::kVpn || s == Screen::kProfile || s == Screen::kForm;
 }
 
 void MenuUi::set_note(const std::string& s)
@@ -227,6 +260,8 @@ void MenuUi::set_note(const std::string& s)
 }
 
 void MenuUi::show_wifi_scan() { enter(Screen::kWifiScan); }
+void MenuUi::show_form() { enter(Screen::kForm); }
+void MenuUi::show_form_list() { enter(form_parent_); }
 void MenuUi::show_wifi_list() { enter(Screen::kWifi); }
 
 void MenuUi::show_profile_list()
@@ -314,6 +349,10 @@ void MenuUi::activate(int id)
     }
     // **上から順に見る。** 帯域が広いほうから判定しないと、スキャン結果の id が
     // 保存済みの条件に先に引っかかる。
+    if (id >= kIdFormField) {
+        if (action_) action_(Action::kFormEdit, id - kIdFormField);
+        return;
+    }
     if (id >= kIdWifiScanned) {
         if (action_) action_(Action::kWifiAddScanned, id - kIdWifiScanned);
         return;
@@ -332,7 +371,7 @@ void MenuUi::activate(int id)
             note_[0] = '\0';
             enter(Screen::kVpn);
             break;
-        case kIdSettings: enter(Screen::kSettings); break;
+        case kIdMisc: enter(Screen::kMisc); break;
         case kIdTerminal:
             if (action_) action_(Action::kShowTerminal, -1);
             break;
@@ -366,6 +405,17 @@ void MenuUi::activate(int id)
             break;
         case kIdProfDel:
             if (action_) action_(Action::kDeleteProfile, prof_sel_);
+            break;
+        case kIdNewSsh:
+        case kIdNewVpn:
+            // **入ってきた一覧を覚えてから渡す。** 新規作成の画面から "< Back" で
+            // 戻る先は、SSH から入ったか VPN から入ったかで変わる。
+            form_parent_ = screen_;
+            note_[0]     = '\0';
+            if (action_) action_(Action::kNewProfile, id == kIdNewSsh ? 0 : 1);
+            break;
+        case kIdFormSave:
+            if (action_) action_(Action::kFormSave, -1);
             break;
         case kIdBack: enter(parent_of(screen_)); break;
         default: break;
@@ -401,12 +451,13 @@ void MenuUi::draw(bool force)
     switch (screen_) {
         case Screen::kSsh: title = "SSH"; break;
         case Screen::kVpn: title = "VPN"; break;
-        case Screen::kSettings: title = "Settings"; break;
+        case Screen::kMisc: title = "Miscellanea"; break;
         case Screen::kWifi:
         case Screen::kWifiNet: title = "WiFi"; break;
         case Screen::kWifiScan: title = "WiFi scan"; break;
         // 詳細画面は入ってきた一覧の見出しを引き継ぐ（どこから入ったか分かるように）。
         case Screen::kProfile: title = (prof_parent_ == Screen::kVpn) ? "VPN" : "SSH"; break;
+        case Screen::kForm: title = (form_parent_ == Screen::kVpn) ? "New VPN" : "New SSH"; break;
         case Screen::kRoot: break;
     }
     gfx_.setTextColor(TFT_CYAN, kBg);
@@ -418,7 +469,7 @@ void MenuUi::draw(bool force)
     const int rows  = (menu_.visible_rows() > 0) ? menu_.visible_rows() : menu_.count();
     for (int i = first; i < menu_.count() && i < first + rows; ++i) {
         const int  y   = list_top_ + (i - first) * row_h_;
-        // 選べない項目には目印を付けない。全部が状態表示の画面（VPN / Settings）で
+        // 選べない項目には目印を付けない。全部が状態表示の画面（VPN / Miscellanea）で
         // 先頭に > が付くと、選べるように見えて紛らわしい。
         const bool sel = (i == menu_.selected()) && menu_.item(i).enabled;
         if (sel) gfx_.fillRect(0, y, gfx_.width(), row_h_, kSelBg);
