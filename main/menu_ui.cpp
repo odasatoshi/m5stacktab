@@ -14,10 +14,8 @@ enum : int {
     kIdSsh      = 1,
     kIdVpn      = 2,
     kIdSettings = 3,
-    kIdTs       = 10,
-    kIdWg       = 11,
     kIdTerminal = 12,
-    kIdSavedSsh = 13,  // NVS に保存した 1 件（SD が無いときの経路）
+    kIdSavedSsh = 13,  // NVS に保存した 1 件（接続先一覧とは別の最短経路）
     kIdReload   = 14,
     kIdWifi     = 15,  // Settings から WiFi の一覧へ (#56)
     kIdWifiNew  = 20,
@@ -31,14 +29,14 @@ enum : int {
     // 下の static_assert が、上限を上げたときの食い込みを止める。
     kIdWifiNet     = 200,   // 保存済みの N 番目
     kIdWifiScanned = 400,   // スキャン結果の N 番目
-    // SD の接続先。id から profiles の index を戻せるようにしておく (#49)。
+    // NVS の接続先。id から profiles の index を戻せるようにしておく (#49)。
     kIdProfile  = 1000,
 };
 
 static_assert(kIdWifiNet + (int)kMaxWifiNets < kIdWifiScanned,
               "保存済みの id がスキャン結果の帯域に食い込む");
 static_assert(kIdWifiScanned + kMaxWifiScanRows < kIdProfile,
-              "スキャン結果の id が SD の接続先の帯域に食い込む");
+              "スキャン結果の id が接続先の帯域に食い込む");
 
 }  // namespace
 
@@ -105,7 +103,8 @@ void MenuUi::rebuild()
         case Screen::kSsh:
             if (note_[0]) add(note_, 0, false);
             add_profiles(/*ssh=*/true, &n);
-            // NVS の 1 件はいつでも残す。SD が読めなくても繋げる経路が要る。
+            // `ssh <user> <host>` で保存した 1 件はいつでも残す。一覧が空でも
+            // 繋げる経路が残るようにする (#66 で前提は NVS に移ったが、役割は同じ)。
             std::snprintf(buf, sizeof(buf), "保存済み: %s",
                           info_.ssh_target[0] ? info_.ssh_target : "(未設定)");
             add(buf, kIdSavedSsh, info_.ssh_target[0] != '\0');
@@ -129,9 +128,9 @@ void MenuUi::rebuild()
             std::snprintf(buf, sizeof(buf), "SSH: %s",
                           info_.ssh_target[0] ? info_.ssh_target : "(未設定)");
             add(buf, 0, false);
-            std::snprintf(buf, sizeof(buf), "SD: %s", info_.sd);
+            std::snprintf(buf, sizeof(buf), "接続先: %s", info_.profiles);
             add(buf, 0, false);
-            add("SD を読み直す", kIdReload, true);
+            add("接続先を読み直す", kIdReload, true);
             add("< Back", kIdBack, true);
             break;
         case Screen::kWifi:
@@ -252,9 +251,9 @@ void MenuUi::add_profiles(bool ssh, int* n)
     if (!profiles_) return;
     if (!profiles_->error.empty()) {
         // **読めなかった理由を画面に出す。** 黙って空にすると
-        // 「SD を挿し忘れた」のか「JSON を壊した」のか分からない。
+        // 「まだ取り込んでいない」のか「JSON を壊した」のか分からない。
         char buf[96];
-        std::snprintf(buf, sizeof(buf), "SD: %s", profiles_->error.c_str());
+        std::snprintf(buf, sizeof(buf), "接続先: %s", profiles_->error.c_str());
         add(buf, 0, false);
         return;
     }
@@ -278,8 +277,8 @@ void MenuUi::add_profiles(bool ssh, int* n)
         add(buf, kIdProfile + static_cast<int>(i), true);
         ++shown;
     }
-    if (shown == 0) add(ssh ? "(SD に ssh のプロファイルが無い)"
-                            : "(SD に VPN のプロファイルが無い)", 0, false);
+    if (shown == 0) add(ssh ? "(ssh の接続先が無い)"
+                            : "(VPN の接続先が無い)", 0, false);
 }
 
 bool MenuUi::key(ui::Key k)
@@ -304,7 +303,7 @@ bool MenuUi::key(ui::Key k)
 
 void MenuUi::activate(int id)
 {
-    // SD の接続先。id に埋めた index で詳細画面に入る (#73)。
+    // NVS の接続先。id に埋めた index で詳細画面に入る (#73)。
     // **一覧から直に繋がない。** 繋ぐのも消すのも詳細画面の中でだけできるようにして、
     // 削除に「1 段挟む」という確認を持たせる（WiFi と同じ形）。
     if (id >= kIdProfile) {
@@ -339,12 +338,6 @@ void MenuUi::activate(int id)
             break;
         case kIdSavedSsh:
             if (action_) action_(Action::kOpenSsh, -1);
-            break;
-        case kIdTs:
-            if (action_) action_(Action::kTsConnect, -1);
-            break;
-        case kIdWg:
-            if (action_) action_(Action::kWgUp, -1);
             break;
         case kIdReload:
             if (action_) action_(Action::kReloadProfiles, -1);
