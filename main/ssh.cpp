@@ -25,6 +25,8 @@
 
 #include <libssh2.h>
 
+#include "ec_pubkey.hpp"
+
 namespace {
 
 const char* TAG = "ssh";
@@ -124,7 +126,7 @@ bool verify_host_key(LIBSSH2_SESSION* session, const char* host, uint16_t port)
 // 唯一の確実な境目になる。
 //
 // 公開鍵が無い鍵（今までの `sshkey` パーティション）では pub が空になり、
-// 呼び出し側が nullptr を渡す = 従来どおりの動作。
+// 呼び出し側が EC なら組み立てる (#84)。RSA は空のまま libssh2 に渡す（従来どおり）。
 void split_key_blob(const std::string& blob, std::string* priv, std::string* pub)
 {
     priv->assign(blob);
@@ -284,7 +286,26 @@ bool authenticate(LIBSSH2_SESSION* session, const SshConfig& cfg)
         // 無ければ今までどおり nullptr。RSA はそれで動いているので壊さない。
         std::string priv, pub;
         split_key_blob(key, &priv, &pub);
+        // **公開鍵が繋がれていなければ、EC のときだけ自分で組み立てる (#84)。**
+        // 連結し忘れた鍵は「繋ぐまで理由が見えない」ので、ここで救う。
+        // RSA は libssh2 側の導出が通るので、pub を空のまま渡す (kNotEc)。
+        if (pub.empty()) {
+            const EcPubKeyStatus st = ec_ssh_pubkey(priv, cfg.password, ssh_drbg(), &pub);
+            if (st != EcPubKeyStatus::kOk) {
+                pub.clear();  // 中途半端に埋まっている形で渡さない
+                // RSA (kNotEc) はこのまま libssh2 に任せるので音を立てない。
+                // それ以外は「公開鍵を渡す」という選択肢が潰えているので出す。
+                if (st != EcPubKeyStatus::kNotEc) {
+                    ESP_LOGW(TAG, "公開鍵を組み立てられない: %s", ec_pubkey_status_name(st));
+                }
+            } else {
+                ESP_LOGI(TAG, "EC key: 公開鍵を秘密鍵から組み立てた (%d bytes)", (int)pub.size());
+            }
+        }
         // **EC だけ DER に詰め替える (#75)。** 理由は ec_pem_to_der のコメント。
+        // ponytail: 上での導出と合わせて同じ PEM を 2 回展開している。どちらも
+        // `ssh` タスク (16KB) の上で順に走るだけなので天井は変わらないが、
+        // 再接続のたびに 2 回かかる。接続の遅延が問題になったら 1 回にまとめる。
         std::string der;
         if (ec_pem_to_der(priv, cfg.password, &der)) {
             ESP_LOGI(TAG, "EC key: re-encoded PEM -> DER (%d bytes) for libssh2", (int)der.size());
@@ -413,6 +434,10 @@ void ssh_task(void*)
         s_error[0] = '\0';
         ESP_LOGI(TAG, "connected to %s@%s:%u (pty %dx%d)", s_cfg.user.c_str(), s_cfg.host.c_str(),
                  s_cfg.port, s_cols, s_rows);
+        // 鍵の展開 (#75 の DER 詰め替えと #84 の公開鍵組み立て) は全部このタスクの
+        // 上で走る。**スタックの細さはログに残らない**ので、高水位マークを出す。
+        ESP_LOGI(TAG, "ssh task stack headroom: %u bytes",
+                 (unsigned)uxTaskGetStackHighWaterMark(nullptr));
 
         char buf[1024];
         while (s_run) {
@@ -499,6 +524,15 @@ void ssh_key_split(const std::string& blob, std::string* priv, std::string* pub)
 bool ssh_key_ec_to_der(const std::string& pem, const std::string& passphrase, std::string* der)
 {
     return ec_pem_to_der(pem, passphrase, der);
+}
+
+// EC の秘密鍵から SSH 公開鍵を組み立てる口 (#84)。**`keytest` が本番と同じ関数を
+// 見るためにある。** 組み立てを失敗すると libssh2 には公開鍵なしで渡り、
+// 失敗理由が "Key type not supported" (= 導出経路) しか見えない。
+EcPubKeyStatus ssh_key_ec_pubkey(const std::string& pem, const std::string& passphrase,
+                                 std::string* out)
+{
+    return ec_ssh_pubkey(pem, passphrase, ssh_drbg(), out);
 }
 
 // 鍵の切り分けの自己テスト (#75)。**切り方を間違えると「鍵が壊れている」と

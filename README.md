@@ -52,17 +52,14 @@ python $IDF_PATH/components/partition_table/parttool.py --port /dev/cu.usbmodem1
     write_partition --partition-name sshkey --input ~/.ssh/id_rsa_tab5
 ```
 
-ECDSA は **named curve 形式**にしたうえで、**公開鍵を秘密鍵の後ろに続けて**書く (#75)。
-公開鍵が無いと libssh2 が秘密鍵から導出しようとして `Key type not supported` になる
-（mbedTLS バックエンドのその実装は RSA 決め打ち）。**RSA は今までどおり秘密鍵だけでよい。**
+ECDSA は **named curve 形式**にする (#75)。公開鍵は秘密鍵の後ろに繋がなくてもよい —
+**端末が秘密鍵から組み立てる** (#84)。繋がれていればそれを使う。**RSA は秘密鍵だけでよい。**
 
 ```sh
 openssl ecparam -name prime256v1 -genkey -noout -out ~/.ssh/id_ecdsa_tab5.pem
-ssh-keygen -y -f ~/.ssh/id_ecdsa_tab5.pem > ~/.ssh/id_ecdsa_tab5.pub
-cat ~/.ssh/id_ecdsa_tab5.pub >> ~/.ssh/authorized_keys        # 接続先で
-cat ~/.ssh/id_ecdsa_tab5.pem ~/.ssh/id_ecdsa_tab5.pub > /tmp/ec_combined.pem
+ssh-keygen -y -f ~/.ssh/id_ecdsa_tab5.pem >> ~/.ssh/authorized_keys      # 接続先で
 python $IDF_PATH/components/partition_table/parttool.py --port /dev/cu.usbmodem101 \
-    write_partition --partition-name sshkey --input /tmp/ec_combined.pem
+    write_partition --partition-name sshkey --input ~/.ssh/id_ecdsa_tab5.pem
 ```
 
 ## コンソールコマンド
