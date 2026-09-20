@@ -3904,8 +3904,27 @@ void form_edit(int index)
             s_form.type = (s_form.type == prof::Type::kWireGuard) ? prof::Type::kTailscale
                                                                   : prof::Type::kWireGuard;
             break;
-        case FormKind::kKey: form_cycle(f.value, form_key_candidates()); break;
-        case FormKind::kVia: form_cycle(f.value, form_via_candidates()); break;
+        // **候補が「なし」しか無いときは理由を出す。** 黙って何も変わらないと
+        // 押し損に見えるだけで、`private_key` が必須の WireGuard では
+        // **そもそも作れない**のに理由が分からない（保存で出るのは書式の警告）。
+        case FormKind::kKey: {
+            const std::vector<std::string> cand = form_key_candidates();
+            if (cand.size() <= 1) {
+                form_note("鍵が NVS に無い（`profiles import` で SD から取り込む）");
+                return;
+            }
+            form_cycle(f.value, cand);
+            break;
+        }
+        case FormKind::kVia: {
+            const std::vector<std::string> cand = form_via_candidates();
+            if (cand.size() <= 1) {
+                form_note("VPN の接続先が無い（先に VPN を 1 件作る）");
+                return;
+            }
+            form_cycle(f.value, cand);
+            break;
+        }
         case FormKind::kText:
         case FormKind::kPort: {
             // **入力は端末に出るので、先に端末へ移る**（WiFi のパスワードと同じ形）。
@@ -3915,12 +3934,20 @@ void form_edit(int index)
             start_line_prompt(label, /*mask=*/false, [index](const std::string& line) {
                 // **項目は引き直す。** 種別を変えると並びもポインタも変わる。
                 const std::vector<FormField> fs = form_fields();
+                std::string                  why;
                 if (index < static_cast<int>(fs.size())) {
                     if (fs[index].kind == FormKind::kPort) {
-                        const long v = std::strtol(line.c_str(), nullptr, 10);
-                        // **範囲外は 0 に落として 22 に見せない。** 保存のときに
-                        // parse が弾いて理由を出す（検査を 2 か所に持たない）。
-                        s_form.port = (v > 0 && v <= 65535) ? static_cast<uint16_t>(v) : 0;
+                        // **ここで弾く。** 0 に落として parse に任せることはできない —
+                        // 0 は「未指定」なので to_json が 22 を書き、**打ち間違えた
+                        // ポートが黙って 22 になる**（繋ぐ先が変わったと気づけない）。
+                        const bool digits = !line.empty() &&
+                                            line.find_first_not_of("0123456789") == std::string::npos;
+                        const long v = digits ? std::strtol(line.c_str(), nullptr, 10) : 0;
+                        if (v > 0 && v <= 65535) {
+                            s_form.port = static_cast<uint16_t>(v);
+                        } else {
+                            why = "port は 1-65535 の数字で入れる（\"" + line + "\" は使わない）";
+                        }
                     } else if (fs[index].value) {
                         *fs[index].value = line;
                     }
@@ -3931,6 +3958,8 @@ void form_edit(int index)
                 set_menu_visible(true);
                 if (menu) {
                     menu->show_form();
+                    // **断った理由は画面に出す。** 端末に書いてもメニューが覆う。
+                    if (!why.empty()) menu->set_note(why);
                     menu->draw();
                 }
             });
@@ -3989,6 +4018,10 @@ void form_save()
             why = w;
             break;
         }
+        // **名前を含まない警告もある。** name が長すぎるときの警告は
+        // `profiles[N]: name が無い（または長すぎる）` で名前が入らないので、
+        // 上の検索では拾えない。**足した項目は必ず末尾**なので最後の警告を使う。
+        if (why.empty() && !check.warnings.empty()) why = check.warnings.back();
         form_note(why.empty() ? "保存できない（設定を読み戻せない）" : why);
         return;
     }

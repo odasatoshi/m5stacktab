@@ -124,9 +124,6 @@ public:
     void show_form();
     // 保存した後に、入ってきた一覧 (SSH / VPN) へ戻る (#82)。
     void show_form_list();
-    // 今その画面を見ているか。**編集から戻ってよいかの判定に使う** —
-    // 入力の間に Esc でメニューごと閉じていたら、勝手に開き直さない。
-    bool on_form() const { return screen_ == Screen::kForm; }
 
     // 接続先を消したあとに、入ってきた一覧 (SSH / VPN) へ戻る (#73)。
     // **消した後に詳細画面へ残してはいけない** — 消えた index を指したまま

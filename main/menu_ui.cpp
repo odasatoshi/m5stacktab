@@ -39,8 +39,10 @@ enum : int {
 
 static_assert(kIdWifiNet + (int)kMaxWifiNets < kIdWifiScanned,
               "保存済みの id がスキャン結果の帯域に食い込む");
-static_assert(kIdWifiScanned + kMaxWifiScanRows < kIdProfile,
-              "スキャン結果の id が接続先の帯域に食い込む");
+static_assert(kIdWifiScanned + kMaxWifiScanRows < kIdFormField,
+              "スキャン結果の id が新規作成の項目の帯域に食い込む");
+static_assert(kIdFormField + kMaxFormFields < kIdProfile,
+              "新規作成の項目の id が接続先の帯域に食い込む");
 
 }  // namespace
 
