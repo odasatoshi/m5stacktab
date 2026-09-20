@@ -224,6 +224,24 @@ void test_tailscale_port_range()
     CHECK(has_warning(c, "port"));
 }
 
+// **authkey が無い tailscale は対話ログイン (#67)。** 空を弾くとメニューに
+// 出せず、この機能は使えない。control があれば authkey 無しで通す。
+void test_tailscale_without_authkey()
+{
+    const prof::Config c = prof::parse(R"({"version":1,"profiles":[
+        {"name":"login","type":"tailscale","control":"https://controlplane.tailscale.com"}]})");
+    CHECK(c.error.empty());
+    CHECK(c.warnings.empty());
+    CHECK(c.profiles.size() == 1);
+    if (c.profiles.size() == 1) CHECK(c.profiles[0].authkey.empty());
+
+    // authkey にパスが混ざっているものは相変わらず弾く
+    const prof::Config d = prof::parse(R"({"version":1,"profiles":[
+        {"name":"bad","type":"tailscale","control":"h","authkey":"../out.key"}]})");
+    CHECK(d.profiles.empty());
+    CHECK(has_warning(d, "authkey"));
+}
+
 void test_password_auth()
 {
     const prof::Config c = prof::parse(R"({"version":1,"profiles":[
@@ -405,6 +423,7 @@ int main()
     test_endpoint_must_be_literal();
     test_tailscale_port_unset_is_kept();
     test_tailscale_port_range();
+    test_tailscale_without_authkey();
     test_via_is_reported_but_not_fatal();
     test_limits();
     test_referenced_keys();
