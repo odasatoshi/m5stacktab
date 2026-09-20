@@ -192,10 +192,11 @@ std::string s_tunnel_peer_key;
 std::string s_tunnel_endpoint;
 bool        s_tunnel_peer_valid = false;
 
-// --- SD カードの接続先 (#49) ---
+// --- 接続先 (#49 / #60) ---
 //
-// **SD の中身は信用しない。** パーサが上限と書式を見ているので、ここは
-// 「読めたか」と「その理由」だけを持つ。読めなくても NVS の 1 件で繋げる。
+// **保存先は NVS**（SD は `profiles import` の取り込み元）。中身は信用しない —
+// パーサが上限と書式を見ているので、ここは「読めたか」と「その理由」だけを持つ。
+// 読めなくても NVS の 1 件で繋げる。
 constexpr const char* kProfilesPath = "/sdcard/tab5/profiles.json";
 constexpr const char* kKeysDir      = "/sdcard/tab5/keys/";
 
@@ -738,7 +739,7 @@ int import_profiles()
     return rc;
 }
 
-// SD の接続先を見る／読み直す。**飛ばした理由をここで出す** — 画面には
+// 接続先（NVS）を見る／読み直す。**飛ばした理由をここで出す** — 画面には
 // 1 行しか出ないので、書き損じを直すにはこれが要る。
 int cmd_profiles(int argc, char** argv)
 {
@@ -1791,7 +1792,7 @@ MenuUi::Info gather_menu_info(const StatusBar::Info& si)
                                                           : nif.handshake_done() ? "up"
                                                                                  : "no handshake");
     std::snprintf(mi.wifi, sizeof(mi.wifi), "%s", si.wifi_up ? si.ssid : "(未接続)");
-    std::snprintf(mi.sd, sizeof(mi.sd), "%s", s_profiles_status);
+    std::snprintf(mi.profiles, sizeof(mi.profiles), "%s", s_profiles_status);
     return mi;
 }
 
@@ -4538,11 +4539,6 @@ extern "C" void app_main(void)
                 // 画面キーボードが隠れたまま・配分もメニューのまま・スワイプの
                 // 掴み位置も残る（ステータスバーのタップとの食い違いになる）。
                 set_menu_visible(false);
-                break;
-            case MenuUi::Action::kTsConnect:
-            case MenuUi::Action::kWgUp:
-                // ponytail: 接続先を NVS に持っていないので、まだ画面からは繋げない。
-                // 保存できるようにしたら menu_ui 側の項目を enabled にする。
                 break;
             case MenuUi::Action::kWifiConnect:
             case MenuUi::Action::kWifiDelete:
