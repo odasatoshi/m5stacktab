@@ -34,13 +34,11 @@ private:
 public:
     // メニューから起こす動作。main が実装を差す（この層は描画と選択だけを持つ）。
     enum class Action {
-        kOpenSsh,          // NVS に保存した 1 件で SSH を開く（SD が無いときの経路）
-        kTsConnect,        // 保存済みの設定で Tailscale に繋ぐ
-        kWgUp,             // 保存済みの設定で WireGuard を上げる
+        kOpenSsh,          // NVS に保存した 1 件で SSH を開く（接続先が無いときの経路）
         kShowTerminal,     // 端末に移る（メニューを閉じる）
-        kConnectProfile,   // SD の profiles.json の N 番目に繋ぐ (#49)
+        kConnectProfile,   // NVS の接続先の N 番目に繋ぐ (#49)
         kDeleteProfile,    // NVS から N 番目を消す (#73)。SD の原本は残る
-        kReloadProfiles,   // SD を読み直す
+        kReloadProfiles,   // NVS の接続先を読み直す (#60)。SD からの取り込みは `profiles import`
         // --- WiFi (#56)。index は保存済み / スキャン結果の何番目か ---
         kWifiConnect,      // 保存済みの N 番目に繋ぐ
         kWifiDelete,       // 保存済みの N 番目を消す
@@ -55,7 +53,8 @@ public:
         char ts_state[48]   = {};
         char wg_state[48]   = {};
         char wifi[48]       = {};
-        char sd[64]         = {};  // SD の読み込み結果（読めなかった理由もここ）
+        // NVS の接続先の読み込み結果（読めなかった理由もここ）。#60 まで SD だった。
+        char profiles[64]   = {};
     };
 
     explicit MenuUi(M5GFX& gfx) : gfx_(gfx) {}
@@ -79,7 +78,7 @@ public:
     }
     // set_info のあとに呼ぶと、項目の文字列を作り直して次の draw で反映する。
     void refresh();
-    // SD から読んだ接続先 (#49)。**呼び出し側が保持し続けること**（コピーしない）。
+    // 接続先 (#49)。**呼び出し側が保持し続けること**（コピーしない）。
     void set_profiles(const prof::Config* cfg) { profiles_ = cfg; }
     // 第 2 引数は kConnectProfile のときだけ意味がある（profiles の index）。
     void set_action(std::function<void(Action, int)> fn) { action_ = std::move(fn); }
@@ -140,7 +139,7 @@ private:
     Info     info_{};
     // 画面ごとの項目。label は下の文字列バッファを指すので、寿命はこのクラスと同じ。
     ui::Item items_[ui::Menu::kMaxItems]{};
-    // SD の接続先は "name  user@host:port via vpn" になるので 72 では足りない。
+    // SSH のラベルは "name  user@host:port via vpn" になるので 72 では足りない。
     char     labels_[ui::Menu::kMaxItems][96]{};
     const prof::Config*              profiles_ = nullptr;
     const std::vector<std::string>*  wifi_nets_ = nullptr;

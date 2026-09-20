@@ -1791,7 +1791,7 @@ MenuUi::Info gather_menu_info(const StatusBar::Info& si)
                                                           : nif.handshake_done() ? "up"
                                                                                  : "no handshake");
     std::snprintf(mi.wifi, sizeof(mi.wifi), "%s", si.wifi_up ? si.ssid : "(未接続)");
-    std::snprintf(mi.sd, sizeof(mi.sd), "%s", s_profiles_status);
+    std::snprintf(mi.profiles, sizeof(mi.profiles), "%s", s_profiles_status);
     return mi;
 }
 
@@ -4528,11 +4528,6 @@ extern "C" void app_main(void)
                 // 画面キーボードが隠れたまま・配分もメニューのまま・スワイプの
                 // 掴み位置も残る（ステータスバーのタップとの食い違いになる）。
                 set_menu_visible(false);
-                break;
-            case MenuUi::Action::kTsConnect:
-            case MenuUi::Action::kWgUp:
-                // ponytail: 接続先を NVS に持っていないので、まだ画面からは繋げない。
-                // 保存できるようにしたら menu_ui 側の項目を enabled にする。
                 break;
             case MenuUi::Action::kWifiConnect:
             case MenuUi::Action::kWifiDelete:
