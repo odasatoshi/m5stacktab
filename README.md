@@ -33,6 +33,8 @@ DISCO        : NaCl crypto_box（公式テストベクタで全層一致）
 
 ## ビルドと書き込み
 
+**まっさらな実機と SD カードから始めるときは [docs/setup.md](docs/setup.md)**（SD のフォーマットから Tailscale のログインまで）。
+
 ```sh
 source ~/esp/esp-idf/export.sh          # ESP-IDF v5.5.1
 idf.py build
