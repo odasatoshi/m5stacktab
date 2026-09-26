@@ -99,6 +99,12 @@ void test_ping_pong()
     ts::DiscoType ptype{};
     CHECK(ts::disco_open(pong, m, a.shared, &ptype, nullptr));
     CHECK(ptype == ts::DiscoType::kPong);
+    // 中身も取り出せる（TxID で自分の Ping への返事かを照合する）
+    ts::DiscoPong got{};
+    CHECK(ts::disco_open(pong, m, a.shared, &ptype, nullptr, &got));
+    CHECK(std::memcmp(got.tx_id, ping.tx_id, ts::kDiscoTxIdLen) == 0);
+    CHECK(std::memcmp(got.src_ip, src_ip, 16) == 0);
+    CHECK(got.src_port == 41641);
 }
 
 void test_ping_without_node_key()

@@ -36,6 +36,24 @@ struct NetMap {
 // 1 件の MapResponse JSON を解析する。失敗したら false。
 bool parse_netmap(const std::string& json, NetMap* out);
 
+// netmap をピアの一覧に畳み込む。Peers があれば丸ごと置き換え、無ければ
+// PeersChanged（ID で上書き、無ければ追加）と PeersRemoved を当てる。
+// **差分の netmap には Peers が無い**ので、1 通だけ見て相手を探すと見つからない。
+// ponytail: PeersChangedPatch / OnlineChange は読まない（エンドポイントと online の
+// 差分が落ちる）。相手がエンドポイントを変えたら次の全量 netmap まで古いまま。
+void apply_netmap(std::vector<Peer>* table, const NetMap& map);
+
+// SSH の接続先からピアを引く。受け付けるのは
+//   - MagicDNS の完全な名前（"host1.tail0000000.ts.net"、末尾の "." は有っても無くても）
+//   - 最初のラベルだけ（"host1"。ドットを含まない場合だけ）
+//   - tailnet のアドレス（"100.70.71.5"。AllowedIPs の /32 と一致）
+// 大文字小文字は区別しない（DNS の名前なので）。見つからなければ nullptr。
+const Peer* find_peer(const std::vector<Peer>& peers, const std::string& host);
+
+// ピアの tailnet IPv4（AllowedIPs の最初の IPv4 /32 からプレフィクスを外したもの）。
+// 無ければ空。
+std::string peer_ipv4(const Peer& peer);
+
 // ピアが申告した複数のエンドポイントから 1 つ選ぶ。
 //
 // **先頭を無条件に取ってはいけない。** ピアは自分の全インターフェースを申告する

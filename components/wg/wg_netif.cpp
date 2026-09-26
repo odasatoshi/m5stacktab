@@ -601,7 +601,8 @@ esp_err_t Netif::set_peer(const PeerConfig& peer)
     // ピアが変わったらリプレイ判定の状態も捨てる。残すと、実クロックを持つ相手から
     // uptime 基準のタイムスタンプを出す相手に切り替えたときに、
     // 新しいピアの initiation が全部 stale 扱いになって永久に応答しなくなる。
-    if (std::memcmp(g_state.peer_pub, peer.public_key, kKeyLen) != 0) {
+    const bool new_peer = std::memcmp(g_state.peer_pub, peer.public_key, kKeyLen) != 0;
+    if (new_peer) {
         g_state.have_peer_timestamp = false;
         std::memset(g_state.peer_timestamp, 0, sizeof(g_state.peer_timestamp));
     }
@@ -611,6 +612,15 @@ esp_err_t Netif::set_peer(const PeerConfig& peer)
 
     bool ok = false;
     if (xSemaphoreTake(g_state.lock, pdMS_TO_TICKS(500)) == pdTRUE) {
+        // **相手が変わったら前の相手のセッション鍵を捨てる** (#98)。残すと
+        // transport->ready() が true のままなので tick_locked が initiation を
+        // 再送せず（最初の 1 発が落ちたら 120 秒の rekey まで待つ）、
+        // handshake_done() も前の相手の鍵で true を返す。
+        if (new_peer) {
+            delete g_state.transport;
+            g_state.transport = new Transport(default_crypto());
+            handshake_ok_     = false;
+        }
         ok = start_handshake_locked();
         xSemaphoreGive(g_state.lock);
     }

@@ -176,4 +176,76 @@ std::string pick_endpoint(const std::vector<std::string>& endpoints, uint32_t my
     return first_v4;
 }
 
+void apply_netmap(std::vector<Peer>* table, const NetMap& map)
+{
+    if (!table || map.keepalive) return;
+    if (map.has_peers) *table = map.peers;
+    for (const auto& changed : map.peers_changed) {
+        bool replaced = false;
+        for (auto& p : *table) {
+            if (p.id == changed.id) {
+                p        = changed;
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) table->push_back(changed);
+    }
+    for (int64_t id : map.peers_removed) {
+        for (auto it = table->begin(); it != table->end(); ++it) {
+            if (it->id == id) {
+                table->erase(it);
+                break;
+            }
+        }
+    }
+}
+
+namespace {
+
+std::string dns_fold(std::string s)
+{
+    while (!s.empty() && s.back() == '.') s.pop_back();
+    for (auto& ch : s) {
+        if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+    }
+    return s;
+}
+
+}  // namespace
+
+std::string peer_ipv4(const Peer& peer)
+{
+    for (const auto& a : peer.allowed_ips) {
+        const size_t slash = a.find('/');
+        if (slash == std::string::npos || a.compare(slash, std::string::npos, "/32") != 0) continue;
+        uint32_t          v4 = 0;
+        const std::string ip = a.substr(0, slash);
+        if (parse_ipv4(ip, &v4)) return ip;
+    }
+    return {};
+}
+
+const Peer* find_peer(const std::vector<Peer>& peers, const std::string& host)
+{
+    const std::string want = dns_fold(host);
+    if (want.empty()) return nullptr;
+    const bool short_name = want.find('.') == std::string::npos;
+    uint32_t   v4         = 0;
+    const bool is_ip      = parse_ipv4(want, &v4);
+    for (const auto& p : peers) {
+        if (is_ip) {
+            if (peer_ipv4(p) == want) return &p;
+            continue;
+        }
+        const std::string name = dns_fold(p.name);
+        if (name == want) return &p;
+        if (short_name && name.compare(0, want.size(), want) == 0 && name.size() > want.size() &&
+            name[want.size()] == '.') {
+            return &p;
+        }
+    }
+    return nullptr;
+}
+
 }  // namespace ts

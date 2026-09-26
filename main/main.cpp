@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -119,7 +120,7 @@ mbedtls_ctr_drbg_context* ts_drbg()
 void register_disco_peers(const ts::NetMap& map);
 // DISCO のレスポンダ（定義は下）。ts の鍵設定から先に触る。
 extern ts::DiscoResponder s_disco;
-void maybe_bring_up_tunnel(const ts::NetMap& map, const std::string& assigned);
+void maybe_bring_up_tunnel(const std::string& assigned);
 void wire_netif(wg::Netif& nif);
 
 M5GFX                          display;
@@ -190,6 +191,13 @@ bool        s_wg_live = false;
 std::string s_tunnel_peer_key;
 std::string s_tunnel_endpoint;
 bool        s_tunnel_peer_valid = false;
+// netmap を畳み込んだピアの一覧と、SSH が指名した相手 (#98)。
+// **ts タスク（netmap）と connect タスク（SSH）の両方が触る**ので s_tunnel_mu で守る。
+// Tailscale の経路での s_tunnel_peer_* の読み書きもこのロックの下で行う。
+std::mutex            s_tunnel_mu;
+std::vector<ts::Peer> s_ts_peers;
+std::string           s_tunnel_want;       // SSH が指名したピアの node key。空なら自動で選ぶ
+uint8_t               s_ts_node_pub[32] = {};  // DISCO の Ping に載せる自分の node 公開鍵
 
 // --- 接続先 (#49 / #60) ---
 //
@@ -1488,6 +1496,7 @@ bool ts_start(const std::string& host, const std::string& authkey, uint16_t port
         s_ts_keys_ready = false;
         return false;
     }
+    std::memcpy(s_ts_node_pub, client.node_public_key(), 32);
     client.set_config(cfg);
     // 対話ログイン (#59)。**ts タスクの上で呼ばれる**ので、描くだけにして待たない。
     client.set_auth_url_handler([](const std::string& url) { show_auth_qr(url); });
@@ -1502,9 +1511,13 @@ bool ts_start(const std::string& host, const std::string& authkey, uint16_t port
         if (!ts::parse_netmap(json, &map)) return;
         if (map.keepalive) return;
         register_disco_peers(map);
+        {
+            std::lock_guard<std::mutex> guard(s_tunnel_mu);
+            ts::apply_netmap(&s_ts_peers, map);
+        }
         // 自分のアドレスは status 側で拾っている（netmap の Addresses）。
         const std::string assigned = s_ts_client ? s_ts_client->snapshot().assigned_address : "";
-        if (!assigned.empty()) maybe_bring_up_tunnel(map, assigned);
+        if (!assigned.empty()) maybe_bring_up_tunnel(assigned);
     });
 
     // **別タスクで走らせる。** run_once() は map の long-poll を最長 600 秒
@@ -2696,17 +2709,103 @@ void wire_netif(wg::Netif& nif)
     }
 }
 
+// トンネルの相手に DISCO の Ping を打つ (#98)。s_tunnel_mu を握って呼ぶ。
+//
+// **Tailscale のピアは、Pong で確かめた経路にしか WireGuard の応答を送らない。**
+// 上流の magicsock (wgengine/magicsock/magicsock.go の Conn.receiveIP) は
+// 知らない送信元からの initiation も lazyEndpoint で wireguard-go に渡すので
+// 受け取りはする。しかし wireguard-go の応答は相手ピアの endpoint
+// (wgcfg.NewPeerLookupFunc が node key から作る magicsock の endpoint) を通り、
+// endpoint.send() → addrForSendLocked() は bestAddr が無ければ UDP では送らず
+// DERP に回す。こちらは DERP を持たない (HomeDERP=0) ので応答は消える。
+// bestAddr を立てるのは endpoint.handlePongConnLocked() だけで、相手がこちらの
+// 送信元を候補にするきっかけが、こちらからの Ping（Conn.handlePingLocked の
+// addCandidateEndpoint）。だから相手に Ping を打ち、相手からの Ping には
+// on_foreign_packet が Pong を返す。
+void send_disco_ping_locked(const ts::Peer& peer, const std::string& endpoint)
+{
+    uint8_t disco_pub[32];
+    if (!ts::key_from_string(peer.disco_key, "discokey:", disco_pub)) {
+        ESP_LOGW(TAG, "disco ping: %s has no disco key", peer.name.c_str());
+        return;
+    }
+    const size_t colon = endpoint.rfind(':');
+    ip4_addr_t   ip;
+    if (colon == std::string::npos || !ip4addr_aton(endpoint.substr(0, colon).c_str(), &ip)) return;
+    const uint16_t port = static_cast<uint16_t>(std::atoi(endpoint.c_str() + colon + 1));
+    static uint8_t pkt[256];  // s_tunnel_mu の下でだけ使う
+    const size_t   n = s_disco.build_ping(disco_pub, s_ts_node_pub, pkt, sizeof(pkt));
+    if (n == 0) {
+        ESP_LOGW(TAG, "disco ping: %s is not a registered disco peer", peer.name.c_str());
+        return;
+    }
+    const bool sent = wg::netif_instance().send_raw(pkt, n, ip.addr, port);
+    ESP_LOGI(TAG, "disco ping -> %s at %s: %s (pongs so far %u)", peer.name.c_str(),
+             endpoint.c_str(), sent ? "sent" : "SEND FAILED", (unsigned)s_disco.pongs_received());
+}
+
+// トンネルをこのピアへ向ける。s_tunnel_mu を握って呼ぶ。
+// エンドポイントが選べなければ false。
+bool point_tunnel_locked(const ts::Peer& peer)
+{
+    auto&          nif = wg::netif_instance();
+    wg::PeerConfig cfg;
+    // ピアの node key が、そのまま WireGuard の公開鍵。
+    if (!ts::key_from_string(peer.node_key, "nodekey:", cfg.public_key)) {
+        ESP_LOGW(TAG, "peer node key not parseable: %s", peer.node_key.c_str());
+        return false;
+    }
+    // 自分のサブネットは WiFi の netif から取る（トンネルの netif ではない）。
+    uint32_t            my_addr = 0, my_mask = 0;
+    esp_netif_t*        sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    esp_netif_ip_info_t ip{};
+    if (sta && esp_netif_get_ip_info(sta, &ip) == ESP_OK) {
+        my_addr = ip.ip.addr;
+        my_mask = ip.netmask.addr;
+    }
+    // ponytail: Ping を打つのは選んだ 1 つだけ。本家は全エンドポイントに打ち、
+    // 最初に Pong が返った経路を使う。同一 LAN なら pick_endpoint の選択で足りる。
+    cfg.endpoint = ts::pick_endpoint(peer.endpoints, my_addr, my_mask);
+    if (cfg.endpoint.empty()) {
+        ESP_LOGW(TAG, "no usable IPv4 endpoint for %s", peer.name.c_str());
+        return false;
+    }
+
+    // **同じピア・同じエンドポイントなら何もしない。** set_peer は無条件に
+    // ハンドシェイクを始めるので、netmap ごとに呼ぶと確立済みのセッションを
+    // 毎回張り替える。しかも X25519 を g_state.lock を握ったまま 2 回回すので
+    // （実測 72ms x 2）、rx/tx タスクの 200ms タイムアウトを踏んでパケットが落ちる。
+    if (s_tunnel_peer_valid && peer.node_key == s_tunnel_peer_key &&
+        cfg.endpoint == s_tunnel_endpoint) {
+        return true;
+    }
+    // **Ping を先に打つ。** 相手はこれでこちらの送信元を候補に入れ、次に
+    // WireGuard を送ろうとしたときにそこへ Ping を打ち返してくる（こちらが Pong
+    // を返すと bestAddr が立つ）。最初の initiation への応答はまだ落ちるが、
+    // wg_netif の再送で次の回が通る。
+    send_disco_ping_locked(peer, cfg.endpoint);
+    if (esp_err_t err = nif.set_peer(cfg); err != ESP_OK) {
+        ESP_LOGE(TAG, "set_peer failed: %s (%s)", esp_err_to_name(err), nif.last_error());
+        return false;
+    }
+    s_tunnel_peer_key   = peer.node_key;
+    s_tunnel_endpoint   = cfg.endpoint;
+    s_tunnel_peer_valid = true;
+    ESP_LOGI(TAG, "tunnel peer: %s at %s", peer.name.c_str(), cfg.endpoint.c_str());
+    return true;
+}
+
 // netmap が来たら、トンネルを張れる材料が揃っているかを見て張る。
 //
 // **Tailscale では WireGuard の秘密鍵 = node key。** 以前は `wg` コマンドが
 // NVS に自前の鍵を作って使っていたので、ピアは Tab5 の node key を公開鍵として
 // 期待するのに Tab5 は別の鍵でハンドシェイクを投げ、必ず弾かれていた（#37）。
 //
-// ponytail: Netif は 1 ピアしか持てないので、**エンドポイントを申告している
-// オンラインのピアのうち最初の 1 つ**だけを相手にする。tailnet に 2 台以上いる
-// 構成が必要になったら Netif を複数ピア対応にする（そのときは AllowedIPs で
-// 宛先を振り分ける必要がある）。
-void maybe_bring_up_tunnel(const ts::NetMap& map, const std::string& assigned)
+// ponytail: Netif は 1 ピアしか持てない。相手は SSH が指名したピア (#98)、
+// 無ければ**エンドポイントを申告しているオンラインのピアのうち最初の 1 つ**。
+// 2 台と同時に話す必要が出たら Netif を複数ピア対応にする（AllowedIPs で
+// 宛先を振り分ける）。
+void maybe_bring_up_tunnel(const std::string& assigned)
 {
     if (!s_ts_keys_ready) return;
     auto& nif = wg::netif_instance();
@@ -2721,6 +2820,8 @@ void maybe_bring_up_tunnel(const ts::NetMap& map, const std::string& assigned)
     ip4_addr_t        addr, mask;
     if (addr_str.empty() || !ip4addr_aton(addr_str.c_str(), &addr)) return;
     ip4addr_aton(kTunnelMask, &mask);
+
+    std::lock_guard<std::mutex> guard(s_tunnel_mu);
 
     // **node key 以外で上がっている netif は張り替える。** Netif::up() は
     // 秘密鍵をコピーするので、上がった後に差し替える手段が無い。`wg` の独自鍵で
@@ -2742,77 +2843,85 @@ void maybe_bring_up_tunnel(const ts::NetMap& map, const std::string& assigned)
         ESP_LOGI(TAG, "tunnel netif up with the node key: %s", addr_str.c_str());
     }
 
-    // 相手を 1 つ選ぶ。オンラインでエンドポイントを申告しているものだけ。
-    //
-    // **一度選んだピアに貼り付く。** 差分 netmap には Peers が無く
-    // PeersChanged だけが来るので、毎回選び直すと peers[0] と
-    // peers_changed[0] の間でトンネルがフラップする（`Netif` は 1 ピアしか
-    // 持てないので、切り替わるたびにハンドシェイクをやり直すことになる）。
+    // 相手を選ぶ。SSH が指名していればそのピア、前に選んだピアがあればそれ
+    // （**貼り付く**: netmap ごとに選び直すとトンネルがフラップし、そのたびに
+    // ハンドシェイクをやり直すことになる）、どちらも無ければ最初の使えるピア。
     auto usable = [](const ts::Peer& p) {
         return p.online && !p.endpoints.empty() && !p.node_key.empty();
     };
-    const ts::Peer* peer = nullptr;
-    auto find_in = [&](const std::vector<ts::Peer>& peers) {
-        for (const auto& p : peers) {
-            if (!usable(p)) continue;
-            if (s_tunnel_peer_valid && p.node_key != s_tunnel_peer_key) continue;
-            peer = &p;
+    const std::string sticky = !s_tunnel_want.empty()
+                                   ? s_tunnel_want
+                                   : (s_tunnel_peer_valid ? s_tunnel_peer_key : std::string());
+    for (const auto& p : s_ts_peers) {
+        if (sticky.empty() ? usable(p) : p.node_key == sticky) {
+            point_tunnel_locked(p);
             return;
         }
-    };
-    find_in(map.peers);
-    if (!peer) find_in(map.peers_changed);
-    if (!peer && s_tunnel_peer_valid) return;  // 選んだピアがこの netmap に出てこないだけ
-    if (!peer) {
-        // まだ誰も選んでいないので、条件を満たす最初のピアを取る。
-        for (const auto& list : {&map.peers, &map.peers_changed}) {
-            for (const auto& p : *list) {
-                if (usable(p)) {
-                    peer = &p;
-                    break;
-                }
+    }
+}
+
+// SSH の接続先を tailnet のピアとして引き、トンネルをそこへ向ける (#98)。
+// 成功したら *ip に相手の 100.x を入れる（SSH はそこへ繋ぐ。MagicDNS の名前は
+// lwIP の DNS では引けない）。**connect タスク (32KB) の上で呼ぶ** — set_peer が
+// X25519 を回す。ハンドシェイクが済むまで待つ。
+bool tailnet_prepare(const std::string& host, std::string* ip, std::string* err)
+{
+    auto& nif = wg::netif_instance();
+    // netmap が来てトンネルの netif が上がるまで待つ。対話ログインなら人間が
+    // QR を読んで承認するまでかかるので長めに取る。
+    constexpr int kWaitNetmapSec    = 120;
+    constexpr int kWaitHandshakeSec = 20;
+    std::string   endpoint;
+    for (int i = 0; endpoint.empty(); ++i) {
+        if (i >= kWaitNetmapSec) {
+            *err = "tailnet の netmap が来ない（`ts-status` を見る）";
+            return false;
+        }
+        if (i > 0) vTaskDelay(pdMS_TO_TICKS(1000));
+        std::lock_guard<std::mutex> guard(s_tunnel_mu);
+        const ts::Peer* p = ts::find_peer(s_ts_peers, host);
+        if (!p) {
+            if (!s_ts_peers.empty()) {
+                *err = "tailnet に \"" + host + "\" が居ない";
+                return false;
             }
-            if (peer) break;
+            if (!s_ts_task) {
+                *err = "tailscale が止まっている（`ts-status` を見る）";
+                return false;
+            }
+            continue;
+        }
+        *ip = ts::peer_ipv4(*p);
+        if (ip->empty()) {
+            *err = host + " に tailnet の IPv4 アドレスが無い";
+            return false;
+        }
+        s_tunnel_want = p->node_key;
+        // netif は map handler が上げる。上がるまで待つ。
+        if (!nif.is_up() || s_netif_key != NetifKey::kNode) continue;
+        if (!point_tunnel_locked(*p)) {
+            *err = host + " に届く IPv4 のエンドポイントが無い（オフライン？ DERP は未実装）";
+            return false;
+        }
+        endpoint = s_tunnel_endpoint;
+    }
+    term_note("33", "tailnet: " + host + " = " + *ip + " via " + endpoint);
+
+    // ハンドシェイクを待つ。Pong が来ないうちは Ping を打ち直す（相手の
+    // bestAddr が立つまで、相手は initiation への応答を送ってこない）。
+    for (int i = 0; i < kWaitHandshakeSec; ++i) {
+        if (nif.handshake_done()) return true;
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (i % 5 == 4) {
+            std::lock_guard<std::mutex> guard(s_tunnel_mu);
+            if (const ts::Peer* p = ts::find_peer(s_ts_peers, host)) {
+                send_disco_ping_locked(*p, s_tunnel_endpoint);
+            }
         }
     }
-    if (!peer) return;
-
-    wg::PeerConfig cfg;
-    // ピアの node key が、そのまま WireGuard の公開鍵。
-    if (!ts::key_from_string(peer->node_key, "nodekey:", cfg.public_key)) {
-        ESP_LOGW(TAG, "peer node key not parseable: %s", peer->node_key.c_str());
-        return;
-    }
-    // 自分のサブネットは WiFi の netif から取る（トンネルの netif ではない）。
-    uint32_t            my_addr = 0, my_mask = 0;
-    esp_netif_t*        sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    esp_netif_ip_info_t ip{};
-    if (sta && esp_netif_get_ip_info(sta, &ip) == ESP_OK) {
-        my_addr = ip.ip.addr;
-        my_mask = ip.netmask.addr;
-    }
-    cfg.endpoint = ts::pick_endpoint(peer->endpoints, my_addr, my_mask);
-    if (cfg.endpoint.empty()) {
-        ESP_LOGW(TAG, "no usable IPv4 endpoint for %s", peer->name.c_str());
-        return;
-    }
-
-    // **同じピア・同じエンドポイントなら何もしない。** set_peer は無条件に
-    // ハンドシェイクを始めるので、netmap ごとに呼ぶと確立済みのセッションを
-    // 毎回張り替える。しかも X25519 を g_state.lock を握ったまま 2 回回すので
-    // （実測 72ms x 2）、rx/tx タスクの 200ms タイムアウトを踏んでパケットが落ちる。
-    if (s_tunnel_peer_valid && peer->node_key == s_tunnel_peer_key &&
-        cfg.endpoint == s_tunnel_endpoint) {
-        return;
-    }
-    if (esp_err_t err = nif.set_peer(cfg); err != ESP_OK) {
-        ESP_LOGE(TAG, "set_peer failed: %s (%s)", esp_err_to_name(err), nif.last_error());
-        return;
-    }
-    s_tunnel_peer_key   = peer->node_key;
-    s_tunnel_endpoint   = cfg.endpoint;
-    s_tunnel_peer_valid = true;
-    ESP_LOGI(TAG, "tunnel peer: %s at %s", peer->name.c_str(), cfg.endpoint.c_str());
+    *err = "WireGuard のハンドシェイクが通らない（disco pong " +
+           std::to_string(s_disco.pongs_received()) + " 回。`wg stat` / `wg disco` を見る）";
+    return false;
 }
 
 // ICMP echo を投げる。トンネル越しの到達性を確かめる手段が無いと、
@@ -3019,10 +3128,10 @@ int cmd_wg(int argc, char** argv)
         }
         std::printf("disco pub: ");
         for (int i = 0; i < 32; ++i) std::printf("%02x", s_disco.public_key()[i]);
-        std::printf("\n  peers=%u pings=%u pongs=%u (failed %u) unknown=%u\n",
+        std::printf("\n  peers=%u pings=%u pongs=%u (failed %u) unknown=%u pongs_rx=%u\n",
                     (unsigned)s_disco.peer_count(), (unsigned)s_disco.pings_received(),
                     (unsigned)s_disco.pongs_sent(), (unsigned)s_disco.pongs_failed(),
-                    (unsigned)s_disco.unknown_peers());
+                    (unsigned)s_disco.unknown_peers(), (unsigned)s_disco.pongs_received());
         return 0;
     }
     if (argc >= 2 && std::string(argv[1]) == "stat") {
@@ -3346,6 +3455,14 @@ void connect_ssh_profile(const prof::Profile& p, int index, const ViaTarget& via
 
     SshConfig cfg;
     cfg.host     = p.host;
+    // tailnet のピアなら、名前を netmap で 100.x に引いてトンネルを向ける (#98)。
+    if (via.named && via.profile.type == prof::Type::kTailscale) {
+        std::string err;
+        if (!tailnet_prepare(p.host, &cfg.host, &err)) {
+            term_note("31", "via " + p.via + ": " + err);
+            return;
+        }
+    }
     cfg.user     = p.user;
     cfg.port     = p.port;
     cfg.password = p.password;

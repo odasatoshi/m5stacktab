@@ -182,6 +182,83 @@ void test_review_regressions()
     CHECK(r.pings_received() == 1);
 }
 
+// 自分から Ping を打ち、返ってきた Pong の TxID を照合する (#98)。
+void test_ping_and_pong()
+{
+    const auto& c = wg::default_crypto();
+    uint8_t     me_priv[32], me_pub[32], peer_priv[32], peer_pub[32], node_key[32];
+    CHECK(c.random_bytes(me_priv, 32));
+    CHECK(c.random_bytes(peer_priv, 32));
+    CHECK(c.random_bytes(node_key, 32));
+    CHECK(c.dh_pubkey(me_pub, me_priv));
+    CHECK(c.dh_pubkey(peer_pub, peer_priv));
+
+    ts::DiscoResponder r;
+    CHECK(r.set_key(me_priv));
+    uint8_t ping[256];
+    // 登録されていないピアには打てない（共有鍵が無い）
+    CHECK(r.build_ping(peer_pub, node_key, ping, sizeof(ping)) == 0);
+    CHECK(r.add_peer(peer_pub));
+    const size_t plen = r.build_ping(peer_pub, node_key, ping, sizeof(ping));
+    CHECK(plen > 0);
+
+    // ピア側で開く: 送り主は自分の disco 鍵、NodeKey は自分の node 鍵
+    uint8_t sender[32];
+    CHECK(ts::disco_is_packet(ping, plen, sender));
+    CHECK(std::memcmp(sender, me_pub, 32) == 0);
+    uint8_t dh[32], peer_shared[32];
+    CHECK(c.dh(dh, peer_priv, me_pub));
+    wg::box_beforenm(peer_shared, dh);
+    ts::DiscoType type{};
+    ts::DiscoPing got{};
+    CHECK(ts::disco_open(ping, plen, peer_shared, &type, &got));
+    CHECK(type == ts::DiscoType::kPing);
+    CHECK(got.has_node_key && std::memcmp(got.node_key, node_key, 32) == 0);
+
+    auto pong_for = [&](const uint8_t* tx, uint8_t* out) {
+        uint8_t src[16], nonce[ts::kDiscoNonceLen];
+        ts::disco_v4_mapped(src, 0x1d00a8c0);
+        CHECK(c.random_bytes(nonce, sizeof(nonce)));
+        return ts::disco_build_pong(out, 256, peer_pub, peer_shared, tx, src, 41641, nonce);
+    };
+    uint8_t pong[256], reply[256];
+
+    // TxID が違う Pong は数えない（こちらが打った Ping への返事ではない）
+    uint8_t other[ts::kDiscoTxIdLen];
+    CHECK(c.random_bytes(other, sizeof(other)));
+    size_t n = pong_for(other, pong);
+    CHECK(r.handle(pong, n, 0x6500a8c0, 41641, reply, sizeof(reply)) == 0);  // 返信はしない
+    CHECK(r.pongs_received() == 0);
+
+    // 一致すれば数える。同じ Pong が二度来ても一度だけ
+    n = pong_for(got.tx_id, pong);
+    CHECK(r.handle(pong, n, 0x6500a8c0, 41641, reply, sizeof(reply)) == 0);
+    CHECK(r.pongs_received() == 1);
+    CHECK(r.handle(pong, n, 0x6500a8c0, 41641, reply, sizeof(reply)) == 0);
+    CHECK(r.pongs_received() == 1);
+    CHECK(r.pings_received() == 0);  // Pong を Ping と数えない
+
+    // 再送した後に、前の回の Ping への Pong が遅れて来ても受ける
+    size_t len1 = r.build_ping(peer_pub, node_key, ping, sizeof(ping));
+    CHECK(len1 > 0);
+    CHECK(ts::disco_open(ping, len1, peer_shared, &type, &got));
+    uint8_t first_tx[ts::kDiscoTxIdLen];
+    std::memcpy(first_tx, got.tx_id, sizeof(first_tx));
+    CHECK(r.build_ping(peer_pub, node_key, ping, sizeof(ping)) > 0);
+    n = pong_for(first_tx, pong);
+    CHECK(r.handle(pong, n, 0x6500a8c0, 41641, reply, sizeof(reply)) == 0);
+    CHECK(r.pongs_received() == 2);
+
+    // 鍵を替えたら前の鍵で閉じた Pong は復号できない
+    const size_t n_old = pong_for(got.tx_id, pong);
+    uint8_t      other_priv[32];
+    CHECK(c.random_bytes(other_priv, 32));
+    CHECK(r.set_key(other_priv));
+    CHECK(r.add_peer(peer_pub));
+    CHECK(r.handle(pong, n_old, 0x6500a8c0, 41641, reply, sizeof(reply)) == 0);
+    CHECK(r.pongs_received() == 2);
+}
+
 }  // namespace
 
 int main()
@@ -189,6 +266,7 @@ int main()
     test_responder();
     test_unknown_peer_rejected();
     test_review_regressions();
+    test_ping_and_pong();
     std::printf("ok: %d checks passed\n", g_checks);
     return 0;
 }

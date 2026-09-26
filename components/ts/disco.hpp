@@ -11,7 +11,9 @@
 // 初めて送信元アドレスを bestAddr に固定するので、応答を返さないと netmap 再構成のあとに
 // DERP 経由へ落ちる（DERP を実装していない側は以後届かなくなる）。
 //
-// まずは「Ping に Pong を返す」だけを実装する（自分から Ping は打たない）。
+// Ping に Pong を返すのに加えて、トンネルの相手には自分から Ping を打つ (#98)。
+// 本家は Ping を受けて初めてこちらの送信元を経路の候補に入れ、Pong で確かめて
+// から WireGuard の応答をそこへ送る（disco_responder.hpp の説明を参照）。
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -37,14 +39,21 @@ struct DiscoPing {
     bool    has_node_key         = false;
 };
 
+struct DiscoPong {
+    uint8_t  tx_id[kDiscoTxIdLen] = {};
+    uint8_t  src_ip[16]           = {};  // 相手から見たこちらの送信元（v4-mapped）
+    uint16_t src_port             = 0;
+};
+
 // 受信したパケットが DISCO かを見る（復号はしない）。
 // 送信者の disco 公開鍵を sender_pub に返す。
 bool disco_is_packet(const uint8_t* pkt, size_t len, uint8_t sender_pub[kDiscoKeyLen]);
 
 // DISCO パケットを復号して種別と中身を取り出す。
 // shared_key は crypto_box_beforenm(sender_pub, 自分の disco 秘密鍵) の結果。
+// pong_out は Pong のときだけ埋まる（短すぎる Pong は false）。
 bool disco_open(const uint8_t* pkt, size_t len, const uint8_t shared_key[32], DiscoType* type,
-                DiscoPing* ping_out);
+                DiscoPing* ping_out, DiscoPong* pong_out = nullptr);
 
 // Pong を作る。src_ip / src_port は「Ping を受け取った送信元」をそのまま返す
 // （相手がこれを見て自分の外側アドレスを知る）。
@@ -54,7 +63,8 @@ size_t disco_build_pong(uint8_t* out, size_t cap, const uint8_t my_disco_pub[kDi
                         const uint8_t src_ip[16], uint16_t src_port,
                         const uint8_t nonce[kDiscoNonceLen]);
 
-// テストと送信側のために Ping も作れるようにしておく。
+// Ping を作る。node_key は**自分の** node 公開鍵（本家はこれで送り主のノードを
+// 一意に決め、送信元アドレスをそのノードに結びつける）。nullptr なら省略する。
 size_t disco_build_ping(uint8_t* out, size_t cap, const uint8_t my_disco_pub[kDiscoKeyLen],
                         const uint8_t shared_key[32], const uint8_t tx_id[kDiscoTxIdLen],
                         const uint8_t* node_key, const uint8_t nonce[kDiscoNonceLen]);

@@ -80,6 +80,8 @@ public:
     bool set_keys(const uint8_t machine_priv[32], const uint8_t node_priv[32],
                   const uint8_t disco_priv[32] = nullptr);
     void set_config(const ClientConfig& cfg) { cfg_ = cfg; }
+    // set_keys で導出した node 公開鍵（DISCO の Ping に載せる）。
+    const uint8_t* node_public_key() const { return node_pub_; }
 
     // netmap を受け取ったときに呼ばれる（生の JSON）。ピア情報の解析は呼び出し側。
     void set_map_handler(std::function<void(const std::string&)> fn) { on_map_ = std::move(fn); }

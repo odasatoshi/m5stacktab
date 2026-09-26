@@ -24,7 +24,7 @@ bool disco_is_packet(const uint8_t* pkt, size_t len, uint8_t sender_pub[kDiscoKe
 }
 
 bool disco_open(const uint8_t* pkt, size_t len, const uint8_t shared_key[32], DiscoType* type,
-                DiscoPing* ping_out)
+                DiscoPing* ping_out, DiscoPong* pong_out)
 {
     if (!disco_is_packet(pkt, len, nullptr)) return false;
 
@@ -53,6 +53,16 @@ bool disco_open(const uint8_t* pkt, size_t len, const uint8_t shared_key[32], Di
             if (ping_out->has_node_key) {
                 std::memcpy(ping_out->node_key, plain + 2 + kDiscoTxIdLen, 32);
             }
+        }
+    }
+    if (t == DiscoType::kPong) {
+        if (plain_len < 2 + kDiscoTxIdLen + 16 + 2) return false;
+        if (pong_out) {
+            const uint8_t* b = plain + 2;
+            std::memcpy(pong_out->tx_id, b, kDiscoTxIdLen);
+            std::memcpy(pong_out->src_ip, b + kDiscoTxIdLen, 16);
+            pong_out->src_port = static_cast<uint16_t>((b[kDiscoTxIdLen + 16] << 8) |
+                                                       b[kDiscoTxIdLen + 17]);
         }
     }
     return true;

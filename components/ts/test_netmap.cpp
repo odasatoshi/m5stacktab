@@ -204,9 +204,74 @@ void test_pick_endpoint()
     CHECK(ts::pick_endpoint(real, v4(203, 0, 0, 5), v4(255, 0, 0, 0)) == "203.0.113.1:41642");
 }
 
+// netmap をピア表に畳み込み、SSH の接続先から引く (#98)。
+void test_apply_and_find()
+{
+    std::vector<ts::Peer> table;
+    ts::NetMap            m;
+    CHECK(ts::parse_netmap(kFullMap, &m));
+    ts::apply_netmap(&table, m);
+    CHECK(table.size() == 2);
+
+    // 完全な名前（末尾の "." の有無・大文字小文字を問わない）、短い名前、100.x
+    const ts::Peer* p = ts::find_peer(table, "mac.tab5.test");
+    CHECK(p && p->id == 1);
+    CHECK(ts::find_peer(table, "MAC.tab5.test.") == p);
+    CHECK(ts::find_peer(table, "mac") == p);
+    CHECK(ts::find_peer(table, "100.64.0.1") == p);
+    EXPECT(ts::peer_ipv4(*p), "100.64.0.1");
+    // 前方一致で拾わない
+    CHECK(ts::find_peer(table, "ma") == nullptr);
+    CHECK(ts::find_peer(table, "mac.tab5") == nullptr);
+    CHECK(ts::find_peer(table, "100.64.0.10") == nullptr);
+    // サブネットルート (10.0.0.0/24) は tailnet のアドレスではない
+    CHECK(ts::find_peer(table, "10.0.0.0") == nullptr);
+    CHECK(ts::find_peer(table, "") == nullptr);
+    CHECK(ts::find_peer(table, ".") == nullptr);
+
+    // 差分: Peers が無いので表は残り、変わったものだけ上書き・追加・削除される
+    ts::NetMap d;
+    CHECK(ts::parse_netmap(R"({
+      "PeersChanged": [
+        {"ID": 1, "Name": "mac.tab5.test.", "Key": "nodekey:dd", "Addresses": ["100.64.0.1/32"],
+         "Endpoints": ["192.168.0.58:41641"], "Online": true},
+        {"ID": 7, "Name": "host1.tail0000000.ts.net.", "Key": "nodekey:ee",
+         "Addresses": ["100.70.71.5/32", "fd7a:115c:a1e0::5/128"], "Online": true}
+      ],
+      "PeersRemoved": [2]
+    })", &d));
+    ts::apply_netmap(&table, d);
+    CHECK(table.size() == 2);
+    p = ts::find_peer(table, "mac");
+    CHECK(p && p->endpoints.size() == 1);
+    EXPECT(p->endpoints[0], "192.168.0.58:41641");
+    CHECK(ts::find_peer(table, "phone") == nullptr);
+    p = ts::find_peer(table, "host1.tail0000000.ts.net");
+    CHECK(p && p->id == 7);
+    EXPECT(ts::peer_ipv4(*p), "100.70.71.5");
+
+    // KeepAlive は何も変えない
+    ts::NetMap ka;
+    CHECK(ts::parse_netmap(R"({"KeepAlive":true})", &ka));
+    ts::apply_netmap(&table, ka);
+    CHECK(table.size() == 2);
+
+    // 全量が来たら置き換える
+    ts::apply_netmap(&table, m);
+    CHECK(table.size() == 2);
+    CHECK(ts::find_peer(table, "host1") == nullptr);
+    CHECK(ts::find_peer(table, "phone") != nullptr);
+
+    // IPv6 しか持たないピアは tailnet IPv4 が無い
+    ts::Peer v6;
+    v6.allowed_ips = {"fd7a:115c:a1e0::9/128"};
+    CHECK(ts::peer_ipv4(v6).empty());
+}
+
 int main()
 {
     test_pick_endpoint();
+    test_apply_and_find();
     test_full_map();
     test_keepalive();
     test_incremental();
