@@ -229,6 +229,20 @@ void test_map_request()
     // Endpoints は Hostinfo の外（兄弟）に出す
     CHECK(s.find("\"LinkType\":\"wifi\"}},\"Endpoints\":") != std::string::npos);
 
+    // long-poll では OmitPeers を出さない（出すとピアが来なくなる）
+    CHECK(s.find("OmitPeers") == std::string::npos);
+
+    // lite update: Stream:false + OmitPeers:true。**DiscoKey / Endpoints が SaaS に
+    // 届くのはこちらだけ**（capver >= 68 の Stream:true は読み取り専用）(#98)
+    p.stream     = false;
+    p.omit_peers = true;
+    const std::string lite = ts::build_map_request(p);
+    CHECK(lite.find("\"Stream\":false,\"OmitPeers\":true") != std::string::npos);
+    CHECK(lite.find("\"DiscoKey\":\"discokey:22\"") != std::string::npos);
+    CHECK(lite.find("\"Endpoints\":[\"192.168.0.29:41641\",\"10.0.0.5:41641\"]") !=
+          std::string::npos);
+    CHECK(lite.find("\"NetInfo\":{") != std::string::npos);
+
     // エンドポイントが無ければキー自体を出さない
     p.endpoints.clear();
     const std::string s2 = ts::build_map_request(p);

@@ -634,18 +634,31 @@ bool Client::run_once()
             mp.disco_key          = key_to_string("discokey:", disco_pub_);
             mp.hostname           = cfg_.hostname;
             mp.endpoints          = cfg_.endpoints;
-            mp.stream             = true;
-            const std::string body = build_map_request(mp);
-            std::vector<uint8_t> buf(body.size() + 1024);
-            map_sid        = take_sid();
-            const size_t n = h2_build_post(buf.data(), buf.size(), map_sid, cfg_.host.c_str(),
-                                           "/machine/map",
-                                           reinterpret_cast<const uint8_t*>(body.data()),
-                                           body.size());
-            if (n == 0 || !seal_send(buf.data(), n)) {
-                set_error("sending map request failed");
-                st_.state = ClientStatus::State::kFailed;
-                return false;
+            // 1 本目は lite update（Stream:false + OmitPeers:true）。**DiscoKey と
+            // Endpoints はここでしか SaaS に届かない** — capver >= 68 の Stream:true は
+            // 読み取り専用として扱われる（tailcfg.MapRequest.Stream）。stream だけ送ると
+            // ピアの netmap で DiscoKey=None になり、相手の magicsock は
+            // こちらを登録すらしない（DISCO ping を捨てる）。実機で確認 (#98)。
+            // 応答は 200 だけで本文は読まない。非 200 は handle_frames が拾う。
+            // 2 本目がいつもの long-poll。本家も Hostinfo 等は両方に載せている。
+            // ponytail: エンドポイントは接続時に 1 回だけ送る。WiFi の IP が
+            // 変わったら再接続で送り直す。走行中に変わるなら lite を送り直す経路を足す。
+            for (const bool stream : {false, true}) {
+                mp.stream              = stream;
+                mp.omit_peers          = !stream;
+                const std::string body = build_map_request(mp);
+                std::vector<uint8_t> buf(body.size() + 1024);
+                const uint32_t sid = take_sid();
+                if (stream) map_sid = sid;
+                const size_t n = h2_build_post(buf.data(), buf.size(), sid, cfg_.host.c_str(),
+                                               "/machine/map",
+                                               reinterpret_cast<const uint8_t*>(body.data()),
+                                               body.size());
+                if (n == 0 || !seal_send(buf.data(), n)) {
+                    set_error("sending map request failed");
+                    st_.state = ClientStatus::State::kFailed;
+                    return false;
+                }
             }
             sent_map  = true;
             st_.state = ClientStatus::State::kMapping;

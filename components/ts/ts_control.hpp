@@ -88,7 +88,13 @@ struct MapParams {
     std::string              disco_key;
     std::string              hostname;
     std::vector<std::string> endpoints;  // "192.168.0.29:41641" など
-    bool                     stream    = true;
+    // **DiscoKey / Endpoints / Hostinfo は stream=false の「lite update」でしか届かない。**
+    // capver >= 68 では Stream:true の要求は読み取り専用で、SaaS はこれらを無視する
+    // （tailcfg.MapRequest.Stream のコメント）。本家のクライアントは
+    // Stream:false + OmitPeers:true で送る（controlclient.Direct.SendUpdate）。
+    // Headscale は stream でも受け取るので、Headscale だけで試すと気づけない (#98)。
+    bool                     stream     = true;
+    bool                     omit_peers = false;
 };
 std::string build_map_request(const MapParams& p);
 

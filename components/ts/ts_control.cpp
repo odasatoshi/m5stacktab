@@ -201,6 +201,7 @@ std::string build_map_request(const MapParams& p)
     s += ",\"NodeKey\":\"" + json_escape(p.node_key) + "\"";
     if (!p.disco_key.empty()) s += ",\"DiscoKey\":\"" + json_escape(p.disco_key) + "\"";
     s += ",\"Stream\":" + std::string(p.stream ? "true" : "false");
+    if (p.omit_peers) s += ",\"OmitPeers\":true";
     s += ",\"KeepAlive\":true";
     // zstd デコーダを載せたくないので圧縮は使わない。
     s += ",\"Compress\":\"\"";
