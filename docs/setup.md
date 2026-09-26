@@ -28,7 +28,8 @@ idf.py -p /dev/cu.usbmodem101 erase-flash
 ## 2. SD カードを MBR + FAT32 でフォーマットする
 
 **新品の SD カードは、そのままでは使えない。** 64GB 以上のカード (SDXC) は exFAT で
-フォーマットされて出荷されるが、ファームは exFAT を読めない（`CONFIG_FATFS_EXFAT` が無い）。
+フォーマットされて出荷されるが、ファームは exFAT を読めない（ESP-IDF の FatFs が
+`ffconf.h` で `FF_FS_EXFAT 0`）。
 
 Mac に挿して、ディスク番号を確かめる。
 
@@ -45,7 +46,7 @@ mkdir -p /Volumes/TAB5/tab5/keys
 ```
 
 - 32GB を超えるカードでも、`diskutil` なら FAT32 で作れる（クラスタ 32KB になった）
-- `MBRFormat` を付ける。GPT だとファームがマウントできない
+- `MBRFormat` を付ける。GPT は読めない（同じく `FF_LBA64 0`。FatFs は GPT を LBA64 有効時にしか扱わない）
 - macOS が `._keys` のような `._` ファイルを作るが、ファームは名前を指定して開くので害はない
 
 ## 3. ビルドして書き込む
