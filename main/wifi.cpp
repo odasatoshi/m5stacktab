@@ -170,7 +170,9 @@ void retry_timer_cb(void*)
 void on_wifi_event(void*, esp_event_base_t base, int32_t id, void* data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
+        // **繋ぐと決めたときだけ繋ぐ。** 保存 0 件だとスキャンが start するので、
+        // ここで無条件に繋ぐと接続試行と重なってスキャンが 0 件になる (#94)。
+        if (s_current >= 0) esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         auto* e = static_cast<wifi_event_sta_disconnected_t*>(data);
         if (s_events) xEventGroupClearBits(s_events, kConnected);
@@ -359,6 +361,9 @@ esp_err_t wifi_start(void)
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_RETURN_ON_ERROR(esp_wifi_init(&cfg), TAG, "wifi_init");  // 内部で SDIO が起動する
+    // **STA の設定を C6 のフラッシュに残さない。** 正本は P4 の NVS (wifi/nets)。
+    // 既定の FLASH だと P4 で消した AP に C6 が覚えた設定で繋がる (#94)。
+    ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_RAM), TAG, "set_storage");
     ESP_RETURN_ON_ERROR(
         esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &on_wifi_event, nullptr, nullptr),
         TAG, "reg wifi event");

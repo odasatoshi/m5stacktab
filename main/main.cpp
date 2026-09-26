@@ -3510,7 +3510,8 @@ void wifi_ui_result(const std::string& note, bool show_scan)
 }
 
 // 足して繋ぐ。**入力は端末でやる**ので、結果も端末に書く（メニューは閉じている）。
-void wifi_add_and_connect(const std::string& ssid, const std::string& pass)
+// 繋ぎ始められたら true。
+bool wifi_add_and_connect(const std::string& ssid, const std::string& pass)
 {
     const esp_err_t err = wifi_net_add(ssid.c_str(), pass.c_str());
     if (err != ESP_OK) {
@@ -3518,24 +3519,47 @@ void wifi_add_and_connect(const std::string& ssid, const std::string& pass)
                             ? "保存済みが " + std::to_string(kMaxWifiNets) +
                                   " 件で満杯。消してから追加する"
                             : "保存できない: " + std::string(esp_err_to_name(err)));
-        return;
+        return false;
     }
     const int i = wifi_net_find(ssid.c_str());
     if (i < 0) {
         term_note("31", "保存したはずの \"" + ssid + "\" が見つからない");
-        return;
+        return false;
     }
     term_note("33", "connecting to \"" + ssid + "\"...");
-    if (const esp_err_t e = wifi_net_connect(static_cast<size_t>(i)); e != ESP_OK) {
-        term_note("31", std::string("connect failed: ") + esp_err_to_name(e));
-    }
+    const esp_err_t e = wifi_net_connect(static_cast<size_t>(i));
+    if (e != ESP_OK) term_note("31", std::string("connect failed: ") + esp_err_to_name(e));
     TermGuard guard;
     if (guard.ok()) refresh_wifi_nets();
+    return e == ESP_OK;
+}
+
+// 繋ぎ始めた後の結果。**ジョブの枠を空けてから呼ぶ**（待つ間に消す・選び直すを断らない）。
+// 途中で別の接続先が選ばれたら空を返す — 古い結果で上書きしない (#94)。
+// ponytail: 20 秒のポーリング。リトライ中の失敗理由は出さない（ログには出る）
+bool wait_wifi_result(const std::string& ssid, std::string* msg)
+{
+    msg->clear();
+    for (int t = 0; t < 80; ++t) {
+        char cur[33] = "", ip[16] = "";
+        if (!wifi_net_ssid(static_cast<size_t>(wifi_net_current()), cur, sizeof(cur)) ||
+            ssid != cur) {
+            return false;
+        }
+        if (wifi_status(cur, sizeof(cur), nullptr, ip, sizeof(ip)) && ssid == cur) {
+            *msg = "connected to \"" + ssid + "\" (" + ip + ")";
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+    *msg = "\"" + ssid + "\" に 20 秒繋がらない（パスワード？ 再接続は続ける）";
+    return false;
 }
 
 void wifi_worker(void*)
 {
     const WifiReq req = s_wifi_req;
+    bool          wait = false;  // 繋ぎ始めたので結果を待つ
     switch (req.job) {
         case WifiJob::kScan: {
             WifiScanEntry aps[kMaxWifiScanRows];
@@ -3561,10 +3585,11 @@ void wifi_worker(void*)
             break;
         }
         case WifiJob::kAddConnect:
-            wifi_add_and_connect(req.ssid, req.pass);
+            wait = wifi_add_and_connect(req.ssid, req.pass);
             break;
         case WifiJob::kConnect: {
             const esp_err_t err = wifi_net_connect(static_cast<size_t>(req.index));
+            wait                = err == ESP_OK;
             wifi_ui_result(err == ESP_OK ? "connecting to \"" + req.ssid + "\"..."
                                          : std::string("connect failed: ") + esp_err_to_name(err),
                            /*show_scan=*/false);
@@ -3578,9 +3603,17 @@ void wifi_worker(void*)
             break;
         }
     }
+    // **枠を空けてから待つ。** 待つ間は読むだけなので、消す・選び直すを断らない。
+    s_wifi_task = nullptr;
+    std::string msg;
+    const bool  ok = wait && wait_wifi_result(req.ssid, &msg);
+    // 追加は端末で入力したので端末へ、選択はメニューから来たのでメニューへ返す。
+    if (!msg.empty()) {
+        if (req.job == WifiJob::kAddConnect) term_note(ok ? "32" : "31", msg);
+        else wifi_ui_result(msg, /*show_scan=*/false);
+    }
     ESP_LOGI(TAG, "wifi job task stack headroom: %u bytes",
              (unsigned)uxTaskGetStackHighWaterMark(nullptr));
-    s_wifi_task = nullptr;
     vTaskDelete(nullptr);
 }
 
