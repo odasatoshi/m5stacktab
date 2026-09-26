@@ -222,8 +222,17 @@ bool h2_parse_frame(const uint8_t* in, size_t len, H2Frame* out, size_t* consume
 bool h2_headers_is_status_200(const uint8_t* payload, size_t len)
 {
     // 静的テーブル index 8 = ":status 200"。indexed field は 0x80 | 8 = 0x88。
-    // サーバは普通これを最初に置く。違う形で来たら判定しない（false）。
-    return len >= 1 && payload[0] == 0x88;
+    // **先頭の dynamic table size update (001xxxxx) は読み飛ばす。** 本家の制御プレーンは
+    // `21 88 ...` と送ってくる。先頭 1 バイトだけ見ると 200 を non-200 と誤判定する。
+    // ponytail: 他の形（literal の :status 200 など）は false のまま。来たら HPACK を読む
+    size_t i = 0;
+    while (payload && i < len && (payload[i] & 0xE0) == 0x20) {
+        if ((payload[i++] & 0x1F) == 0x1F) {  // 5 ビットに収まらない値は続きのバイトがある
+            while (i < len && (payload[i] & 0x80)) ++i;
+            ++i;
+        }
+    }
+    return payload && i < len && payload[i] == 0x88;
 }
 
 }  // namespace ts

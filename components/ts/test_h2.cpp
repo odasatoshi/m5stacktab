@@ -179,6 +179,16 @@ void test_status_check()
     const uint8_t not_ok[] = {0x8b};  // :status 404
     CHECK(!ts::h2_headers_is_status_200(not_ok, sizeof(not_ok)));
     CHECK(!ts::h2_headers_is_status_200(nullptr, 0));
+    // 先頭の dynamic table size update は読み飛ばす（本家が実際に送ってくる形）
+    const uint8_t sized[] = {0x21, 0x88, 0x0f};
+    CHECK(ts::h2_headers_is_status_200(sized, sizeof(sized)));
+    const uint8_t sized_404[] = {0x21, 0x8b};
+    CHECK(!ts::h2_headers_is_status_200(sized_404, sizeof(sized_404)));
+    // 4096 = 31 + 4065 (0xe1 0x1f) の多バイト整数
+    const uint8_t sized_long[] = {0x3f, 0xe1, 0x1f, 0x88};
+    CHECK(ts::h2_headers_is_status_200(sized_long, sizeof(sized_long)));
+    const uint8_t only_update[] = {0x3f, 0xe1};  // 途中で切れている
+    CHECK(!ts::h2_headers_is_status_200(only_update, sizeof(only_update)));
 }
 
 }  // namespace
