@@ -1,6 +1,6 @@
 # 新規セットアップ
 
-まっさらな Tab5 と新品の SD カードから、WiFi と Tailscale に繋がるまでの手順。
+まっさらな Tab5 と新品の SD カードから、Tailscale 経由で SSH するまでの手順。
 2026-09-26 に、フラッシュを全消去した実機で最初から最後まで通したものだけを書いている。
 
 ## 必要なもの
@@ -8,7 +8,7 @@
 - M5Stack Tab5 と USB Type-C ケーブル（シリアルは `/dev/cu.usbmodem101`）
 - microSD カード（128GB で確認）と、Mac に挿すためのカードリーダ
 - macOS + ESP-IDF v5.5.1（`source ~/esp/esp-idf/export.sh` が通ること）
-- SSH の秘密鍵（RSA の PEM。作り方は下の「鍵」の節）
+- SSH の秘密鍵（ECDSA P-256 か RSA の PEM。作り方は下の「鍵」の節）
 
 以降のコマンドは、`source ~/esp/esp-idf/export.sh` を済ませたシェルで、リポジトリ直下から叩く。
 `python` は ESP-IDF の環境の中のものを使う（外の python には `serial` が無い）。
@@ -68,7 +68,7 @@ SSH の秘密鍵:
 
 ```sh
 python $IDF_PATH/components/partition_table/parttool.py --port /dev/cu.usbmodem101 \
-    write_partition --partition-name sshkey --input ~/.ssh/id_rsa_tab5
+    write_partition --partition-name sshkey --input ~/.ssh/id_ecdsa_tab5.pem
 ```
 
 > zsh では `PT="python .../parttool.py --port ..."; $PT write_partition ...` のように
@@ -77,13 +77,23 @@ python $IDF_PATH/components/partition_table/parttool.py --port /dev/cu.usbmodem1
 ### 鍵
 
 まだ無ければ作る。**ed25519 と OpenSSH 形式は使えない**（libssh2 の mbedTLS バックエンドの制約）。
+ECDSA は **openssl で named curve の P-256** を作る（`ssh-keygen -t ecdsa -m PEM` の鍵は読めない）。
 
 ```sh
-ssh-keygen -t rsa -b 2048 -m PEM -N '' -f ~/.ssh/id_rsa_tab5
-cat ~/.ssh/id_rsa_tab5.pub >> ~/.ssh/authorized_keys   # 接続先で
+openssl ecparam -name prime256v1 -genkey -noout -out ~/.ssh/id_ecdsa_tab5.pem
+chmod 600 ~/.ssh/id_ecdsa_tab5.pem
+ssh-keygen -y -f ~/.ssh/id_ecdsa_tab5.pem    # この 1 行を接続先の ~/.ssh/authorized_keys に足す
 ```
 
-ECDSA を使うときの条件は README の「ビルドと書き込み」を参照。
+公開鍵は端末が秘密鍵から組み立てるので、秘密鍵だけ書けばよい (#84)。
+RSA なら `ssh-keygen -t rsa -b 2048 -m PEM -N '' -f ~/.ssh/id_rsa_tab5`。
+
+**接続先に登録できたかは、Tab5 より先に Mac から確かめる。** Tab5 の
+`publickey auth failed ... Username/PublicKey combination invalid` と区別がつかない:
+
+```sh
+ssh -i ~/.ssh/id_ecdsa_tab5.pem -o IdentitiesOnly=yes -o BatchMode=yes <user>@<host> true
+```
 
 ## 4. 起動を確かめる
 
@@ -94,7 +104,8 @@ python tools/serial_log.py --send "conv nihongo" --send "keytest" --send-delay 8
 ```
 romaji: nihongo -> kana: にほんご
 lookup 176 us, 1 candidates: 日本語                  ← 辞書が読めている
-parse ok: type=RSA bits=2048                          ← 鍵が読めている
+公開鍵: 無し -> 秘密鍵から組み立てられる (160 バイト)   ← 鍵が読めている（ECDSA）
+  ecdsa-sha2-nistp256 AAAA...                          ← ssh-keygen -y と同じになる
 ```
 
 - 辞書が無いと `dict not written yet or corrupt` が出る
@@ -114,18 +125,26 @@ parse ok: type=RSA bits=2048                          ← 鍵が読めている
 Mac で SD に `tab5/profiles.json` を書く（書式は `docs/profiles.example.json`）。
 鍵を使う接続先は、鍵ファイルを `tab5/keys/` に置いて `"key": "<ファイル名>"` と書く。
 
-Tailscale 本家に対話ログイン（QR で承認）するだけなら、これだけでよい:
+Tailscale 本家に対話ログイン（QR で承認）し、tailnet のマシンに SSH する例:
 
 ```json
 {
   "version": 1,
   "profiles": [
-    { "name": "tailscale", "type": "tailscale", "control": "https://controlplane.tailscale.com" }
+    { "name": "tailscale", "type": "tailscale", "control": "https://controlplane.tailscale.com" },
+    { "name": "host1", "type": "ssh", "host": "host1.<tailnet>.ts.net", "user": "<user>",
+      "auth": "key", "key": "id_ecdsa_tab5", "via": "tailscale" }
   ]
 }
 ```
 
-`authkey` を書かないと対話ログインになる。Mac から取り出して (`diskutil eject /Volumes/TAB5`)
+- `authkey` を書かないと対話ログインになる
+- `via` は種別ではなく **Tailscale の接続先の `name`**
+- `host` は MagicDNS の名前（短い名前 `host1` や `100.x.y.z` でもよい）
+- 鍵は `tab5/keys/id_ecdsa_tab5` に置く。**名前は 13 文字まで**（NVS のキー名の制約）なので
+  `.pem` を外す
+
+Mac から取り出して (`diskutil eject /Volumes/TAB5`)
 Tab5 に挿し、**コンソールから**取り込む（メニューには取り込みが無い）。
 起動した後に挿してよい — 取り込むときにマウントする。
 
@@ -135,8 +154,9 @@ python tools/serial_log.py --no-reset --send "profiles import" --seconds 8
 
 ```
 I (...) sd: mounted /sdcard in 55ms: SE128 118040MB
-取り込んだ: 1 件、鍵 0 本（SD は抜いてよい）
+取り込んだ: 2 件、鍵 1 本（SD は抜いてよい）
   [0] tailscale        tailscale  https://controlplane.tailscale.com
+  [1] host1            ssh        <user>@host1.<tailnet>.ts.net:22 key=id_ecdsa_tab5 via tailscale
 ```
 
 - `ldo: The voltage value 0 is out of the recommended range` の警告が出るが、マウントできていれば問題ない
@@ -158,7 +178,25 @@ I (...) boot: tunnel netif up with the node key: 100.70.71.77
 - **WireGuard の設定は要らない。** ログの `wg_netif` は Tailscale が内部で張るトンネル
 - QR が出ずに `control plane returned a non-200 status` になるのは #96 で直した不具合
 
+## 8. Tailscale 経由で SSH する
+
+`MENU → SSH → host1`。Tailscale に繋がっていなければ先に繋ぎ（初回は手順 7 の QR）、
+相手に DISCO ping を打って経路を確かめてから SSH する。**最大で 2 分ほどかかる**。
+
+```
+I (...) boot: disco ping -> host1.<tailnet>.ts.net. at 192.168.0.x:41641: sent
+I (...) wg_netif: handshake complete (peer index ...)
+W (...) ssh: new host key for 100.x.y.z:22 (sha256:...) - remembered
+```
+
+tailnet の他のマシンから見えているかは、そちらで確かめられる:
+
+```sh
+tailscale ping <Tab5 のホスト名>     # pong ... via 192.168.0.x:41641 なら DISCO が通っている
+tailscale status                   # Tab5 が active; direct ... になる
+```
+
 ## まだできないこと
 
-- **tailnet のピアへの SSH**（`user@host1.tail0000000.ts.net` など）。登録と netmap の受信までは
-  通るが、ピアとの通信が成立しない → #98
+- **LAN の外の tailnet ピアには繋がらない。** DERP も STUN も実装していないので、
+  同じ LAN に居るピアとだけ直接繋がる → #11
