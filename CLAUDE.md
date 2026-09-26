@@ -228,6 +228,17 @@ python tools/serial_log.py --seconds 20      # ログ採取
   頃の `ssid` / `pass` からは起動時に自動で引き継ぐ。**画面から消したら実際に切断する**ので、
   `s_reconfiguring` を立ててから `esp_wifi_disconnect` を呼ぶ（立てないと切断イベントで
   再接続が走り、消した AP に繋ぎ直しに行く）
+- **接続先の新規作成はメニューの中で 1 項目ずつ聞く** (#82)。ここの罠は 3 つ:
+  - **`set_menu_visible(true)` は `menu->set_visible(true)` 経由で必ず `kRoot` に戻す。**
+    1 行入力から戻ったら `show_form()` を続けて呼ぶ（呼ばないと
+    「1 項目打つたびに最上位へ戻る」になる）
+  - **書式の検査を画面側に書かない。** `prof::to_json` → `add_profile` →
+    **`parse` に通して一覧に出るかで見る**。画面に検査を持つと parse と食い違い、
+    「保存はできたのに一覧に出ない」が出る。飛ばされた理由 (warnings) をそのまま注記に出す
+  - **`prof::Profile::port` の既定は 0 = 未指定**（22 ではない）。22 にすると、手で
+    組み立てた tailscale の設定に 22 番が書かれる（TS の port は「書かれていなければ
+    control のスキームで決める」#68）。ssh の 22 は parse と `to_json` が埋める
+
 - **WiFi の設定変更と RPC は `wifijob` タスク (8KB) に載せる**。パスワード入力の Enter は
   **kbd タスク (8KB) の上で、しかも `s_term_lock` を握ったまま**返ってくるので、そこから
   `nvs_set_blob` と `esp_wifi_set_config` を呼ぶと、スタックも足りないうえ描画ループが

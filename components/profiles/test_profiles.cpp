@@ -384,6 +384,140 @@ void test_remove_profile()
     CHECK(out == "untouched");
 }
 
+void test_add_profile()
+{
+    const char* entry = R"({"name":"new","type":"ssh","host":"h","user":"u","key":"k.pem"})";
+    std::string out;
+    CHECK(prof::add_profile(kGood, entry, &out));
+    const prof::Config c = prof::parse(out);
+    CHECK(c.error.empty());
+    CHECK(prof::find(c, "new") != nullptr);
+    CHECK(c.profiles.size() == prof::parse(kGood).profiles.size() + 1);
+    CHECK(prof::find(c, "bastion") != nullptr);  // 元からあるものは残る
+
+    // **空から作れる。** 1 件も取り込んでいない端末にメニューから足す経路。
+    out.clear();
+    CHECK(prof::add_profile("", entry, &out));
+    const prof::Config e = prof::parse(out);
+    CHECK(e.error.empty() && e.profiles.size() == 1);
+
+    // **同じ名前は断る。** 上書きすると繋ぐ先が変わったことに気づけない。
+    out = "untouched";
+    CHECK(!prof::add_profile(kGood, R"({"name":"bastion","type":"ssh","host":"x","user":"u"})",
+                             &out));
+    CHECK(out == "untouched");
+
+    // **壊れた本文には足さない。** 器で置き換えると今までの接続先が消える。
+    out = "untouched";
+    CHECK(!prof::add_profile(R"({"profiles":[{"name":"a",)", entry, &out));
+    CHECK(out == "untouched");
+
+    // 壊れた入力・name 無し・配列は断る
+    CHECK(!prof::add_profile(kGood, "{ broken", &out));
+    CHECK(!prof::add_profile(kGood, R"({"type":"ssh","host":"h","user":"u"})", &out));
+    CHECK(!prof::add_profile(kGood, "[]", &out));
+    CHECK(out == "untouched");
+}
+
+// **画面で作った設定が読み戻せることを 1 本で見る (#82)。** to_json と parse が
+// 食い違うと「保存はできたのに一覧に出ない」になり、実機でしか気づけない。
+void test_to_json_roundtrip()
+{
+    prof::Profile ssh;
+    ssh.type = prof::Type::kSsh;
+    ssh.name = "jump";
+    ssh.host = "10.0.0.5";
+    ssh.user = "user";
+    ssh.port = 2222;
+    ssh.key  = "id.pem";
+    std::string out;
+    CHECK(prof::add_profile("", prof::to_json(ssh), &out));
+    prof::Config c = prof::parse(out);
+    CHECK(c.error.empty());
+    const prof::Profile* got = prof::find(c, "jump");
+    CHECK(got && got->host == "10.0.0.5" && got->user == "user" && got->port == 2222);
+    CHECK(got && got->key == "id.pem" && !got->ask_password);
+
+    // **鍵が無ければパスワード認証になる。** auth を書かないと鍵で繋ごうとする。
+    prof::Profile pw = ssh;
+    pw.key.clear();
+    out.clear();
+    CHECK(prof::add_profile("", prof::to_json(pw), &out));
+    c   = prof::parse(out);
+    got = prof::find(c, "jump");
+    CHECK(got && got->ask_password);
+
+    prof::Profile wg;
+    wg.type           = prof::Type::kWireGuard;
+    wg.name           = "office";
+    wg.address        = "10.9.0.2/32";
+    wg.private_key    = "wg.key";
+    wg.peer.pubkey    = "abc=";
+    wg.peer.endpoint  = "192.168.0.5:51820";
+    wg.peer.allowed_ips = {"10.9.0.0/24"};
+    out.clear();
+    CHECK(prof::add_profile("", prof::to_json(wg), &out));
+    c   = prof::parse(out);
+    got = prof::find(c, "office");
+    CHECK(got && got->peer.endpoint == "192.168.0.5:51820");
+    CHECK(got && got->peer.allowed_ips.size() == 1 && got->address == "10.9.0.2/32");
+
+    // tailscale は authkey 無し = 対話ログイン。**port 0 は書かない**
+    // （書くと parse が 0 番ポートとして扱う）。
+    prof::Profile ts;
+    ts.type    = prof::Type::kTailscale;
+    ts.name    = "ts";
+    ts.control = "https://hs.example.com";
+    out.clear();
+    CHECK(prof::add_profile("", prof::to_json(ts), &out));
+    c   = prof::parse(out);
+    got = prof::find(c, "ts");
+    CHECK(got && got->authkey.empty() && got->port == 0);  // 既定は「未指定」
+    CHECK(prof::to_json(ts).find("port") == std::string::npos);
+
+    // **壊れた入力は parse が弾く。** 画面側で書式を検査せず、保存の前に
+    // parse に通して「一覧に出るか」で見る、という作りの土台。
+    prof::Profile bad = wg;
+    bad.name          = "bad";
+    bad.address       = "not-an-address";
+    out.clear();
+    CHECK(prof::add_profile("", prof::to_json(bad), &out));
+    const prof::Config badcfg = prof::parse(out);
+    CHECK(prof::find(badcfg, "bad") == nullptr);
+}
+
+void test_split_list()
+{
+    // **本数が要**。1 本に潰れると allowed_ips が「経路 1 本の壊れた設定」になり、
+    // parse は通ってしまう（書式としては CIDR 1 本に見える）。
+    const auto a = prof::split_list("10.9.0.0/24,10.8.0.0/24");
+    CHECK(a.size() == 2 && a[0] == "10.9.0.0/24" && a[1] == "10.8.0.0/24");
+    const auto b = prof::split_list(" 10.9.0.0/24 , 10.8.0.0/24 ,");
+    CHECK(b.size() == 2 && b[0] == "10.9.0.0/24" && b[1] == "10.8.0.0/24");
+    CHECK(prof::split_list("").empty());
+    CHECK(prof::split_list(" , , ").empty());
+    const auto c = prof::split_list("10.9.0.0/24");
+    CHECK(c.size() == 1 && c[0] == "10.9.0.0/24");
+
+    // 画面から来た 1 行がそのまま WireGuard の設定になるところまで見る。
+    prof::Profile wg;
+    wg.type             = prof::Type::kWireGuard;
+    wg.name             = "wg2";
+    wg.address          = "10.9.0.3/32";
+    wg.private_key      = "wg_hq.key";
+    wg.peer.pubkey      = "abcd=";
+    wg.peer.endpoint    = "192.168.0.101:51820";
+    wg.peer.allowed_ips = prof::split_list("10.9.0.0/24,10.8.0.0/24");
+    std::string out;
+    CHECK(prof::add_profile("", prof::to_json(wg), &out));
+    // **Config は名前を付けて持つ。** `find(parse(out), ...)` は一時オブジェクトを
+    // 指すポインタを返すので、式の終わりで消える（実際にここで segfault した）。
+    const prof::Config   cfg = prof::parse(out);
+    const prof::Profile* got = prof::find(cfg, "wg2");
+    CHECK(got && got->peer.allowed_ips.size() == 2);
+    CHECK(got && got->peer.allowed_ips[1] == "10.8.0.0/24");
+}
+
 void test_cidr()
 {
     std::string a;
@@ -428,6 +562,9 @@ int main()
     test_limits();
     test_referenced_keys();
     test_remove_profile();
+    test_add_profile();
+    test_to_json_roundtrip();
+    test_split_list();
     test_cidr();
 
     std::printf("%d checks, %d failed\n", g_checks, g_fails);

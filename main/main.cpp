@@ -2216,6 +2216,7 @@ int cmd_menu(int argc, char** argv)
         set_menu_visible(show);
         std::printf("menu %s, terminal %dx%d\n", show ? "shown" : "hidden", renderer->cols(),
                     renderer->rows());
+        if (show) std::printf("%s\n", menu->state_line().c_str());
         return 0;
     }
     if (!menu->visible()) {
@@ -2237,6 +2238,9 @@ int cmd_menu(int argc, char** argv)
     menu->refresh();
     menu->key(k);
     menu->draw();
+    // **押した後にどこに居るかを返す。** 画面を読まずに `menu down` を連投すると
+    // 詳細画面の `削除`（`接続` の 1 行下、確認なし）を踏む。実際に踏んだ。
+    std::printf("%s\n", menu->state_line().c_str());
     return 0;
 }
 
@@ -3802,6 +3806,274 @@ void delete_profile(int index)
     }
 }
 
+// --- 接続先の新規作成 (#82) ---
+//
+// **画面は行を並べるだけ**で、項目の中身も候補の回し方もここが決める
+// (MenuUi は「何番目が押されたか」を返す)。書式の知識は `prof::to_json` に置く
+// ので、ここには「何を聞くか」しか無い。
+//
+// ponytail: 編集の途中で Esc を押すと端末へ戻り、**書きかけは捨てる**。
+// 戻す口を作るには start_line_prompt に中止のコールバックが要り、メニューの
+// 開閉からも呼ばれる cancel_line_prompt と絡む。打ち直しが辛いと分かったら足す。
+prof::Profile            s_form;
+bool                     s_form_vpn = false;  // VPN の一覧から入った（種別を選べる）
+std::string              s_form_allowed;      // allowed_ips はカンマ区切りで聞く
+std::vector<std::string> s_form_rows;
+
+enum class FormKind { kText, kPort, kType, kKey, kVia };
+struct FormField {
+    const char*  label;
+    std::string* value;  // kText のときだけ使う
+    FormKind     kind;
+};
+
+// **type で項目が変わるので毎回組み直す。** 表を静的に持つと、種別を変えたときに
+// 古い項目のポインタが残る。
+std::vector<FormField> form_fields()
+{
+    std::vector<FormField> f;
+    if (s_form_vpn) f.push_back({"種別", nullptr, FormKind::kType});
+    f.push_back({"name", &s_form.name, FormKind::kText});
+    switch (s_form.type) {
+        case prof::Type::kSsh:
+            f.push_back({"user", &s_form.user, FormKind::kText});
+            f.push_back({"host", &s_form.host, FormKind::kText});
+            f.push_back({"port", nullptr, FormKind::kPort});
+            f.push_back({"key", &s_form.key, FormKind::kKey});
+            f.push_back({"via", &s_form.via, FormKind::kVia});
+            break;
+        case prof::Type::kWireGuard:
+            f.push_back({"address", &s_form.address, FormKind::kText});
+            f.push_back({"private_key", &s_form.private_key, FormKind::kKey});
+            f.push_back({"peer pubkey", &s_form.peer.pubkey, FormKind::kText});
+            f.push_back({"peer endpoint", &s_form.peer.endpoint, FormKind::kText});
+            f.push_back({"allowed_ips", &s_form_allowed, FormKind::kText});
+            break;
+        case prof::Type::kTailscale:
+            f.push_back({"control", &s_form.control, FormKind::kText});
+            f.push_back({"authkey", &s_form.authkey, FormKind::kKey});
+            break;
+    }
+    return f;
+}
+
+// 今の値の見え方。**空は「(なし)」と出す** — 空行だと「まだ聞かれていない」のか
+// 「空を入れた」のか分からない。
+std::string form_shown(const FormField& f)
+{
+    switch (f.kind) {
+        case FormKind::kType: return prof::type_name(s_form.type);
+        case FormKind::kPort: return s_form.port ? std::to_string(s_form.port) : "22";
+        default: break;
+    }
+    return (f.value && !f.value->empty()) ? *f.value : "(なし)";
+}
+
+void form_rebuild_rows()
+{
+    s_form_rows.clear();
+    for (const FormField& f : form_fields()) {
+        s_form_rows.push_back(std::string(f.label) + " : " + form_shown(f));
+    }
+}
+
+// 鍵の候補。**末尾に「なし」を入れる** — SSH で鍵なしはパスワード認証、
+// Tailscale で authkey なしは対話ログインという意味があるので、外せない選択肢。
+std::vector<std::string> form_key_candidates()
+{
+    std::vector<std::string> v = nvs_key_names();
+    v.emplace_back();
+    return v;
+}
+
+// via の候補は VPN の接続先の名前。こちらも「なし」を末尾に入れる。
+std::vector<std::string> form_via_candidates()
+{
+    std::vector<std::string> v;
+    for (const auto& q : s_profiles.profiles) {
+        if (q.type != prof::Type::kSsh) v.push_back(q.name);
+    }
+    v.emplace_back();
+    return v;
+}
+
+// 候補を 1 つ進める。今の値が候補に無ければ先頭から。
+void form_cycle(std::string* v, const std::vector<std::string>& cand)
+{
+    if (!v || cand.empty()) return;
+    const auto it = std::find(cand.begin(), cand.end(), *v);
+    const size_t next = (it == cand.end()) ? 0 : static_cast<size_t>(it - cand.begin()) + 1;
+    *v = cand[next % cand.size()];
+}
+
+// メニューの注記に理由を出す。**端末に書いても見えない** — メニューが出ている間は
+// render_term() が早期 return する。
+void form_note(const std::string& why)
+{
+    if (!menu) return;
+    menu->set_note(why);
+    menu->refresh();
+    menu->draw();
+    // **断ったときも残量を出す。** 出すのが成功時だけだと、指で触った検証の
+    // ほとんど（書きかけで保存を押す）が数字を残さない。cJSON を通す重さは
+    // 断られる経路でも同じ（to_json → add_profile → parse までは走っている）。
+    ESP_LOGW(TAG, "form: %s (stack headroom %u bytes)", why.c_str(),
+             (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+}
+
+void form_start(bool vpn)
+{
+    s_form         = prof::Profile{};
+    s_form_vpn     = vpn;
+    s_form.type    = vpn ? prof::Type::kWireGuard : prof::Type::kSsh;
+    s_form.port    = vpn ? 0 : 22;
+    s_form_allowed.clear();
+    form_rebuild_rows();
+    if (!menu) return;
+    menu->show_form();
+    menu->draw();
+}
+
+void form_edit(int index)
+{
+    const std::vector<FormField> fields = form_fields();
+    if (index < 0 || index >= static_cast<int>(fields.size())) return;
+    const FormField& f = fields[index];
+    switch (f.kind) {
+        // VPN は 2 種類しかないので押すたびに入れ替える（1 段の画面を足さない）。
+        case FormKind::kType:
+            s_form.type = (s_form.type == prof::Type::kWireGuard) ? prof::Type::kTailscale
+                                                                  : prof::Type::kWireGuard;
+            break;
+        // **候補が「なし」しか無いときは理由を出す。** 黙って何も変わらないと
+        // 押し損に見えるだけで、`private_key` が必須の WireGuard では
+        // **そもそも作れない**のに理由が分からない（保存で出るのは書式の警告）。
+        case FormKind::kKey: {
+            const std::vector<std::string> cand = form_key_candidates();
+            if (cand.size() <= 1) {
+                form_note("鍵が NVS に無い（`profiles import` で SD から取り込む）");
+                return;
+            }
+            form_cycle(f.value, cand);
+            break;
+        }
+        case FormKind::kVia: {
+            const std::vector<std::string> cand = form_via_candidates();
+            if (cand.size() <= 1) {
+                form_note("VPN の接続先が無い（先に VPN を 1 件作る）");
+                return;
+            }
+            form_cycle(f.value, cand);
+            break;
+        }
+        case FormKind::kText:
+        case FormKind::kPort: {
+            // **入力は端末に出るので、先に端末へ移る**（WiFi のパスワードと同じ形）。
+            set_menu_visible(false);
+            const std::string label = std::string(f.label) + " (今: " + form_shown(f) +
+                                      ") (Enter で確定 / Esc で中止):";
+            start_line_prompt(label, /*mask=*/false, [index](const std::string& line) {
+                // **項目は引き直す。** 種別を変えると並びもポインタも変わる。
+                const std::vector<FormField> fs = form_fields();
+                std::string                  why;
+                if (index < static_cast<int>(fs.size())) {
+                    if (fs[index].kind == FormKind::kPort) {
+                        // **ここで弾く。** 0 に落として parse に任せることはできない —
+                        // 0 は「未指定」なので to_json が 22 を書き、**打ち間違えた
+                        // ポートが黙って 22 になる**（繋ぐ先が変わったと気づけない）。
+                        const bool digits = !line.empty() &&
+                                            line.find_first_not_of("0123456789") == std::string::npos;
+                        const long v = digits ? std::strtol(line.c_str(), nullptr, 10) : 0;
+                        if (v > 0 && v <= 65535) {
+                            s_form.port = static_cast<uint16_t>(v);
+                        } else {
+                            why = "port は 1-65535 の数字で入れる（\"" + line + "\" は使わない）";
+                        }
+                    } else if (fs[index].value) {
+                        *fs[index].value = line;
+                    }
+                }
+                form_rebuild_rows();
+                // **開き直してから画面を指定する。** set_visible(true) は kRoot に戻すので、
+                // show_form() を続けて呼ばないと「1 項目打つたびに最上位へ戻る」になる。
+                set_menu_visible(true);
+                if (menu) {
+                    menu->show_form();
+                    // **断った理由は画面に出す。** 端末に書いてもメニューが覆う。
+                    if (!why.empty()) menu->set_note(why);
+                    menu->draw();
+                }
+            });
+            return;
+        }
+    }
+    form_rebuild_rows();
+    if (!menu) return;
+    menu->refresh();
+    menu->draw();
+}
+
+// 保存する。**書式の検査は持たない** — 書いてから `prof::parse` に通し、
+// 一覧に出るかで見る。画面側に検査を書くと parse と食い違い、
+// 「保存はできたのに一覧に出ない」が起きる。
+//
+// ponytail: delete_profile と同じく、cJSON と NVS はここで同期にやる。
+// メニューの操作から来るので s_term_lock は握っているが、esp-hosted の RPC の
+// ような数秒のブロックは無い（実機のログに headroom を出して確かめる）。
+void form_save()
+{
+    if (s_form.name.empty()) {
+        form_note("name を入れる（一覧に出る名前）");
+        return;
+    }
+    prof::Profile p = s_form;
+    // **分け方はパーサ側に置いてある** (`prof::split_list`)。ここで書くと
+    // ホストでテストできない（1 本に潰れても parse は通ってしまう）。
+    if (p.type == prof::Type::kWireGuard) p.peer.allowed_ips = prof::split_list(s_form_allowed);
+    std::string json;
+    if (const esp_err_t err = nvs_profiles_load(&json);
+        err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        form_note(std::string("保存できない: ") + esp_err_to_name(err));
+        return;
+    }
+    std::string out;
+    if (!prof::add_profile(json, prof::to_json(p), &out)) {
+        form_note("保存できない: \"" + p.name + "\" は既にある（消してから作り直す）");
+        return;
+    }
+    // **書く前に読み戻す。** 飛ばされたらその理由がそのまま画面に出せる。
+    const prof::Config check = prof::parse(out);
+    if (!prof::find(check, p.name)) {
+        std::string why = check.error;
+        for (const auto& w : check.warnings) {
+            if (w.find("\"" + p.name + "\"") == std::string::npos) continue;
+            why = w;
+            break;
+        }
+        // **名前を含まない警告もある。** name が長すぎるときの警告は
+        // `profiles[N]: name が無い（または長すぎる）` で名前が入らないので、
+        // 上の検索では拾えない。**足した項目は必ず末尾**なので最後の警告を使う。
+        if (why.empty() && !check.warnings.empty()) why = check.warnings.back();
+        form_note(why.empty() ? "保存できない（設定を読み戻せない）" : why);
+        return;
+    }
+    if (const esp_err_t err = nvs_profiles_store(out); err != ESP_OK) {
+        form_note(std::string("保存できない: ") + esp_err_to_name(err));
+        return;
+    }
+    load_profiles();
+    ESP_LOGI(TAG, "form: saved \"%s\" -> %s (stack headroom %u bytes)", p.name.c_str(),
+             s_profiles_status, (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+    if (!menu) return;
+    // **一覧へ戻す。** 保存した後も新規作成の画面に残ると、もう一度「保存」を
+    // 押せてしまう（同じ名前なので断られるだけだが、断られた理由が分からない）。
+    menu->show_form_list();
+    menu->set_note("保存した: " + p.name);
+    menu->set_info(gather_menu_info(gather_status()));
+    menu->refresh();
+    menu->draw();
+}
+
 // 一覧から選ぶのと同じ経路を、指も画面も無しで叩く。
 int cmd_connect(int argc, char** argv)
 {
@@ -4494,6 +4766,7 @@ extern "C" void app_main(void)
     menu->set_profiles(&s_profiles);
     menu->set_wifi_nets(&s_wifi_nets);
     menu->set_wifi_scan(&s_wifi_scan_rows);
+    menu->set_form_rows(&s_form_rows);
     refresh_wifi_nets();
     menu->set_action([](MenuUi::Action a, int index) {
         switch (a) {
@@ -4541,6 +4814,15 @@ extern "C" void app_main(void)
             case MenuUi::Action::kWifiAddScanned:
             case MenuUi::Action::kWifiAddManual:
                 wifi_menu_action(a, index);
+                break;
+            case MenuUi::Action::kNewProfile:
+                form_start(/*vpn=*/index == 1);
+                break;
+            case MenuUi::Action::kFormEdit:
+                form_edit(index);
+                break;
+            case MenuUi::Action::kFormSave:
+                form_save();
                 break;
         }
     });

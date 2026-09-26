@@ -366,6 +366,130 @@ Config parse(const std::string& json)
     return cfg;
 }
 
+std::vector<std::string> split_list(const std::string& s)
+{
+    std::vector<std::string> out;
+    std::string              cur;
+    for (char c : s) {
+        if (c == ',' || c == ' ' || c == '\t') {
+            if (!cur.empty()) out.push_back(cur);
+            cur.clear();
+            continue;
+        }
+        cur += c;
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+
+std::string to_json(const Profile& p)
+{
+    cJSON* o = cJSON_CreateObject();
+    auto   put = [o](const char* k, const std::string& v) {
+        if (!v.empty()) cJSON_AddStringToObject(o, k, v.c_str());
+    };
+    put("name", p.name);
+    cJSON_AddStringToObject(o, "type", type_name(p.type));
+    switch (p.type) {
+        case Type::kSsh:
+            put("host", p.host);
+            put("user", p.user);
+            cJSON_AddNumberToObject(o, "port", p.port ? p.port : 22);
+            put("key", p.key);
+            put("via", p.via);
+            // **鍵が無ければパスワード認証。** 書かないと parse が「鍵で繋ぐ」と
+            // 読み、鍵が無いまま接続して失敗する。パスワードそのものは書かない
+            // （NVS を読める人が全部読めてしまう）。繋ぐときに画面から聞く。
+            if (p.ask_password || p.key.empty()) cJSON_AddStringToObject(o, "auth", "password");
+            break;
+        case Type::kWireGuard: {
+            put("address", p.address);
+            put("private_key", p.private_key);
+            cJSON* peer = cJSON_AddObjectToObject(o, "peer");
+            if (!p.peer.pubkey.empty()) cJSON_AddStringToObject(peer, "pubkey", p.peer.pubkey.c_str());
+            if (!p.peer.endpoint.empty())
+                cJSON_AddStringToObject(peer, "endpoint", p.peer.endpoint.c_str());
+            if (!p.peer.allowed_ips.empty()) {
+                cJSON* arr = cJSON_AddArrayToObject(peer, "allowed_ips");
+                for (const auto& a : p.peer.allowed_ips) {
+                    cJSON_AddItemToArray(arr, cJSON_CreateString(a.c_str()));
+                }
+            }
+            break;
+        }
+        case Type::kTailscale:
+            put("control", p.control);
+            put("authkey", p.authkey);
+            // **0 は書かない。** 0 は「未指定」で、書くと parse が 0 番ポートとして扱う
+            // （TLS かどうかは control のスキームで決まる）。
+            if (p.port) cJSON_AddNumberToObject(o, "port", p.port);
+            break;
+    }
+    std::string out;
+    if (char* s = cJSON_PrintUnformatted(o); s) {
+        out.assign(s);
+        cJSON_free(s);
+    }
+    cJSON_Delete(o);
+    return out;
+}
+
+bool add_profile(const std::string& json, const std::string& entry, std::string* out)
+{
+    if (!out || entry.empty()) return false;
+    cJSON* item = cJSON_Parse(entry.c_str());
+    if (!item || !cJSON_IsObject(item)) {
+        cJSON_Delete(item);
+        return false;
+    }
+    const std::string name = get_string(item, "name");
+    if (name.empty()) {
+        cJSON_Delete(item);
+        return false;
+    }
+
+    // **空なら器から作る。** 1 件も取り込んでいない端末でもメニューから足せるようにする。
+    //
+    // **読めない本文は器で置き換えない。** 置き換えると、壊れた JSON に 1 件足した
+    // つもりが**今まで取り込んだ接続先を全部捨てて 1 件だけにする**ことになり、
+    // 「保存した」としか出ない（remove_profile が同じ場合に false を返すのと揃える）。
+    cJSON* root = nullptr;
+    if (json.empty()) {
+        root = cJSON_CreateObject();
+        cJSON_AddNumberToObject(root, "version", 1);
+        cJSON_AddItemToObject(root, "profiles", cJSON_CreateArray());
+    } else if (root = cJSON_Parse(json.c_str()); !root) {
+        cJSON_Delete(item);
+        return false;
+    }
+    cJSON* arr = cJSON_GetObjectItemCaseSensitive(root, "profiles");
+    if (!cJSON_IsArray(arr)) {
+        cJSON_Delete(root);
+        cJSON_Delete(item);
+        return false;
+    }
+    // **同じ名前が有れば断る。** 上書きすると、名前を打ち間違えただけで繋ぐ先が
+    // 変わったことに気づけない。
+    const int n = cJSON_GetArraySize(arr);
+    for (int i = 0; i < n; ++i) {
+        if (get_string(cJSON_GetArrayItem(arr, i), "name") != name) continue;
+        cJSON_Delete(root);
+        cJSON_Delete(item);
+        return false;
+    }
+
+    cJSON_AddItemToArray(arr, item);  // item の所有権は root に移る
+    bool  ok = false;
+    char* s  = cJSON_PrintUnformatted(root);
+    if (s) {
+        out->assign(s);
+        cJSON_free(s);
+        ok = true;
+    }
+    cJSON_Delete(root);
+    return ok;
+}
+
 bool remove_profile(const std::string& json, const std::string& name, std::string* out)
 {
     if (!out || name.empty()) return false;
