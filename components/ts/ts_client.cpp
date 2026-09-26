@@ -494,7 +494,17 @@ bool Client::run_once()
                     // 応答ステータスを見る。404/500 を素通りさせると、本文が JSON でないために
                     // 「machine not authorized」のような誤ったエラーになる。
                     if (!h2_headers_is_status_200(f.payload, f.payload_len)) {
-                        set_error("control plane returned a non-200 status");
+                        char msg[160];
+                        int  m = std::snprintf(msg, sizeof(msg),
+                                               "control plane returned a non-200 status "
+                                               "(sid=%u flags=0x%02x len=%u:",
+                                               (unsigned)f.stream_id, f.flags,
+                                               (unsigned)f.payload_len);
+                        for (size_t i = 0; i < f.payload_len && i < 16; ++i) {
+                            m += std::snprintf(msg + m, sizeof(msg) - m, " %02x", f.payload[i]);
+                        }
+                        std::snprintf(msg + m, sizeof(msg) - m, ")");
+                        set_error(msg);
                         return false;
                     }
                     if ((f.flags & kFlagEndStream) && f.stream_id == reg_sid) {
