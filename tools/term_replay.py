@@ -64,13 +64,18 @@ def main() -> int:
     events = []
     if args.events:
         for line in open(args.events):
+            if not line.strip():
+                continue
             kind, off, arg = line.split()
             events.append((kind, min(int(off), len(data)), arg))
+    # 位置の順に当てる。戻る位置があると同じ区間を二度流してしまう。
+    events.sort(key=lambda e: e[1])
     events.append(("snap", len(data), "end"))
     # イベントの位置で区切って、区間ごとに term コマンドへ詰める。
     chunks, done = [], 0
     for kind, off, arg in events:
-        piece = (prefix if done == 0 else b"") + data[done:off]
+        piece = prefix + data[done:off]
+        prefix = b""  # --clear は最初の区間にだけ付ける
         chunks.append((list(commands(piece, MAX_CMDLINE - 16)) if piece else [], kind, arg))
         done = off
     cmds = [c for part, _, _ in chunks for c in part]

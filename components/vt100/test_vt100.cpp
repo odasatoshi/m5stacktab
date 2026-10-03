@@ -315,6 +315,38 @@ void test_resize_trims_below_cursor()
     CHECK_EQ(t.cursor_y(), 2);
     CHECK_EQ(t.scrollback_lines(), 0);
 
+    // 引き戻すのは縮めて押し出した分だけ。前からあった履歴は引き戻さない。
+    // 数えずに引き戻すと、Ctrl-L (ED 2) で消した画面がキーボードを閉じたときに戻ってくる。
+    {
+        Terminal              c(10, 4);
+        std::vector<vt::Cell> sb2(10 * 10);
+        c.set_scrollback(sb2.data(), 10, 10);
+        c.write("1\r\n2\r\n3\r\n4\r\n5\r\n6");  // 2 行が履歴へ (普通のスクロール)
+        CHECK_EQ(c.scrollback_lines(), 2);
+        c.resize(10, 6);                    // 押し出していないので引き戻さない
+        CHECK_STR(c.row_text(0), "3");
+        CHECK_EQ(c.scrollback_lines(), 2);
+        c.write("\033[2J\033[H$ ");        // Ctrl-L
+        c.resize(10, 3);                    // カーソルは行 0: 下の空行だけ削る
+        c.resize(10, 6);
+        CHECK_STR(c.row_text(0), "$");      // 消した画面も古い履歴も戻ってこない
+        CHECK_EQ(c.cursor_y(), 0);
+        // 押し出した後に普通にスクロールしても、引き戻すのは最新の行 (背の高い端末と同じ)
+        c.write("\r\na\r\nb\r\nc\r\nd\r\ne");  // 画面は $ a b c d e
+        c.resize(10, 3);                    // $ a b を押し出す
+        c.write("\r\nf");                  // a... ではなく c を押し出す
+        c.resize(10, 6);
+        CHECK_STR(c.row_text(0), "a");
+        CHECK_STR(c.row_text(5), "f");
+        CHECK_EQ(c.cursor_y(), 5);
+        // ED 2 の後は、押し出した分も引き戻さない
+        c.resize(10, 3);
+        c.write("\033[2J\033[3;1Hz");
+        c.resize(10, 6);
+        CHECK_STR(c.row_text(2), "z");
+        CHECK_EQ(c.cursor_y(), 2);
+    }
+
     // 代替画面にいる間: 代替画面は自分のカーソルで、主画面は入ったときの位置で削る。
     // 主画面の内容は抜けたときに元の位置で戻る。
     Terminal u(10, 6);
@@ -725,7 +757,8 @@ void test_resize_keeps_scrollback()
     }
 
     // 桁数が変わったら捨てる（履歴は cols 単位で詰めてあるので使い回せない）。
-    CHECK(t.scrollback_lines() == 2);  // 3 → 4 行で 1 行引き戻した残り
+    // 3 → 4 行では引き戻さない（残りの履歴はスクロールで入った行で、押し出した行ではない）。
+    CHECK(t.scrollback_lines() == 3);
     t.resize(12, 4);
     CHECK(t.scrollback_lines() == 0);
     // **桁数が確保時と食い違ったままなので、以後は積まれない（#45）。**

@@ -238,12 +238,16 @@ int Terminal::resize_screen(std::vector<Cell>& src, int cursor_y, int cols, int 
         const int top    = need - bottom;
         if (history) {
             for (int y = 0; y < top; ++y) push_scrollback(&src[static_cast<size_t>(y) * cols_]);
+            sb_hidden_ += top;
         }
         for (int y = 0; y < rows; ++y) copy_row(&src[static_cast<size_t>(y + top) * cols_], y);
         shift = -top;
     } else {
         // 履歴は cols_ 単位で詰めてあるので、桁数が変わるときは引き戻さない (resize が捨てる)。
-        const int pull = (history && cols == cols_ && sb_cols_ == cols_) ? std::min(rows - rows_, sb_count_) : 0;
+        const int pull = (history && cols == cols_ && sb_cols_ == cols_)
+                             ? std::min({rows - rows_, sb_count_, sb_hidden_})
+                             : 0;
+        sb_hidden_ -= pull;
         for (int i = 0; i < pull; ++i) copy_row(sb_line(pull - i), i);  // 古い順に上から
         sb_count_ -= pull;
         sb_head_ = (sb_head_ - pull + sb_max_) % std::max(1, sb_max_);
@@ -286,8 +290,9 @@ void Terminal::resize(int cols, int rows)
     // 行数だけの変更でも捨てていたので、キーボードやメニューの表示を切り替える
     // たびにスクロールバックが消えていた（実機では常に空になっていた）。
     if (cols != old_cols) {
-        sb_count_ = 0;
-        sb_head_  = 0;
+        sb_count_  = 0;
+        sb_head_   = 0;
+        sb_hidden_ = 0;
     }
     // 見ている位置は行数が変わると意味が変わるので、どちらでも最新に戻す。
     view_offset_ = 0;
@@ -486,6 +491,7 @@ void Terminal::reset()
     bracketed_paste_ = false;
     app_cursor_keys_ = false;
     synchronized_    = false;
+    sb_hidden_       = 0;
     g_graphics_[0]   = false;
     g_graphics_[1]   = false;
     gl_              = 0;
@@ -840,7 +846,10 @@ void Terminal::exec_csi(uint8_t f)
                 clear_region(0, here + 1);
             } else if (mode == 2) {
                 clear_region(0, rows_ * cols_);
-            } else if (mode == 3) {
+            }
+            // 画面の上側を消したら、縮めて隠した行も（背の高い端末なら）消えていたはず。
+            if ((mode == 1 || mode == 2 || mode == 3) && !alt_active_) sb_hidden_ = 0;
+            if (mode == 3) {
                 // 画面ではなくスクロールバックを消す (Claude Code の /clear が 2J の後に送る)。
                 // 履歴を見ている最中なら表示が最新に戻るので描き直させる。
                 if (view_offset_ != 0) mark_all_dirty();
@@ -1180,6 +1189,7 @@ void Terminal::set_scrollback(Cell* buffer, int max_lines, int cols)
     sb_cols_     = (cols > 0) ? cols : cols_;
     sb_count_    = 0;
     sb_head_     = 0;
+    sb_hidden_   = 0;
     view_offset_ = 0;
 }
 
