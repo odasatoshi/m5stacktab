@@ -121,22 +121,22 @@ void test_sgr()
     Terminal t(10, 2);
     t.write("\033[1;31mR\033[0mN");
     CHECK(t.cell(0, 0).attr.flags & vt::kBold);
-    CHECK_EQ(t.cell(0, 0).attr.fg, 1);
+    CHECK_EQ(t.cell(0, 0).attr.fg, 1u);
     CHECK_EQ(t.cell(1, 0).attr.flags, 0);
     CHECK_EQ(t.cell(1, 0).attr.fg, vt::kDefaultFg);
 
     // 256 色
     t.write("\033[38;5;208mX");
-    CHECK_EQ(t.cell(2, 0).attr.fg, 208);
-    // 24bit 色は 256 色に丸める (捨てない)
+    CHECK_EQ(t.cell(2, 0).attr.fg, 208u);
+    // 24bit 色はそのまま持つ
     t.write("\033[38;2;255;0;0mY");
-    CHECK_EQ(t.cell(3, 0).attr.fg, 196);
+    CHECK_EQ(t.cell(3, 0).attr.fg, vt::rgb(255, 0, 0));
     // 明るい色
     t.write("\033[92mZ");
-    CHECK_EQ(t.cell(4, 0).attr.fg, 10);
+    CHECK_EQ(t.cell(4, 0).attr.fg, 10u);
     // 背景色つきで消去すると背景が残る
     t.write("\033[41m\033[2K");
-    CHECK_EQ(t.cell(0, 0).attr.bg, 1);
+    CHECK_EQ(t.cell(0, 0).attr.bg, 1u);
     CHECK_EQ(t.cell(0, 0).attr.flags, 0);
 }
 
@@ -344,19 +344,19 @@ void test_real_sequences()
 // レビュー指摘の回帰テスト。番号はレビューの指摘番号。
 void test_review_regressions()
 {
-    // 1. rgb_to_256 の境界: r==248 で 256 になって 0 (黒) に化けていた
+    // 1. 24bit 色はそのまま持つ (256 色に丸めていた頃は r==248 で黒に化けた)
     {
         Terminal t(10, 2);
         t.write("\033[38;2;248;248;248mW");
-        CHECK_EQ(t.cell(0, 0).attr.fg, 231);
+        CHECK_EQ(t.cell(0, 0).attr.fg, vt::rgb(248, 248, 248));
     }
     // 2. 既定色センチネルが実パレット番号と衝突しない
     {
         Terminal t(10, 2);
         t.write("\033[38;5;255mA\033[48;5;254mB");
-        CHECK_EQ(t.cell(0, 0).attr.fg, 255);
+        CHECK_EQ(t.cell(0, 0).attr.fg, 255u);
         CHECK(t.cell(0, 0).attr.fg != vt::kDefaultFg);
-        CHECK_EQ(t.cell(1, 0).attr.bg, 254);
+        CHECK_EQ(t.cell(1, 0).attr.bg, 254u);
         CHECK(t.cell(1, 0).attr.bg != vt::kDefaultBg);
         // 24bit の明るいグレーも既定色に潰れない
         t.write("\033[38;2;247;247;247mC");
@@ -415,9 +415,9 @@ void test_review_regressions()
     {
         Terminal t(10, 2);
         t.write("\033[38:2::255:0:0mR");
-        CHECK_EQ(t.cell(0, 0).attr.fg, 196);
+        CHECK_EQ(t.cell(0, 0).attr.fg, vt::rgb(255, 0, 0));
         t.write("\033[48:2::0:0:255mB");
-        CHECK_EQ(t.cell(1, 0).attr.bg, 21);
+        CHECK_EQ(t.cell(1, 0).attr.bg, vt::rgb(0, 0, 255));
     }
     // 9. 絵文字などの全角判定
     {
@@ -699,6 +699,102 @@ void test_resize_keeps_scrollback()
     CHECK(t.scrollback_lines() == held);
 }
 
+// TUI (herdr / Claude Code / opencode / codex) が実際に送るシーケンス (#100)。
+// どれも tmux で採った生のバイト列に出てきたもの。
+void test_tui_sequences()
+{
+    // private / 中間バイト付きの CSI を素の CSI として実行しない
+    {
+        Terminal t(20, 5);
+        t.write("\033[3;5H\0337");               // DECSC
+        t.write("\033[1;1H\033[>4;1m\033[>4;2mA");  // XTMODKEYS: 下線にも太字にもしない
+        CHECK_EQ(t.cell(0, 0).attr.flags, 0);
+        t.write("\033[2;2H\033[>1u\033[<u\033[?u");  // kitty keyboard: カーソルを復元しない
+        CHECK_EQ(t.cursor_x(), 1);
+        CHECK_EQ(t.cursor_y(), 1);
+        t.write("\033[2;4r\033[3;3H\033[?1r");  // XTRESTORE: スクロール領域を戻さない
+        CHECK_EQ(t.cursor_y(), 2);
+        t.write("\033[5;1H\n");  // 領域外の下端なのでスクロールしない (領域が 2-4 のまま)
+        CHECK_EQ(t.cursor_y(), 4);
+    }
+    // 応答: DA2 は DA1 と別物、DECRQM、DECXCPR、色の問い合わせ
+    {
+        Terminal    t(20, 5);
+        std::string reply;
+        t.set_reply([&](const std::string& s) { reply += s; });
+        t.write("\033[>c");
+        CHECK_STR(reply, "\033[>0;0;0c");
+        reply.clear();
+        t.write("\033[?2026$p\033[?2026h\033[?2026$p\033[?9999$p");
+        CHECK_STR(reply, "\033[?2026;2$y\033[?2026;1$y\033[?9999;0$y");
+        CHECK(t.synchronized());
+        t.write("\033[?2026l");
+        CHECK(!t.synchronized());
+        reply.clear();
+        t.write("\033[2;3H\033[?6n");
+        CHECK_STR(reply, "\033[?2;3R");
+        reply.clear();
+        t.write("\033]11;?\033\\");  // ST で訊かれたら ST で返す
+        CHECK_STR(reply, "\033]11;rgb:0000/0000/0000\033\\");
+        reply.clear();
+        t.write("\033]4;1;?;15;?\a");  // BEL で訊かれたら BEL。複数の番号を 1 本で訊ける
+        CHECK_STR(reply, "\033]4;1;rgb:cdcd/0000/0000\a\033]4;15;rgb:ffff/ffff/ffff\a");
+    }
+    // SGR のサブパラメータ (':') は ';' と別に扱う
+    {
+        Terminal t(20, 2);
+        t.write("\033[4:3mA\033[4:0mB");  // 波線の下線 → 下線。3 を斜体と読まない
+        CHECK_EQ(t.cell(0, 0).attr.flags, vt::kUnderline);
+        CHECK_EQ(t.cell(1, 0).attr.flags, 0);
+        t.write("\033[58:2::1:2:3mC");  // 下線の色は読み飛ばす (2 を dim と読まない)
+        CHECK_EQ(t.cell(2, 0).attr.flags, 0);
+        t.write("\033[58;5;9;1mD");  // ';' 形式でも引数を食ってから次へ進む
+        CHECK_EQ(t.cell(3, 0).attr.flags, vt::kBold);
+    }
+    // DEC 特殊図形 (ncurses の罫線) と SO/SI
+    {
+        Terminal t(20, 2);
+        t.write("\033(0lqk\033(Bq");
+        CHECK_STR(t.row_text(0), "┌─┐q");
+        t.write("\r\n\033)0x\016x\017x");
+        CHECK_STR(t.row_text(1), "x│x");
+    }
+    // REP / CHT / CBT
+    {
+        Terminal t(20, 2);
+        t.write("─\033[4b");
+        CHECK_STR(t.row_text(0), "─────");
+        t.write("\r\033[2I");
+        CHECK_EQ(t.cursor_x(), 16);
+        t.write("\033[Z");
+        CHECK_EQ(t.cursor_x(), 8);
+        t.write("\033[3Z");
+        CHECK_EQ(t.cursor_x(), 0);
+    }
+    // 幅 0 の文字はカーソルを進めない (異体字セレクタ・結合文字・肌色修飾)
+    {
+        CHECK_EQ(vt::char_width(0xFE0F), 0);
+        CHECK_EQ(vt::char_width(0x0301), 0);
+        CHECK_EQ(vt::char_width(0x1F3FB), 0);
+        CHECK_EQ(vt::char_width(0x3099), 0);  // かなの範囲 (幅 2) より先に判定する
+        Terminal t(20, 2);
+        t.write("\u2764\uFE0Fx");  // ❤️x
+        CHECK_EQ(t.cursor_x(), 2);
+        CHECK_STR(t.row_text(0), "\u2764x");
+    }
+    // ED 3 はスクロールバックだけを消す (画面は残す)
+    {
+        Terminal              t(10, 3);
+        std::vector<vt::Cell> sb(10 * 10);
+        t.set_scrollback(sb.data(), 10, 10);
+        t.write("a\r\nb\r\nc\r\nd");
+        CHECK(t.scrollback_lines() > 0);
+        t.write("\033[3J");
+        CHECK_EQ(t.scrollback_lines(), 0);
+        CHECK_STR(t.row_text(2), "d");
+    }
+}
+
 int main()
 {
     test_resize_keeps_scrollback();
@@ -718,6 +814,7 @@ int main()
     test_review_regressions();
     test_dirty_range();
     test_scrollback();
+    test_tui_sequences();
     std::printf("ok: %d checks passed\n", g_checks);
     return 0;
 }

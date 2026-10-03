@@ -3,7 +3,7 @@
 //
 // 1280x720 を毎フレーム全面書き換えると間に合わないので、行単位のスプライトを使って
 // dirty 行だけ転送する。フォントは M5GFX 内蔵の日本語等幅 (efont) を使い、
-// 全角は 2 セル分の幅で描く。
+// 全角は 2 セル分の幅で描く。罫線・ブロック・点字とフォントに無い字は term_glyphs で描く。
 #include <cstdint>
 #include <M5GFX.h>
 
@@ -69,6 +69,24 @@ private:
     // [x_from, x_to] のセル範囲だけ描いて転送する。
     void draw_row(vt::Terminal& term, int y, int x_from, int x_to);
 
+    // セルの描き方。フォントの送り幅がセル幅と一致する字だけを drawString の区間にまとめる。
+    // **一致しない字を区間に入れてはいけない。** M5GFX は無い字を 24px の空箱で描くので、
+    // 区間のそれ以降が 1 セルずつ右にずれる（TUI が崩れていた原因, #100）。
+    enum class Kind : uint8_t {
+        kFont,   // フォントで、区間にまとめて描く
+        kDrawn,  // 自前で描く (罫線・ブロック・点字)
+        kAlone,  // フォントに有るが送り幅がセル幅と違う。そのセルの中に収めて 1 字で描く
+        kTofu,   // 描けない。セルの中に枠を描く
+    };
+    struct Glyph {
+        Kind     kind;
+        uint32_t cp;
+    };
+    Glyph resolve(uint32_t cp, int width);
+    // efontJA_24 での送り幅 (px)。無い字は 0。グリフの探索は線形なので 1 度引いたら覚える。
+    int font_advance(uint32_t cp);
+    uint16_t color565(uint32_t c) const;
+
     M5GFX&    gfx_;
     M5Canvas  row_;
     int       cell_w_ = 0;
@@ -85,7 +103,10 @@ private:
     int       cur_x_ = -1;
     int       cur_y_ = -1;
     // 0-255 が xterm パレット、256 が既定前景、257 が既定背景 (vt::kDefaultFg/Bg に対応)。
+    // 24bit 色 (vt::kRgb) は表を引かずにその場で変換する。
     uint16_t  pal_[258] = {};
+    // BMP の各字の送り幅。0xFF = まだ引いていない、0 = 無い (64KB、PSRAM)。
+    uint8_t*  advance_ = nullptr;
     // PPA を使う経路。ppa_client_handle_t を持つと driver/ppa.h を公開ヘッダに
     // 引き込むので void* で持つ。
     void*     ppa_       = nullptr;

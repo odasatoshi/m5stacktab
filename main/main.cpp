@@ -2,6 +2,7 @@
 // 今の段階では「画面にターミナルを描く土台」と「WiFi 接続」まで。
 // SSH セッションを繋ぐのは #5 / #6。
 #include <cstdint>
+#include <cctype>
 #include <cstdlib>
 #include <utility>
 #include <algorithm>
@@ -270,6 +271,16 @@ std::string unescape(const char* src)
             case 't': out += '\t'; break;
             case 'a': out += '\a'; break;
             case '\\': out += '\\'; break;
+            case 'x': {  // \xHH: 任意のバイト (空白や UTF-8 を argv の分割に潰されずに送る)
+                if (!std::isxdigit(static_cast<unsigned char>(p[1])) ||
+                    !std::isxdigit(static_cast<unsigned char>(p[2]))) {
+                    return out;
+                }
+                const char h[3] = {p[1], p[2], '\0'};
+                out += static_cast<char>(std::strtol(h, nullptr, 16));
+                p += 2;
+                break;
+            }
             case '\0': return out;
             default: out += *p; break;
         }
@@ -309,7 +320,7 @@ int cmd_termdump(int, char**)
 int cmd_term(int argc, char** argv)
 {
     if (argc < 2) {
-        std::printf("usage: term <text>   (\\\\e=ESC \\\\r=CR \\\\n \\\\t \\\\a"
+        std::printf("usage: term <text>   (\\\\e=ESC \\\\r=CR \\\\n \\\\t \\\\a \\\\xHH"
                     " — コンソールでは二重にする)\n");
         return 1;
     }
@@ -4635,9 +4646,22 @@ extern "C" void app_main(void)
                     refresh_wifi_nets();  // 繋がった / 切れたで `*` が動く (#56)
                     menu->refresh();
                 }
+                // 同期出力 (?2026) の間は描かない。Claude Code / codex / opencode は
+                // 1 フレームをこれで囲むので、途中の画面（消した直後の空白など）を出さずに済む。
+                // 閉じ忘れたアプリで画面が止まらないよう、待つのは kSyncHoldUs まで。
+                constexpr int64_t kSyncHoldUs = 100 * 1000;
+                static int64_t    sync_since  = 0;
+                bool              hold        = false;
+                if (term->synchronized()) {
+                    const int64_t now = esp_timer_get_time();
+                    if (sync_since == 0) sync_since = now;
+                    hold = now - sync_since < kSyncHoldUs;
+                } else {
+                    sync_since = 0;
+                }
                 if (menu->visible()) {
                     menu->draw();
-                } else if (term->any_dirty()) {
+                } else if (term->any_dirty() && !hold) {
                     render_term();
                 }
             }

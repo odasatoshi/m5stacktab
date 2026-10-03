@@ -3,19 +3,28 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 
 namespace vt {
 
 namespace {
 
-// East Asian Wide / Fullwidth の範囲。Unicode 15 の EastAsianWidth.txt から W/F のみ抜粋。
-// 結合文字 (幅 0) は扱わない: 端末で結合文字を使う場面が限られるうえ、幅 0 を導入すると
-// カーソル位置の整合を取る箇所が増える。
-// ponytail: 結合文字は幅 1 として扱う。濁点付き仮名などが崩れたら幅 0 を追加する。
 struct Range {
     uint32_t lo;
     uint32_t hi;
 };
+
+// 幅 0 (結合文字・異体字セレクタ・ゼロ幅の制御文字)。前の文字に重ねるだけでカーソルは進まない。
+// 1 として数えると、送る側 (wcwidth / string-width) とその行の以降が 1 セルずつずれる。
+// ponytail: 重ねて描かずに捨てる。濁点の結合 (U+3099) が要る場面が出たら前のセルに合成する。
+constexpr Range kZero[] = {
+    {0x0300, 0x036F}, {0x0483, 0x0489}, {0x0591, 0x05BD}, {0x0610, 0x061A},
+    {0x064B, 0x065F}, {0x200B, 0x200F}, {0x202A, 0x202E}, {0x2060, 0x2064},
+    {0x20D0, 0x20FF}, {0x3099, 0x309A}, {0xFE00, 0xFE0F}, {0xFE20, 0xFE2F},
+    {0xFEFF, 0xFEFF}, {0x1F3FB, 0x1F3FF}, {0xE0000, 0xE0FFF},
+};
+
+// East Asian Wide / Fullwidth の範囲。Unicode 15 の EastAsianWidth.txt から W/F のみ抜粋。
 
 constexpr Range kWide[] = {
     {0x1100, 0x115F},   {0x231A, 0x231B},   {0x2329, 0x232A},   {0x23E9, 0x23EC},
@@ -41,23 +50,56 @@ constexpr Range kWide[] = {
     {0x1FA70, 0x1FAFF}, {0x20000, 0x2FFFD}, {0x30000, 0x3FFFD},
 };
 
-// 24bit 色を xterm 256 色パレットの最近似に丸める。
-uint16_t rgb_to_256(int r, int g, int b)
-{
-    // グレースケール軸のほうが近ければそちらを使う。
-    if (std::abs(r - g) < 8 && std::abs(g - b) < 8) {
-        if (r < 8) return 16;
-        if (r >= 248) return 231;  // > だと r==248 で 256 になり uint8_t で 0 (黒) に化ける
-        return static_cast<uint16_t>(232 + (r - 8) * 24 / 240);
-    }
-    auto q = [](int v) { return v < 48 ? 0 : v < 115 ? 1 : (v - 35) / 40; };
-    return static_cast<uint16_t>(16 + 36 * q(r) + 6 * q(g) + q(b));
-}
+// xterm の標準 16 色。
+constexpr uint8_t kBase16[16][3] = {
+    {0, 0, 0},       {205, 0, 0},     {0, 205, 0},     {205, 205, 0},
+    {0, 0, 238},     {205, 0, 205},   {0, 205, 205},   {229, 229, 229},
+    {127, 127, 127}, {255, 0, 0},     {0, 255, 0},     {255, 255, 0},
+    {92, 92, 255},   {255, 0, 255},   {0, 255, 255},   {255, 255, 255},
+};
+constexpr uint8_t kCubeLevels[6] = {0, 95, 135, 175, 215, 255};
+
+// DEC 特殊図形 (ESC ( 0) の 0x60-0x7E。ncurses の acsc はこれで罫線を描く。
+constexpr uint16_t kDecGraphics[31] = {
+    0x25C6, 0x2592, 0x2409, 0x240C, 0x240D, 0x240A, 0x00B0, 0x00B1,  // ` a b c d e f g
+    0x2424, 0x240B, 0x2518, 0x2510, 0x250C, 0x2514, 0x253C, 0x23BA,  // h i j k l m n o
+    0x23BB, 0x2500, 0x23BC, 0x23BD, 0x251C, 0x2524, 0x2534, 0x252C,  // p q r s t u v w
+    0x2502, 0x2264, 0x2265, 0x03C0, 0x2260, 0x00A3, 0x00B7,          // x y z { | } ~
+};
 
 }  // namespace
 
+void color_rgb(uint32_t c, uint8_t& r, uint8_t& g, uint8_t& b)
+{
+    if (c & kRgb) {
+        r = static_cast<uint8_t>(c >> 16);
+        g = static_cast<uint8_t>(c >> 8);
+        b = static_cast<uint8_t>(c);
+        return;
+    }
+    if (c == kDefaultFg) c = 7;
+    if (c == kDefaultBg) c = 0;
+    if (c < 16) {
+        r = kBase16[c][0];
+        g = kBase16[c][1];
+        b = kBase16[c][2];
+    } else if (c < 232) {
+        c -= 16;
+        r = kCubeLevels[c / 36];
+        g = kCubeLevels[(c / 6) % 6];
+        b = kCubeLevels[c % 6];
+    } else {
+        r = g = b = static_cast<uint8_t>(8 + (c - 232) * 10);
+    }
+}
+
 int char_width(uint32_t cp)
 {
+    if (cp < 0x300) return 1;
+    for (const auto& r : kZero) {
+        if (cp < r.lo) break;
+        if (cp <= r.hi) return 0;
+    }
     if (cp < 0x1100) return 1;
     for (const auto& r : kWide) {
         if (cp < r.lo) break;
@@ -424,6 +466,11 @@ void Terminal::reset()
     reverse_video_   = false;
     bracketed_paste_ = false;
     app_cursor_keys_ = false;
+    synchronized_    = false;
+    g_graphics_[0]   = false;
+    g_graphics_[1]   = false;
+    gl_              = 0;
+    last_cp_         = 0;
     scroll_top_      = 0;
     scroll_bottom_   = rows_ - 1;
     std::fill(tab_stops_.begin(), tab_stops_.end(), false);
@@ -434,6 +481,8 @@ void Terminal::reset()
 void Terminal::put_char(uint32_t cp)
 {
     int w = char_width(cp);
+    if (w == 0) return;
+    last_cp_ = cp;
 
     if (cur_.pending_wrap && autowrap_) {
         carriage_return();
@@ -499,7 +548,9 @@ void Terminal::exec_c0(uint8_t b)
             index();
             break;
         case 0x0D: carriage_return(); break;
-        default: break;  // SO/SI や未対応の C0 は無視
+        case 0x0E: gl_ = 1; break;  // SO: G1 を使う
+        case 0x0F: gl_ = 0; break;  // SI: G0 に戻す
+        default: break;  // 未対応の C0 は無視
     }
 }
 
@@ -549,6 +600,7 @@ void Terminal::set_mode(bool enable)
                     switch_alt(enable, /*clear=*/enable, /*save_restore_cursor=*/true);
                     break;
                 case 2004: bracketed_paste_ = enable; break;
+                case 2026: synchronized_ = enable; break;
                 default: break;  // マウス報告 (1000 系) などは未対応
             }
         } else {
@@ -564,8 +616,54 @@ void Terminal::set_mode(bool enable)
 void Terminal::exec_sgr()
 {
     if (params_.empty()) params_.push_back(0);
+    auto is_sub = [&](size_t k) { return k < params_.size() && k < 32 && (sub_mask_ >> k) & 1; };
     for (size_t i = 0; i < params_.size(); ++i) {
         int p = param(i, 0);
+        // この番号に付いているサブパラメータ (':' 区切り) の終わり。
+        size_t end = i + 1;
+        while (is_sub(end)) ++end;
+        const bool has_sub = end > i + 1;
+
+        if (p == 38 || p == 48 || p == 58) {
+            // 58 (下線の色) は描かないが、引数を読み飛ばさないと後ろの数字が属性に化ける。
+            uint32_t color = 0;
+            bool     ok    = false;
+            const int kind = param(i + 1, 0);
+            if (has_sub) {
+                // 38:5:n / 38:2:<colorspace>:r:g:b / 38:2:r:g:b (colorspace 欄を省く実装もある)
+                if (kind == 5 && end - i >= 3) {
+                    color = static_cast<uint32_t>(std::clamp(param(i + 2, 0), 0, 255));
+                    ok    = true;
+                } else if (kind == 2 && end - i >= 5) {
+                    const size_t r = (end - i >= 6) ? i + 3 : i + 2;
+                    color = rgb(std::clamp(param(r, 0), 0, 255), std::clamp(param(r + 1, 0), 0, 255),
+                                std::clamp(param(r + 2, 0), 0, 255));
+                    ok = true;
+                }
+                i = end - 1;
+            } else if (kind == 5) {
+                color = static_cast<uint32_t>(std::clamp(param(i + 2, 0), 0, 255));
+                ok    = true;
+                i += 2;
+            } else if (kind == 2) {
+                color = rgb(std::clamp(param(i + 2, 0), 0, 255), std::clamp(param(i + 3, 0), 0, 255),
+                            std::clamp(param(i + 4, 0), 0, 255));
+                ok = true;
+                i += 4;
+            }
+            if (ok && p == 38) cur_.attr.fg = color;
+            if (ok && p == 48) cur_.attr.bg = color;
+            continue;
+        }
+        if (has_sub) {
+            // 4:0 は下線なし、4:1-5 は下線の種類 (二重・波線など。描き分けずに下線にする)。
+            if (p == 4) {
+                if (param(i + 1, 1) == 0) cur_.attr.flags &= ~kUnderline;
+                else cur_.attr.flags |= kUnderline;
+            }
+            i = end - 1;
+            continue;
+        }
         switch (p) {
             case 0: cur_.attr = Attr{}; break;
             case 1: cur_.attr.flags |= kBold; break;
@@ -586,44 +684,106 @@ void Terminal::exec_sgr()
             case 29: cur_.attr.flags &= ~kStrike; break;
             case 39: cur_.attr.fg = kDefaultFg; break;
             case 49: cur_.attr.bg = kDefaultBg; break;
-            case 38:
-            case 48: {
-                bool fg  = (p == 38);
-                int  kind = param(i + 1, 0);
-                if (kind == 5) {
-                    uint16_t idx = static_cast<uint16_t>(std::clamp(param(i + 2, 0), 0, 255));
-                    if (fg) cur_.attr.fg = idx; else cur_.attr.bg = idx;
-                    i += 2;
-                } else if (kind == 2) {
-                    // コロン形式の標準は 38:2:<colorspace>:r:g:b で colorspace 欄が空。
-                    // 空欄 (-1) を r として食うと色が壊れるので 1 つ読み飛ばす。
-                    size_t j = i + 2;
-                    if (j < params_.size() && params_[j] < 0) ++j;
-                    uint16_t idx = rgb_to_256(std::clamp(param(j, 0), 0, 255),
-                                              std::clamp(param(j + 1, 0), 0, 255),
-                                              std::clamp(param(j + 2, 0), 0, 255));
-                    if (fg) cur_.attr.fg = idx; else cur_.attr.bg = idx;
-                    i = j + 2;
-                }
-                break;
-            }
             default:
                 if (p >= 30 && p <= 37) {
-                    cur_.attr.fg = static_cast<uint16_t>(p - 30);
+                    cur_.attr.fg = static_cast<uint32_t>(p - 30);
                 } else if (p >= 40 && p <= 47) {
-                    cur_.attr.bg = static_cast<uint16_t>(p - 40);
+                    cur_.attr.bg = static_cast<uint32_t>(p - 40);
                 } else if (p >= 90 && p <= 97) {
-                    cur_.attr.fg = static_cast<uint16_t>(p - 90 + 8);
+                    cur_.attr.fg = static_cast<uint32_t>(p - 90 + 8);
                 } else if (p >= 100 && p <= 107) {
-                    cur_.attr.bg = static_cast<uint16_t>(p - 100 + 8);
+                    cur_.attr.bg = static_cast<uint32_t>(p - 100 + 8);
                 }
                 break;
         }
     }
 }
 
+// DECRQM (CSI ? Ps $ p) への応答。1 = 設定中、2 = 解除中、0 = 知らない。
+// Claude Code は ?2026 をこれで確かめてから同期出力を使う。
+void Terminal::report_mode(int mode)
+{
+    if (!reply_) return;
+    int state = 0;
+    if (csi_private_ == '?') {
+        switch (mode) {
+            case 1: state = app_cursor_keys_ ? 1 : 2; break;
+            case 6: state = origin_mode_ ? 1 : 2; break;
+            case 7: state = autowrap_ ? 1 : 2; break;
+            case 25: state = cursor_visible_ ? 1 : 2; break;
+            case 47:
+            case 1047:
+            case 1049: state = alt_active_ ? 1 : 2; break;
+            case 2004: state = bracketed_paste_ ? 1 : 2; break;
+            case 2026: state = synchronized_ ? 1 : 2; break;
+            default: break;
+        }
+    } else if (mode == 4) {
+        state = insert_mode_ ? 1 : 2;
+    }
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), "\033[%s%d;%d$y", csi_private_ == '?' ? "?" : "", mode, state);
+    reply_(buf);
+}
+
+// DECSTR (CSI ! p)。画面は消さずにモードだけ初期値に戻す。
+void Terminal::soft_reset()
+{
+    cursor_visible_   = true;
+    autowrap_         = true;
+    origin_mode_      = false;
+    insert_mode_      = false;
+    app_cursor_keys_  = false;
+    synchronized_     = false;
+    g_graphics_[0]    = false;
+    g_graphics_[1]    = false;
+    gl_               = 0;
+    scroll_top_       = 0;
+    scroll_bottom_    = rows_ - 1;
+    cur_.attr         = Attr{};
+    cur_.pending_wrap = false;
+    saved_main_       = Cursor{};
+    saved_alt_        = Cursor{};
+}
+
 void Terminal::exec_csi(uint8_t f)
 {
+    // 中間バイト付き (CSI ... $ p など) と private 付き (CSI > ... など) は、知っているものだけ
+    // 拾って残りは捨てる。**素の CSI と同じ表に落としてはいけない。** 落とすと
+    // CSI > 4;1 m (XTMODKEYS。4 つの TUI が全部送る) が「下線 + 太字」に、
+    // CSI > 1 u / CSI < u / CSI ? u (kitty keyboard) が「カーソル復元」になり、
+    // CSI ? 1 r (XTRESTORE) がスクロール領域をリセットしてカーソルを原点に飛ばす。
+    if (csi_inter_ != 0) {
+        if (csi_inter_ == '$' && f == 'p') report_mode(param(0, 0));
+        else if (csi_inter_ == '!' && f == 'p') soft_reset();
+        return;  // SP q (カーソル形状) など
+    }
+    if (csi_private_ == '>') {
+        // DA2。VT100 相当 (端末の種類 0) を名乗る。
+        if (f == 'c' && reply_) reply_("\033[>0;0;0c");
+        return;
+    }
+    if (csi_private_ == '?') {
+        switch (f) {
+            case 'h':
+            case 'l':
+            case 'J':  // DECSED / DECSEL は保護属性を持たないので素の消去と同じ
+            case 'K':
+                break;
+            case 'n':
+                if (param(0, 0) == 6 && reply_) {  // DECXCPR
+                    char buf[32];
+                    std::snprintf(buf, sizeof(buf), "\033[?%d;%dR",
+                                  cur_.y - (origin_mode_ ? scroll_top_ : 0) + 1, cur_.x + 1);
+                    reply_(buf);
+                }
+                return;
+            default: return;  // ?u (kitty keyboard の問い合わせ)、?r / ?s (XTRESTORE/XTSAVE) など
+        }
+    } else if (csi_private_ != 0) {
+        return;  // CSI < u / CSI = c など
+    }
+
     // 原点モードではスクロール領域が座標の基準になる。
     const int y_origin = origin_mode_ ? scroll_top_ : 0;
     // カーソルがスクロール領域内にいるなら、上下移動はマージンで止まる (VT100 仕様)。
@@ -656,8 +816,13 @@ void Terminal::exec_csi(uint8_t f)
                 clear_region(here, rows_ * cols_);
             } else if (mode == 1) {
                 clear_region(0, here + 1);
-            } else if (mode == 2 || mode == 3) {
+            } else if (mode == 2) {
                 clear_region(0, rows_ * cols_);
+            } else if (mode == 3) {
+                // 画面ではなくスクロールバックを消す (Claude Code の /clear が 2J の後に送る)。
+                sb_count_    = 0;
+                sb_head_     = 0;
+                view_offset_ = 0;
             }
             break;
         }
@@ -703,6 +868,21 @@ void Terminal::exec_csi(uint8_t f)
             break;
         }
         case 'X': erase_cells(cur_.x, cur_.y, std::max(1, param(0, 1))); break;
+        case 'b': {  // REP。xterm-256color の terminfo に rep があるので ncurses が使う
+            if (last_cp_ == 0) break;
+            const int n = std::clamp(param(0, 1), 1, cols_ * rows_);
+            for (int i = 0; i < n; ++i) put_char(last_cp_);
+            break;
+        }
+        case 'I':  // CHT
+            for (int i = std::clamp(param(0, 1), 1, cols_); i > 0; --i) tab_forward();
+            break;
+        case 'Z':  // CBT (Shift+Tab の逆タブ)
+            cur_.pending_wrap = false;
+            for (int i = std::clamp(param(0, 1), 1, cols_); i > 0 && cur_.x > 0; --i) {
+                do --cur_.x; while (cur_.x > 0 && !tab_stops_[cur_.x]);
+            }
+            break;
         case 'S': scroll_up(scroll_top_, scroll_bottom_, param(0, 1)); break;
         case 'T': scroll_down(scroll_top_, scroll_bottom_, param(0, 1)); break;
         case 'm': exec_sgr(); break;
@@ -765,6 +945,49 @@ void Terminal::clear_region(int from_index, int to_index)
     repair_row((to_index - 1) / cols_);
 }
 
+// OSC 0/2 (タイトル) と、色の問い合わせ OSC 4;n;? / 10;? / 11;? への応答。
+// codex / herdr / opencode は起動時に前景・背景・パレットを訊いて配色を決める。
+// 答えないと各アプリの待ち時間 (タイムアウト) が起動のたびにかかる。
+void Terminal::exec_osc()
+{
+    const size_t semi = osc_.find(';');
+    if (semi == std::string::npos) return;
+    const int code = std::atoi(osc_.c_str());
+    if (code == 0 || code == 2) {
+        title_ = osc_.substr(semi + 1);
+        return;
+    }
+    if (!reply_) return;
+    const char* st = osc_bel_ ? "\a" : "\033\\";
+    auto answer = [&](const std::string& head, uint32_t color) {
+        uint8_t r, g, b;
+        color_rgb(color, r, g, b);
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "\033]%s;rgb:%02x%02x/%02x%02x/%02x%02x%s", head.c_str(), r, r, g,
+                      g, b, b, st);
+        reply_(buf);
+    };
+    const std::string rest = osc_.substr(semi + 1);
+    if ((code == 10 || code == 11) && rest == "?") {
+        answer(std::to_string(code), code == 10 ? kDefaultFg : kDefaultBg);
+    } else if (code == 4) {
+        // 4;<n>;?[;<n>;?...]。設定 (4;n;rgb:...) は無視する。
+        size_t pos = 0;
+        while (pos < rest.size()) {
+            const size_t a = rest.find(';', pos);
+            if (a == std::string::npos) break;
+            const size_t e    = rest.find(';', a + 1);
+            const std::string spec = rest.substr(a + 1, e == std::string::npos ? std::string::npos : e - a - 1);
+            const int idx = std::atoi(rest.c_str() + pos);
+            if (spec == "?" && idx >= 0 && idx <= 255) {
+                answer("4;" + std::to_string(idx), static_cast<uint32_t>(idx));
+            }
+            if (e == std::string::npos) break;
+            pos = e + 1;
+        }
+    }
+}
+
 void Terminal::write(const std::string& s)
 {
     write(reinterpret_cast<const uint8_t*>(s.data()), s.size());
@@ -801,7 +1024,11 @@ void Terminal::write(const uint8_t* data, size_t len)
                 } else if (b == 0x7F) {
                     // DEL は無視
                 } else if (b < 0x80) {
-                    put_char(b);
+                    if (g_graphics_[gl_] && b >= 0x60 && b <= 0x7E) {
+                        put_char(kDecGraphics[b - 0x60]);
+                    } else {
+                        put_char(b);
+                    }
                 } else if ((b & 0xE0) == 0xC0) {
                     utf8_cp_        = b & 0x1F;
                     utf8_remaining_ = 1;
@@ -822,6 +1049,8 @@ void Terminal::write(const uint8_t* data, size_t len)
             case State::kEsc:
                 if (b == '[') {
                     params_.clear();
+                    sub_mask_       = 0;
+                    next_sub_       = false;
                     param_seen_     = false;
                     param_overflow_ = false;
                     csi_private_ = 0;
@@ -833,7 +1062,8 @@ void Terminal::write(const uint8_t* data, size_t len)
                 } else if (b == 'P' || b == 'X' || b == '^' || b == '_') {
                     state_ = State::kDcs;
                 } else if (b == '(' || b == ')' || b == '*' || b == '+' || b == '#' || b == ' ') {
-                    state_ = State::kEscIntermediate;
+                    esc_inter_ = b;
+                    state_     = State::kEscIntermediate;
                 } else if (b == 0x1B) {
                     // ESC ESC: 後ろの ESC から解釈し直す
                 } else {
@@ -843,7 +1073,10 @@ void Terminal::write(const uint8_t* data, size_t len)
                 break;
 
             case State::kEscIntermediate:
-                state_ = State::kGround;  // 文字集合指定などは読み捨てる
+                // G0 / G1 の文字集合。'0' が DEC 特殊図形、それ以外 ('B' など) は ASCII に戻す。
+                // G2 / G3 (* +) と ESC # / ESC SP は読み捨てる。
+                if (esc_inter_ == '(' || esc_inter_ == ')') g_graphics_[esc_inter_ == ')'] = (b == '0');
+                state_ = State::kGround;
                 break;
 
             case State::kCsiParam:
@@ -851,6 +1084,7 @@ void Terminal::write(const uint8_t* data, size_t len)
                     if (!param_seen_) {
                         param_seen_ = true;
                         if (params_.size() < kMaxParams) {
+                            if (next_sub_) sub_mask_ |= 1u << params_.size();
                             params_.push_back(0);
                         } else {
                             param_overflow_ = true;  // 以降このシーケンスの数字は捨てる
@@ -860,10 +1094,14 @@ void Terminal::write(const uint8_t* data, size_t len)
                         params_.back() = params_.back() * 10 + (b - '0');
                     }
                 } else if (b == ';' || b == ':') {
-                    // ':' は SGR のサブパラメータ区切りだが、ここでは ';' と同じ扱いにする。
+                    // ':' の後ろはサブパラメータ (sub_mask_ に印を付ける)。
                     // 数字が来ないまま区切られたら -1 を積む。param() がそれを既定値に読み替える。
-                    if (!param_seen_ && params_.size() < kMaxParams) params_.push_back(-1);
+                    if (!param_seen_ && params_.size() < kMaxParams) {
+                        if (next_sub_) sub_mask_ |= 1u << params_.size();
+                        params_.push_back(-1);
+                    }
                     param_seen_ = false;
+                    next_sub_   = (b == ':');
                 } else if (b >= '<' && b <= '?') {
                     csi_private_ = b;
                 } else if (b >= ' ' && b <= '/') {
@@ -882,10 +1120,8 @@ void Terminal::write(const uint8_t* data, size_t len)
 
             case State::kOsc:
                 if (b == 0x07) {
-                    // OSC 0/2 はウィンドウタイトル
-                    if (osc_.size() >= 2 && (osc_[0] == '0' || osc_[0] == '2') && osc_[1] == ';') {
-                        title_ = osc_.substr(2);
-                    }
+                    osc_bel_ = true;
+                    exec_osc();
                     state_ = State::kGround;
                 } else if (b == 0x1B) {
                     state_ = State::kOscEsc;
@@ -895,9 +1131,8 @@ void Terminal::write(const uint8_t* data, size_t len)
                 break;
 
             case State::kOscEsc:
-                if (osc_.size() >= 2 && (osc_[0] == '0' || osc_[0] == '2') && osc_[1] == ';') {
-                    title_ = osc_.substr(2);
-                }
+                osc_bel_ = false;
+                exec_osc();
                 state_ = State::kGround;
                 if (b != '\\') --i;  // ST 以外なら読み直す
                 break;

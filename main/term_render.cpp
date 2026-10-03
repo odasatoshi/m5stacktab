@@ -12,27 +12,30 @@
 #include <lgfx/v1/platforms/esp32p4/Panel_DSI.hpp>
 
 #include "rotate.hpp"
+#include "term_glyphs.hpp"
 
 namespace {
 
 const char* TAG = "render";
 
-// xterm の標準 16 色。
-constexpr uint8_t kBase16[16][3] = {
-    {0, 0, 0},       {205, 0, 0},     {0, 205, 0},     {205, 205, 0},
-    {0, 0, 238},     {205, 0, 205},   {0, 205, 205},   {229, 229, 229},
-    {127, 127, 127}, {255, 0, 0},     {0, 255, 0},     {255, 255, 0},
-    {92, 92, 255},   {255, 0, 255},   {0, 255, 255},   {255, 255, 255},
-};
+// 日本語等幅で一番大きいもの。1280x720 で 106x30 になる。
+const lgfx::IFont* const kFont = &fonts::efontJA_24;
 
-constexpr uint8_t kCubeLevels[6] = {0, 95, 135, 175, 215, 255};
+// a から b へ alpha/255 だけ寄せる (RGB565 のまま)。dim とシェード ░▒▓ に使う。
+uint16_t blend565(uint16_t a, uint16_t b, uint8_t alpha)
+{
+    auto mix = [&](int shift, int mask) {
+        const int ca = (a >> shift) & mask, cb = (b >> shift) & mask;
+        return ((ca * (255 - alpha) + cb * alpha) / 255) << shift;
+    };
+    return static_cast<uint16_t>(mix(11, 0x1F) | mix(5, 0x3F) | mix(0, 0x1F));
+}
 
 }  // namespace
 
 bool TermRenderer::begin()
 {
-    // 日本語等幅で一番大きいもの。1280x720 で 106x30 になる。
-    gfx_.setFont(&fonts::efontJA_24);
+    gfx_.setFont(kFont);
     // fontWidth() は efont では実際の送り幅と一致しない (24px 高で 6 を返す) ので、
     // 半角 1 文字を実測する。全角はこの 2 倍で描かれる。
     cell_w_ = gfx_.textWidth("A");
@@ -47,19 +50,20 @@ bool TermRenderer::begin()
     rows_      = (gfx_.height() - origin_y_) / cell_h_;
     full_rows_ = rows_;
 
-    for (int i = 0; i < 16; ++i) {
-        pal_[i] = gfx_.color565(kBase16[i][0], kBase16[i][1], kBase16[i][2]);
+    // 色の表は vt100 側にある（OSC 4/10/11 の応答と同じ表を見る）。
+    for (uint32_t i = 0; i < 258; ++i) {
+        uint8_t r, g, b;
+        vt::color_rgb(i, r, g, b);
+        pal_[i] = gfx_.color565(r, g, b);
     }
-    for (int i = 0; i < 216; ++i) {
-        pal_[16 + i] = gfx_.color565(kCubeLevels[i / 36], kCubeLevels[(i / 6) % 6],
-                                     kCubeLevels[i % 6]);
+
+    advance_ = static_cast<uint8_t*>(heap_caps_malloc(0x10000, MALLOC_CAP_SPIRAM));
+    if (!advance_) advance_ = static_cast<uint8_t*>(malloc(0x10000));
+    if (!advance_) {
+        ESP_LOGE(TAG, "glyph advance cache alloc failed");
+        return false;
     }
-    for (int i = 0; i < 24; ++i) {
-        uint8_t v    = static_cast<uint8_t>(8 + i * 10);
-        pal_[232 + i] = gfx_.color565(v, v, v);
-    }
-    pal_[vt::kDefaultFg] = pal_[7];
-    pal_[vt::kDefaultBg] = pal_[0];
+    std::memset(advance_, 0xFF, 0x10000);
 
     // 行スプライトは内蔵 RAM に置く (1280x24x2 = 60KB)。PSRAM に置くと転送が遅くなる。
     row_.setPsram(false);
@@ -68,7 +72,7 @@ bool TermRenderer::begin()
     // （赤 0xF800 が暗い青に見える。白と黒はスワップ不変なので気づきにくい）。
     // パネルも PPA もネイティブのリトルエンディアン RGB565 を期待している。
     row_.setColorDepth(lgfx::v1::color_depth_t::rgb565_nonswapped);
-    row_.setFont(&fonts::efontJA_24);
+    row_.setFont(kFont);
     row_.setTextDatum(textdatum_t::top_left);
     if (!row_.createSprite(gfx_.width(), cell_h_)) {
         ESP_LOGE(TAG, "row sprite alloc failed (%dx%d)", (int)gfx_.width(), cell_h_);
@@ -78,6 +82,43 @@ bool TermRenderer::begin()
              (int)gfx_.width() * cell_h_ * 2);
 
     return true;
+}
+
+uint16_t TermRenderer::color565(uint32_t c) const
+{
+    if (c < 258) return pal_[c];
+    uint8_t r, g, b;
+    vt::color_rgb(c, r, g, b);
+    return lgfx::color565(r, g, b);
+}
+
+int TermRenderer::font_advance(uint32_t cp)
+{
+    if (cp > 0xFFFF) return 0;  // efont は BMP まで
+    uint8_t& a = advance_[cp];
+    if (a == 0xFF) {
+        lgfx::FontMetrics m{};
+        a = kFont->updateFontMetric(&m, static_cast<uint16_t>(cp))
+                ? static_cast<uint8_t>(std::clamp<int>(m.x_advance, 1, 0xFE))
+                : 0;
+    }
+    return a;
+}
+
+TermRenderer::Glyph TermRenderer::resolve(uint32_t cp, int width)
+{
+    if (cp == 0) cp = ' ';
+    // 置き換えは 1 段だけ（置き換え先も無ければ枠にする）。
+    for (int i = 0; i < 2; ++i) {
+        if (glyph::is_drawn(cp)) return {Kind::kDrawn, cp};
+        const int adv = font_advance(cp);
+        if (adv == cell_w_ * width) return {Kind::kFont, cp};
+        if (adv > 0) return {Kind::kAlone, cp};
+        const uint32_t sub = glyph::substitute(cp);
+        if (sub == 0) break;
+        cp = sub;
+    }
+    return {Kind::kTofu, cp};
 }
 
 namespace {
@@ -94,8 +135,8 @@ void append_utf8(std::string& out, uint32_t cp)
         out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
         out += static_cast<char>(0x80 | (cp & 0x3F));
     } else {
-        // efont は BMP までなので下駄記号にする。
-        append_utf8(out, 0x3013);
+        // efont は BMP まで。resolve() が kFont にしないので来ない。
+        out += '?';
     }
 }
 
@@ -239,66 +280,102 @@ void TermRenderer::draw_row(vt::Terminal& term, int y, int x_from, int x_to)
         term.cursor_visible() && term.view_offset() == 0 && y == term.cursor_y();
     const int cursor_x = term.cursor_x();
 
-    // 同じ見た目が続く区間をまとめて 1 回の drawString で描く。
-    // drawChar は指定した座標に描いてくれない (advance は正しいが位置が効かない) ので使わない。
+    constexpr uint16_t kDeco = vt::kUnderline | vt::kStrike | vt::kInvisible;
+    struct Style {
+        uint16_t fg, bg, deco;
+        bool     operator!=(const Style& o) const { return fg != o.fg || bg != o.bg || deco != o.deco; }
+    };
+    auto style_of = [&](int cx, const vt::Cell& c) {
+        uint32_t fgc = c.attr.fg;
+        // 太字は明色化する (専用のボールドフォントは無い)。xterm 系と同じ扱い。
+        if ((c.attr.flags & vt::kBold) && fgc < 8) fgc += 8;
+        Style st{color565(fgc), color565(c.attr.bg), static_cast<uint16_t>(c.attr.flags & kDeco)};
+        // dim は背景へ寄せる。Claude Code は補足の文字を dim で出す。
+        if (c.attr.flags & vt::kDim) st.fg = blend565(st.bg, st.fg, 150);
+        const bool reverse = (c.attr.flags & vt::kReverse) != 0;
+        // カーソルは反転ブロック。反転属性と重なったら二重反転で元に戻る。
+        const bool on_cursor = cursor_here && (cx == cursor_x || (c.width == 2 && cx + 1 == cursor_x));
+        if (reverse != on_cursor) std::swap(st.fg, st.bg);
+        return st;
+    };
+    auto decorate = [&](int px, int width, const Style& st) {
+        if (st.deco & vt::kUnderline) row_.drawFastHLine(px, cell_h_ - 2, width, st.fg);
+        if (st.deco & vt::kStrike) row_.drawFastHLine(px, cell_h_ / 2, width, st.fg);
+    };
+
+    // 同じ見た目が続く区間をまとめて 1 回の drawString で描く（速いうえ、
+    // drawChar は指定した座標に描いてくれない）。区間に入れるのは kFont の字だけ。
+    std::string run;
+    int         run_x = -1;
+    Style       run_st{};
+    auto flush = [&](int end_x) {
+        if (run_x < 0) return;
+        const int px    = run_x * cell_w_;
+        const int width = (end_x - run_x) * cell_w_;
+        // 既定背景のまま・空白だけ・装飾なしなら最初の fillRect で足りる。
+        const bool all_blank = run.find_first_not_of(' ') == std::string::npos;
+        if (!(all_blank && run_st.bg == pal_[vt::kDefaultBg] && run_st.deco == 0)) {
+            row_.fillRect(px, 0, width, cell_h_, run_st.bg);
+            if (!all_blank && (run_st.deco & vt::kInvisible) == 0) {
+                row_.setTextColor(run_st.fg, run_st.bg);
+                row_.drawString(run.c_str(), px, 0);
+            }
+            decorate(px, width, run_st);
+        }
+        run.clear();
+        run_x = -1;
+    };
+    // kFont 以外の字は 1 セル (全角なら 2 セル) の中だけに描く。
+    auto draw_alone = [&](int cx, int cells, const Style& st, const Glyph& g) {
+        const int px = cx * cell_w_;
+        const int pw = cells * cell_w_;
+        row_.fillRect(px, 0, pw, cell_h_, st.bg);
+        if ((st.deco & vt::kInvisible) == 0) {
+            switch (g.kind) {
+                case Kind::kDrawn:
+                    glyph::draw(g.cp, pw, cell_h_, [&](int x, int y, int w, int h, uint8_t a) {
+                        row_.fillRect(px + x, y, w, h, a == 255 ? st.fg : blend565(st.bg, st.fg, a));
+                    });
+                    break;
+                case Kind::kAlone: {
+                    std::string s;
+                    append_utf8(s, g.cp);
+                    row_.setClipRect(px, 0, pw, cell_h_);
+                    row_.setTextColor(st.fg, st.bg);
+                    row_.drawString(s.c_str(), px + (pw - font_advance(g.cp)) / 2, 0);
+                    row_.clearClipRect();
+                    break;
+                }
+                default:
+                    row_.drawRect(px + 2, 3, pw - 4, cell_h_ - 6, st.fg);
+                    break;
+            }
+        }
+        decorate(px, pw, st);
+    };
+
     int x = x_from;
     while (x <= x_to) {
-        const vt::Cell& head = term.view_cell(x, y);
-        if (head.width == 0) {  // 孤立した右半分（通常ここには来ない）
+        const vt::Cell& c = term.view_cell(x, y);
+        if (c.width == 0) {  // 孤立した右半分（通常ここには来ない）
             ++x;
             continue;
         }
-
-        auto effective = [&](int cx, const vt::Cell& c, uint16_t& fg, uint16_t& bg) {
-            fg = pal_[c.attr.fg];
-            bg = pal_[c.attr.bg];
-            // 太字は明色化する (専用のボールドフォントは無い)。xterm 系と同じ扱い。
-            if ((c.attr.flags & vt::kBold) && c.attr.fg < 8) fg = pal_[c.attr.fg + 8];
-            const bool reverse = (c.attr.flags & vt::kReverse) != 0;
-            // カーソルは反転ブロック。反転属性と重なったら二重反転で元に戻る。
-            const bool on_cursor =
-                cursor_here && (cx == cursor_x || (c.width == 2 && cx + 1 == cursor_x));
-            if (reverse != on_cursor) std::swap(fg, bg);
-        };
-
-        uint16_t fg = 0, bg = 0;
-        effective(x, head, fg, bg);
-        const uint16_t flags = head.attr.flags & (vt::kUnderline | vt::kStrike | vt::kInvisible);
-
-        const int start_x = x;
-        std::string run;
-        while (x <= x_to) {
-            const vt::Cell& c = term.view_cell(x, y);
-            if (c.width == 0) {
-                ++x;
-                continue;
+        const Style st = style_of(x, c);
+        const Glyph g  = resolve(c.ch, c.width);
+        if (run_x >= 0 && (g.kind != Kind::kFont || st != run_st)) flush(x);
+        if (g.kind == Kind::kFont) {
+            if (run_x < 0) {
+                run_x  = x;
+                run_st = st;
             }
-            uint16_t cfg = 0, cbg = 0;
-            effective(x, c, cfg, cbg);
-            if (cfg != fg || cbg != bg ||
-                (c.attr.flags & (vt::kUnderline | vt::kStrike | vt::kInvisible)) != flags) {
-                break;
-            }
-            append_utf8(run, (c.ch == 0) ? ' ' : c.ch);
-            x += c.width;
+            append_utf8(run, g.cp);
+        } else {
+            draw_alone(x, c.width, st, g);
         }
-        if (run.empty()) continue;
-
-        const int px    = start_x * cell_w_;
-        const int width = (x - start_x) * cell_w_;
-
-        // 既定背景のまま・空白だけ・装飾なしなら fillSprite の結果で足りる。
-        const bool all_blank = run.find_first_not_of(' ') == std::string::npos;
-        if (all_blank && bg == pal_[vt::kDefaultBg] && flags == 0) continue;
-
-        row_.fillRect(px, 0, width, cell_h_, bg);
-        if (!all_blank && (flags & vt::kInvisible) == 0) {
-            row_.setTextColor(fg, bg);
-            row_.drawString(run.c_str(), px, 0);
-        }
-        if (flags & vt::kUnderline) row_.drawFastHLine(px, cell_h_ - 2, width, fg);
-        if (flags & vt::kStrike) row_.drawFastHLine(px, cell_h_ / 2, width, fg);
+        x += c.width;
     }
+    flush(x);
 
     const int64_t t_push = esp_timer_get_time();
     last_draw_us_ += static_cast<uint32_t>(t_push - t_draw);

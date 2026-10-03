@@ -87,6 +87,12 @@ jobs:
               -I main -o /tmp/test_kbd_keys main/test_kbd_keys.cpp
           /tmp/test_kbd_keys
 
+      - name: 罫線・ブロック・点字の作図 (#100)
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \
+              -I main -o /tmp/test_term_glyphs main/test_term_glyphs.cpp main/term_glyphs.cpp
+          /tmp/test_term_glyphs
+
       - name: 端末領域のダブルタップ判定
         run: |
           c++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined \

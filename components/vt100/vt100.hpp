@@ -4,8 +4,9 @@
 // バッファが更新され、UI 側はセルを読んで描画する。ホスト (macOS/Linux) でもそのまま
 // ビルドできるので、テストは実機を使わずに回す。
 //
-// 対応範囲: カーソル移動、消去、SGR (256色 + 24bit色は近似)、スクロール領域、
-//           代替画面バッファ、DECAWM、挿入削除、タブ、UTF-8、East Asian Width。
+// 対応範囲: カーソル移動、消去、SGR (256色 + 24bit色)、スクロール領域、
+//           代替画面バッファ、DECAWM、挿入削除、タブ、UTF-8、East Asian Width、
+//           DEC 特殊図形 (罫線)、REP、同期出力 (?2026)、色の問い合わせ (OSC 4/10/11)。
 #pragma once
 
 #include <cstddef>
@@ -27,15 +28,25 @@ enum AttrFlag : uint16_t {
     kStrike    = 1 << 7,
 };
 
-// 色は 256 色パレットの番号 (0-255)。24bit 色 (SGR 38;2;r;g;b) は最近似に丸める。
+// 色は 0-255 が 256 色パレットの番号、kRgb が立っていれば下位 24bit が RGB。
 // 既定色はパレット外の値で表す。パレット内の番号を流用すると ESC[38;5;255m や
 // 24bit の明るいグレーが「既定色」に潰れる。
-constexpr uint16_t kDefaultFg = 256;
-constexpr uint16_t kDefaultBg = 257;
+// 24bit を 256 色に丸めていた頃は、opencode の背景 (10,10,10) と枠 (30,30,30) が
+// 段差 20 の灰色 2 段に潰れていた。
+constexpr uint32_t kDefaultFg = 256;
+constexpr uint32_t kDefaultBg = 257;
+constexpr uint32_t kRgb       = 1u << 24;
+constexpr uint32_t rgb(int r, int g, int b)
+{
+    return kRgb | (static_cast<uint32_t>(r) << 16) | (static_cast<uint32_t>(g) << 8) | static_cast<uint32_t>(b);
+}
+// 色を RGB にする。パレット番号は xterm の既定値、既定色は前景 229 灰 / 背景 黒。
+// 描画と OSC 4/10/11 の応答が同じ表を見るためにここに置く。
+void color_rgb(uint32_t color, uint8_t& r, uint8_t& g, uint8_t& b);
 
 struct Attr {
-    uint16_t fg    = kDefaultFg;
-    uint16_t bg    = kDefaultBg;
+    uint32_t fg    = kDefaultFg;
+    uint32_t bg    = kDefaultBg;
     uint16_t flags = 0;
 
     bool operator==(const Attr& o) const
@@ -98,6 +109,9 @@ public:
     uint32_t bell_count() const { return bell_count_; }
 
     bool alt_screen() const { return alt_active_; }
+    // 同期出力 (DECSET 2026) の最中か。描画側はこの間フレームを出さない（途中の画面を見せない）。
+    // 閉じ忘れたアプリで画面が止まらないよう、待つ上限は描画側が持つ。
+    bool synchronized() const { return synchronized_; }
     bool bracketed_paste() const { return bracketed_paste_; }
     bool app_cursor_keys() const { return app_cursor_keys_; }
 
@@ -146,7 +160,7 @@ private:
     enum class State {
         kGround,
         kEsc,
-        kEscIntermediate,  // ESC ( ) * + # の次の 1 バイトを読み捨てる
+        kEscIntermediate,  // ESC ( ) * + # SP の次の 1 バイト (文字集合の指定など)
         kCsiParam,
         kOsc,
         kOscEsc,  // OSC 文字列中に ESC が来た (ST = ESC \ の待ち)
@@ -163,7 +177,10 @@ private:
     void exec_esc(uint8_t b);
     void exec_csi(uint8_t final_byte);
     void exec_sgr();
+    void exec_osc();
     void set_mode(bool enable);
+    void report_mode(int mode);  // DECRQM
+    void soft_reset();           // DECSTR
 
     void mark_dirty(int y);
     // 列範囲つき。x2 < 0 なら行全体。
@@ -217,6 +234,16 @@ private:
     bool reverse_video_   = false;
     bool bracketed_paste_ = false;
     bool app_cursor_keys_ = false;
+    bool synchronized_    = false;
+
+    // 文字集合。G0/G1 のどちらが DEC 特殊図形か (ESC ( 0 / ESC ) 0) と、
+    // どちらを使っているか (SO/SI)。ncurses は罫線をこれで描く。
+    // ponytail: DECSC で文字集合を退避しない。退避と復元の間で切り替えるアプリが出たら足す。
+    bool g_graphics_[2] = {false, false};
+    int  gl_            = 0;
+    uint8_t esc_inter_  = 0;
+    // REP (CSI b) が繰り返す、直前に置いた文字。
+    uint32_t last_cp_   = 0;
 
     std::vector<bool> tab_stops_;
 
@@ -236,11 +263,16 @@ private:
 
     State                state_ = State::kGround;
     std::vector<int>     params_;
+    // params_[i] が ':' で区切られたサブパラメータなら bit i が立つ (SGR 4:3 や 38:2::r:g:b)。
+    // ';' と同じに扱うと 4:3 が「下線 + 斜体」、58:2::r:g:b が「dim + ...」になる。
+    uint32_t             sub_mask_       = 0;
+    bool                 next_sub_       = false;
     bool                 param_seen_     = false;
     bool                 param_overflow_ = false;
     uint8_t              csi_private_ = 0;
     uint8_t              csi_inter_   = 0;
     std::string          osc_;
+    bool                 osc_bel_ = false;  // OSC が BEL で終わったか (応答も同じ終端で返す)
 
     // UTF-8 デコーダの持ち越し状態 (write() 境界で分断されるため)
     uint32_t utf8_cp_        = 0;
