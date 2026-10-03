@@ -600,7 +600,10 @@ void Terminal::set_mode(bool enable)
                     switch_alt(enable, /*clear=*/enable, /*save_restore_cursor=*/true);
                     break;
                 case 2004: bracketed_paste_ = enable; break;
-                case 2026: synchronized_ = enable; break;
+                case 2026:
+                    if (enable) ++sync_generation_;
+                    synchronized_ = enable;
+                    break;
                 default: break;  // マウス報告 (1000 系) などは未対応
             }
         } else {
@@ -820,6 +823,8 @@ void Terminal::exec_csi(uint8_t f)
                 clear_region(0, rows_ * cols_);
             } else if (mode == 3) {
                 // 画面ではなくスクロールバックを消す (Claude Code の /clear が 2J の後に送る)。
+                // 履歴を見ている最中なら表示が最新に戻るので描き直させる。
+                if (view_offset_ != 0) mark_all_dirty();
                 sb_count_    = 0;
                 sb_head_     = 0;
                 view_offset_ = 0;

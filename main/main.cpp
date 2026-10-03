@@ -4649,12 +4649,17 @@ extern "C" void app_main(void)
                 // 同期出力 (?2026) の間は描かない。Claude Code / codex / opencode は
                 // 1 フレームをこれで囲むので、途中の画面（消した直後の空白など）を出さずに済む。
                 // 閉じ忘れたアプリで画面が止まらないよう、待つのは kSyncHoldUs まで。
+                // 待ち始めはフレームごと (?2026h ごと) に取り直す。
                 constexpr int64_t kSyncHoldUs = 100 * 1000;
                 static int64_t    sync_since  = 0;
+                static uint32_t   sync_gen    = 0;
                 bool              hold        = false;
                 if (term->synchronized()) {
                     const int64_t now = esp_timer_get_time();
-                    if (sync_since == 0) sync_since = now;
+                    if (sync_since == 0 || sync_gen != term->sync_generation()) {
+                        sync_since = now;
+                        sync_gen   = term->sync_generation();
+                    }
                     hold = now - sync_since < kSyncHoldUs;
                 } else {
                     sync_since = 0;

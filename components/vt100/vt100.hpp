@@ -112,6 +112,9 @@ public:
     // 同期出力 (DECSET 2026) の最中か。描画側はこの間フレームを出さない（途中の画面を見せない）。
     // 閉じ忘れたアプリで画面が止まらないよう、待つ上限は描画側が持つ。
     bool synchronized() const { return synchronized_; }
+    // ?2026h を受けるたびに増える。フレームが続けて来たとき、描画側が待ち始めを
+    // 前のフレームから持ち越さないために見る（持ち越すと上限を超えて途中の画面を出す）。
+    uint32_t sync_generation() const { return sync_generation_; }
     bool bracketed_paste() const { return bracketed_paste_; }
     bool app_cursor_keys() const { return app_cursor_keys_; }
 
@@ -235,6 +238,7 @@ private:
     bool bracketed_paste_ = false;
     bool app_cursor_keys_ = false;
     bool synchronized_    = false;
+    uint32_t sync_generation_ = 0;
 
     // 文字集合。G0/G1 のどちらが DEC 特殊図形か (ESC ( 0 / ESC ) 0) と、
     // どちらを使っているか (SO/SI)。ncurses は罫線をこれで描く。

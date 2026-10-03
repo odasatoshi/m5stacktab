@@ -728,6 +728,10 @@ void test_tui_sequences()
         t.write("\033[?2026$p\033[?2026h\033[?2026$p\033[?9999$p");
         CHECK_STR(reply, "\033[?2026;2$y\033[?2026;1$y\033[?9999;0$y");
         CHECK(t.synchronized());
+        const uint32_t gen = t.sync_generation();
+        t.write("\033[?2026l\033[?2026h");  // 次のフレーム: 世代が進む
+        CHECK(t.synchronized());
+        CHECK(t.sync_generation() == gen + 1);
         t.write("\033[?2026l");
         CHECK(!t.synchronized());
         reply.clear();
@@ -792,6 +796,13 @@ void test_tui_sequences()
         t.write("\033[3J");
         CHECK_EQ(t.scrollback_lines(), 0);
         CHECK_STR(t.row_text(2), "d");
+        // 履歴を見ている最中に 3J だけが来たら、最新に戻して全行を描き直させる
+        t.write("\r\ne\r\nf");
+        CHECK(t.scroll_view(1) == 1);
+        t.clear_dirty();
+        t.write("\033[3J");
+        CHECK_EQ(t.view_offset(), 0);
+        CHECK(t.is_dirty(0) && t.is_dirty(2));
     }
 }
 
