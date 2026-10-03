@@ -135,8 +135,10 @@ public:
     // バッファは呼び出し側が用意する (cols * max_lines 個の Cell)。ESP-IDF 側は PSRAM から
     // 確保して渡す。コア側で確保するとアロケータを選べないため。
     // **resize() の扱い**: 桁数が変わったときだけ履歴を破棄する（履歴は cols 単位で
-    // 詰めてあるので使い回せない）。行数だけの変更では履歴は残り、行が減って
-    // 画面から追い出される分はここに積まれる。view_offset はどちらでも 0 に戻る。
+    // 詰めてあるので使い回せない）。行数だけの変更では履歴は残る。行が減るときは
+    // カーソルより下から削り、足りない分だけ上から押し出してここに積む。行が増える
+    // ときはここから引き戻す（tmux と同じ。キーボードを閉じると元の画面に戻る）。
+    // view_offset はどちらでも 0 に戻る。
     // buffer は cols * max_lines 個。**cols は必須。** push_scrollback は現在の
     // cols_ でストライドするので、確保時と食い違うと呼び出し側のバッファを
     // 踏み越える（今は cols が変わらないので到達しない）。既定値を持たせると
@@ -197,6 +199,7 @@ private:
     void repair_row(int y);
     void clear_region(int from_index, int to_index);
     void switch_alt(bool enable, bool clear, bool save_restore_cursor);
+    int  resize_screen(std::vector<Cell>& src, int cursor_y, int cols, int rows, bool history);
     void scroll_up(int top, int bottom, int n);
     void scroll_down(int top, int bottom, int n);
     void index();      // カーソルを 1 行下げる (必要ならスクロール)

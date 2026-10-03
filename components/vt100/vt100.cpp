@@ -216,43 +216,62 @@ namespace {
 // resize / スクロール後は行全体を描き直す必要があるので、範囲は行全体にする。
 }  // namespace
 
+// 1 画面ぶんを rows 行 x cols 桁に詰め替える。行の増減は tmux (screen_resize_y) と同じ規則:
+//   縮める: **カーソルより下の行から削り**、足りない分だけ上から押し出す (history なら履歴へ)。
+//   広げる: history なら**履歴から引き戻し**、残りは下に空行を足す。
+// 戻り値は内容が下へ動いた行数 (上から押し出せば負)。カーソルと退避位置をこの分だけ動かす。
+//
+// 以前は常に上を捨てて下を残していた。シェルで clear した直後 (カーソルが上のほう) に
+// キーボードを出すと、プロンプトも出力も画面外へ押し出され、キーボードを閉じても
+// 戻らなかった (#100)。下を削れば消えるのは空行だけで、閉じれば履歴から戻る。
+int Terminal::resize_screen(std::vector<Cell>& src, int cursor_y, int cols, int rows, bool history)
+{
+    std::vector<Cell> dst(static_cast<size_t>(cols) * rows, Cell{});
+    const int copy_cols = std::min(cols, cols_);
+    auto copy_row = [&](const Cell* from, int to_y) {
+        std::copy(from, from + copy_cols, dst.begin() + static_cast<size_t>(to_y) * cols);
+    };
+    int shift = 0;
+    if (rows < rows_) {
+        const int need   = rows_ - rows;
+        const int bottom = std::clamp(rows_ - 1 - cursor_y, 0, need);
+        const int top    = need - bottom;
+        if (history) {
+            for (int y = 0; y < top; ++y) push_scrollback(&src[static_cast<size_t>(y) * cols_]);
+        }
+        for (int y = 0; y < rows; ++y) copy_row(&src[static_cast<size_t>(y + top) * cols_], y);
+        shift = -top;
+    } else {
+        // 履歴は cols_ 単位で詰めてあるので、桁数が変わるときは引き戻さない (resize が捨てる)。
+        const int pull = (history && cols == cols_ && sb_cols_ == cols_) ? std::min(rows - rows_, sb_count_) : 0;
+        for (int i = 0; i < pull; ++i) copy_row(sb_line(pull - i), i);  // 古い順に上から
+        sb_count_ -= pull;
+        sb_head_ = (sb_head_ - pull + sb_max_) % std::max(1, sb_max_);
+        for (int y = 0; y < rows_; ++y) copy_row(&src[static_cast<size_t>(y) * cols_], y + pull);
+        shift = pull;
+    }
+    src.swap(dst);
+    return shift;
+}
+
 void Terminal::resize(int cols, int rows)
 {
     cols = std::max(2, cols);
     rows = std::max(1, rows);
     if (cols == cols_ && rows == rows_) return;
 
-    // 行が減るときに画面から追い出される行。**捨てずにスクロールバックへ積む。**
-    // 積まないと、キーボードやメニューの表示を切り替えるたびにその分の行が
-    // 画面にもスクロールバックにも無い状態になり、履歴に穴があく（実機で確認:
-    // 29 行 → 15 行で 14 行が消えた）。桁数が変わるときは履歴自体を捨てるので積まない。
-    auto regrow = [&](std::vector<Cell>& src, bool push_evicted) {
-        std::vector<Cell> dst(static_cast<size_t>(cols) * rows, Cell{});
-        // 下端を保ったまま詰め替える。行が減る場合は上を捨てる (シェルの挙動に近い)。
-        int copy_rows = std::min(rows, rows_);
-        int copy_cols = std::min(cols, cols_);
-        int src_off   = rows_ - copy_rows;
-        if (push_evicted) {
-            for (int y = 0; y < src_off; ++y) {
-                push_scrollback(&src[static_cast<size_t>(y) * cols_]);
-            }
-        }
-        for (int y = 0; y < copy_rows; ++y) {
-            for (int x = 0; x < copy_cols; ++x) {
-                dst[static_cast<size_t>(y) * cols + x] =
-                    src[static_cast<size_t>(y + src_off) * cols_ + x];
-            }
-        }
-        src.swap(dst);
-    };
-    const int old_rows = rows_;
     const int old_cols = cols_;
-    // 追い出す行を積むのは、桁数が変わらない主画面のときだけ。
-    // 代替画面 (vim など) の内容は履歴に入れない（本家の端末も入れない）。
-    regrow(main_, cols == old_cols && !alt_active_);
-    regrow(alt_, false);
+    // 代替画面 (vim など) の内容は履歴に入れないし、履歴からも引き戻さない (本家の端末と同じ)。
+    // 主画面は、代替画面にいる間は入ったときのカーソル位置を基準にする。
+    // 使っていない代替画面は上を残す (入るときに消すので中身は意味を持たない)。
+    const int main_shift =
+        resize_screen(main_, alt_active_ ? alt_entry_.y : cur_.y, cols, rows, /*history=*/true);
+    const int alt_shift = resize_screen(alt_, alt_active_ ? cur_.y : 0, cols, rows, /*history=*/false);
+    cur_.y += alt_active_ ? alt_shift : main_shift;
+    saved_main_.y += main_shift;
+    saved_alt_.y += alt_shift;
+    alt_entry_.y += main_shift;
 
-    cur_.y -= std::max(0, old_rows - rows);
     cols_ = cols;
     rows_ = rows;
     dirty_.assign(rows_, true);

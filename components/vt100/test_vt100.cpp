@@ -286,6 +286,47 @@ void test_tabs_and_bs()
     CHECK_CH(t.cell(7, 0).ch, 'Z');
 }
 
+// 行を減らすときはカーソルより下から削る (tmux と同じ, #100)。
+// 上を捨てていた頃は、シェルで clear した直後にキーボードを出すとプロンプトも
+// 出力も画面外へ消え、キーボードを閉じても戻らなかった。
+void test_resize_trims_below_cursor()
+{
+    Terminal              t(10, 6);
+    std::vector<vt::Cell> sb(10 * 10);
+    t.set_scrollback(sb.data(), 10, 10);
+    t.write("$ ls\r\na b\r\n$ ");  // カーソルは 2 行目、下に 3 行の空き
+    t.write("\0337");              // DECSC も一緒に動くか見る
+    t.resize(10, 3);
+    CHECK_STR(t.row_text(0), "$ ls");
+    CHECK_STR(t.row_text(2), "$");
+    CHECK_EQ(t.cursor_y(), 2);
+    CHECK_EQ(t.scrollback_lines(), 0);  // 削ったのは空行だけ
+    // 下が足りなければ残りは上から履歴へ (DECSC の位置も同じだけ上へ)
+    t.resize(10, 2);
+    CHECK_STR(t.row_text(0), "a b");
+    CHECK_EQ(t.scrollback_lines(), 1);
+    CHECK_EQ(t.cursor_y(), 1);
+    t.write("\033[1;1H\0338");
+    CHECK_EQ(t.cursor_y(), 1);
+    // 戻すと履歴から引き戻して元の並びになる
+    t.resize(10, 6);
+    CHECK_STR(t.row_text(0), "$ ls");
+    CHECK_STR(t.row_text(1), "a b");
+    CHECK_EQ(t.cursor_y(), 2);
+    CHECK_EQ(t.scrollback_lines(), 0);
+
+    // 代替画面にいる間: 代替画面は自分のカーソルで、主画面は入ったときの位置で削る。
+    // 主画面の内容は抜けたときに元の位置で戻る。
+    Terminal u(10, 6);
+    u.write("top\r\n$ ");
+    u.write("\033[?1049h\033[6;1Halt");
+    u.resize(10, 3);
+    CHECK_STR(u.row_text(2), "alt");  // 代替画面はカーソル (最下行) を保って上から削る
+    u.write("\033[?1049l");
+    CHECK_STR(u.row_text(0), "top");
+    CHECK_EQ(u.cursor_y(), 1);
+}
+
 void test_resize()
 {
     Terminal t(10, 3);
@@ -596,9 +637,11 @@ void test_resize_keeps_scrollback()
     // **縮めた分は追い出されて履歴に積まれる**（3 行 → 2 行なので 1 行増える）。
     t.resize(10, 2);
     CHECK(t.scrollback_lines() == 4);
-    // 広げるときは何も追い出さないので増えない。
+    // 広げるときは履歴から引き戻す（キーボードを閉じたら元の画面に戻る）。
     t.resize(10, 3);
-    CHECK(t.scrollback_lines() == 4);
+    CHECK(t.scrollback_lines() == 3);
+    CHECK(t.row_text(0) == "d");
+    CHECK(t.row_text(2) == "f");
     // 見ている位置は最新に戻る。
     CHECK(t.view_offset() == 0);
     CHECK(t.scroll_view(2) == 2);
@@ -638,10 +681,14 @@ void test_resize_keeps_scrollback()
         CHECK(t2.view_row_text(0) == "4");
         CHECK(t2.view_row_text(1) == "5");
 
-        // 広げるときは何も追い出さない。
-        const int held = t2.scrollback_lines();
+        // 広げるときは履歴から引き戻す。3 行あるので 4 行広げても 3 行だけ戻り、
+        // 残り 1 行は下に空行が足される。カーソルは "5" の行に付いていく。
         t2.resize(10, 6);
-        CHECK(t2.scrollback_lines() == held);
+        CHECK(t2.scrollback_lines() == 0);
+        CHECK(t2.row_text(0) == "1");
+        CHECK(t2.row_text(4) == "5");
+        CHECK(t2.row_text(5) == "");
+        CHECK(t2.cursor_y() == 4);
     }
 
     // 代替画面の内容は履歴に入れない（本家の端末も入れない）。
@@ -678,7 +725,7 @@ void test_resize_keeps_scrollback()
     }
 
     // 桁数が変わったら捨てる（履歴は cols 単位で詰めてあるので使い回せない）。
-    CHECK(t.scrollback_lines() == 4);
+    CHECK(t.scrollback_lines() == 2);  // 3 → 4 行で 1 行引き戻した残り
     t.resize(12, 4);
     CHECK(t.scrollback_lines() == 0);
     // **桁数が確保時と食い違ったままなので、以後は積まれない（#45）。**
@@ -821,6 +868,7 @@ int main()
     test_replies_and_title();
     test_tabs_and_bs();
     test_resize();
+    test_resize_trims_below_cursor();
     test_real_sequences();
     test_review_regressions();
     test_dirty_range();
