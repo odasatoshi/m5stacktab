@@ -53,7 +53,11 @@ def main() -> int:
     with serial.Serial(args.port, 115200, timeout=0.2) as s:
         s.rts = False
         s.dtr = False
+        # メニューを閉じると画面キーボードが出て端末の行数が減る。採ったときの寸法
+        # (全画面) に合わせるため、キーボードも畳む。
         s.write(b"menu hide\r\n")
+        time.sleep(0.5)
+        s.write(b"kbd off\r\n")
         time.sleep(0.5)
         s.reset_input_buffer()
         # 1 行ずつ「wrote」を待ってから次を送る。待たずに送るとコンソールの受信が溢れる。
