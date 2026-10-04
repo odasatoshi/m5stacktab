@@ -2,6 +2,7 @@
 // 今の段階では「画面にターミナルを描く土台」と「WiFi 接続」まで。
 // SSH セッションを繋ぐのは #5 / #6。
 #include <cstdint>
+#include <cctype>
 #include <cstdlib>
 #include <utility>
 #include <algorithm>
@@ -270,6 +271,16 @@ std::string unescape(const char* src)
             case 't': out += '\t'; break;
             case 'a': out += '\a'; break;
             case '\\': out += '\\'; break;
+            case 'x': {  // \xHH: 任意のバイト (空白や UTF-8 を argv の分割に潰されずに送る)
+                if (!std::isxdigit(static_cast<unsigned char>(p[1])) ||
+                    !std::isxdigit(static_cast<unsigned char>(p[2]))) {
+                    return out;
+                }
+                const char h[3] = {p[1], p[2], '\0'};
+                out += static_cast<char>(std::strtol(h, nullptr, 16));
+                p += 2;
+                break;
+            }
             case '\0': return out;
             default: out += *p; break;
         }
@@ -309,7 +320,7 @@ int cmd_termdump(int, char**)
 int cmd_term(int argc, char** argv)
 {
     if (argc < 2) {
-        std::printf("usage: term <text>   (\\\\e=ESC \\\\r=CR \\\\n \\\\t \\\\a"
+        std::printf("usage: term <text>   (\\\\e=ESC \\\\r=CR \\\\n \\\\t \\\\a \\\\xHH"
                     " — コンソールでは二重にする)\n");
         return 1;
     }
@@ -969,7 +980,10 @@ void send_input(const std::string& s)
     // **SSH へ送る前に見る。** 入力中のパスワードをリモートに漏らさない。
     if (line_prompt_input(s)) return;
     if (ssh_is_connected()) {
-        ssh_send(s.data(), s.size());
+        // 失敗したら打鍵が失われているので、少なくとも痕跡を残す。
+        if (esp_err_t err = ssh_send(s.data(), s.size()); err != ESP_OK) {
+            ESP_LOGW(TAG, "key input dropped (%u bytes): %s", (unsigned)s.size(), esp_err_to_name(err));
+        }
         return;
     }
     // **未接続のエコーだけ手当てする。** リモートへ送るバイトは正しい
@@ -4481,7 +4495,9 @@ extern "C" void app_main(void)
     term->write("console: term / termtest / wifi / ssh / key\r\n");
     // DSR/CPR や DA の応答をリモートへ返す。vim などがこれを待つ。
     term->set_reply([](const std::string& s) {
-        if (ssh_is_connected()) ssh_send(s.data(), s.size());
+        if (ssh_is_connected() && ssh_send(s.data(), s.size()) != ESP_OK) {
+            ESP_LOGW(TAG, "terminal reply dropped (%u bytes)", (unsigned)s.size());
+        }
     });
     renderer->render(*term, /*force=*/true);
     ESP_LOGI(TAG, "first full draw: %d rows in %u us (draw %u / push %u)",
@@ -4512,6 +4528,10 @@ extern "C" void app_main(void)
                 // 端末に移るのは set_menu_visible の仕事（画面キーボードの再表示と
                 // 行数の張り直しがここにある）。直に set_visible すると隠れたままになる。
                 set_menu_visible(false);
+                // **繋がっていれば端末に戻るだけ。** 続けると「connecting...」を端末に
+                // 書いてから ssh_connect が INVALID_STATE で失敗し、動いている TUI
+                // (herdr など) の画面にその 1 行が割り込む（実機で発生, #100）。
+                if (ssh_is_connected()) break;
                 // 保存済みの設定で繋ぐ。無ければ端末にそう出す。
                 SshConfig cfg;
                 if (ssh_config_load(cfg) != ESP_OK || cfg.host.empty()) {
@@ -4635,9 +4655,27 @@ extern "C" void app_main(void)
                     refresh_wifi_nets();  // 繋がった / 切れたで `*` が動く (#56)
                     menu->refresh();
                 }
+                // 同期出力 (?2026) の間は描かない。Claude Code / codex / opencode は
+                // 1 フレームをこれで囲むので、途中の画面（消した直後の空白など）を出さずに済む。
+                // 閉じ忘れたアプリで画面が止まらないよう、待つのは kSyncHoldUs まで。
+                // 待ち始めはフレームごと (?2026h ごと) に取り直す。
+                constexpr int64_t kSyncHoldUs = 100 * 1000;
+                static int64_t    sync_since  = 0;
+                static uint32_t   sync_gen    = 0;
+                bool              hold        = false;
+                if (term->synchronized()) {
+                    const int64_t now = esp_timer_get_time();
+                    if (sync_since == 0 || sync_gen != term->sync_generation()) {
+                        sync_since = now;
+                        sync_gen   = term->sync_generation();
+                    }
+                    hold = now - sync_since < kSyncHoldUs;
+                } else {
+                    sync_since = 0;
+                }
                 if (menu->visible()) {
                     menu->draw();
-                } else if (term->any_dirty()) {
+                } else if (term->any_dirty() && !hold) {
                     render_term();
                 }
             }

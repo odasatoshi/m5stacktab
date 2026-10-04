@@ -9,6 +9,7 @@
 #include <arpa/inet.h>
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <freertos/stream_buffer.h>
 #include <freertos/task.h>
 #include <lwip/netdb.h>
@@ -37,6 +38,12 @@ constexpr size_t      kTxBufSize    = 1024;
 
 StreamBufferHandle_t s_rx     = nullptr;  // リモート → 端末
 StreamBufferHandle_t s_tx     = nullptr;  // 端末 → リモート
+// s_tx の書き手を 1 つにする。ストリームバッファは書き手 1 つが前提で、満杯で 1 つが
+// 待っている間に別のタスクが書くと assert (xTaskWaitingToSend == NULL) で落ちる。
+// 書き手は kbd タスク (純正キーボード)・メインループ (画面キーボードと端末の応答)・
+// コンソール (key)。#100 で OSC 4 に答えるようにしてから、herdr の 256 色の問い合わせで
+// 応答が 1KB を超えて待ちが起き、その間に打鍵すると落ちた（実機で再現）。
+SemaphoreHandle_t    s_tx_lock = nullptr;
 TaskHandle_t         s_task   = nullptr;
 volatile bool        s_run    = false;
 volatile bool        s_online = false;
@@ -440,6 +447,26 @@ void ssh_task(void*)
                  (unsigned)uxTaskGetStackHighWaterMark(nullptr));
 
         char buf[1024];
+        // 端末 → リモート。溜まっている分を送り出す。送ったら true。
+        char tx[1024];
+        auto flush_tx = [&]() {
+            const size_t len = xStreamBufferReceive(s_tx, tx, sizeof(tx), 0);
+            size_t       off = 0;
+            while (off < len && s_run) {
+                ssize_t w = libssh2_channel_write(channel, tx + off, len - off);
+                if (w == LIBSSH2_ERROR_EAGAIN) {
+                    wait_socket(sock, session, 50);
+                    continue;
+                }
+                if (w < 0) {
+                    set_error("channel write error: %d", (int)w);
+                    s_run = false;
+                    break;
+                }
+                off += w;
+            }
+            return len > 0;
+        };
         while (s_run) {
             bool idle = true;
 
@@ -453,9 +480,14 @@ void ssh_task(void*)
             if (n > 0) {
                 idle = false;
                 // 端末が詰まっているときは捨てずに待つ（画面が壊れるので取りこぼしは許さない）。
+                // **待つ間も端末 → リモートは送り出す。** メインループは s_rx を読む途中で
+                // 端末の応答 (OSC 4 など) を ssh_send し、s_tx の空きを待つ。ここで s_rx の
+                // 空きだけを待つと、互いに相手を待って ssh_send のタイムアウトまで止まり、
+                // その間の打鍵と応答が失われる（実機で再現, #100）。
                 size_t sent = 0;
                 while (sent < static_cast<size_t>(n) && s_run) {
-                    sent += xStreamBufferSend(s_rx, buf + sent, n - sent, pdMS_TO_TICKS(100));
+                    sent += xStreamBufferSend(s_rx, buf + sent, n - sent, pdMS_TO_TICKS(20));
+                    if (sent < static_cast<size_t>(n)) flush_tx();
                 }
             } else if (n == LIBSSH2_ERROR_EAGAIN) {
                 // 何もない
@@ -468,26 +500,7 @@ void ssh_task(void*)
                 break;
             }
 
-            // 端末 → リモート
-            size_t len = xStreamBufferReceive(s_tx, buf, sizeof(buf), 0);
-            if (len > 0) {
-                idle       = false;
-                size_t off = 0;
-                while (off < len && s_run) {
-                    ssize_t w = libssh2_channel_write(channel, buf + off, len - off);
-                    if (w == LIBSSH2_ERROR_EAGAIN) {
-                        wait_socket(sock, session, 50);
-                        continue;
-                    }
-                    if (w < 0) {
-                        set_error("channel write error: %d", (int)w);
-                        off = len;
-                        s_run = false;
-                        break;
-                    }
-                    off += w;
-                }
-            }
+            if (flush_tx()) idle = false;
 
             if (idle) wait_socket(sock, session, 50);
         }
@@ -626,7 +639,8 @@ esp_err_t ssh_connect(const SshConfig& cfg, int cols, int rows)
 
     if (!s_rx) s_rx = xStreamBufferCreate(kRxBufSize, 1);
     if (!s_tx) s_tx = xStreamBufferCreate(kTxBufSize, 1);
-    if (!s_rx || !s_tx) {
+    if (!s_tx_lock) s_tx_lock = xSemaphoreCreateMutex();
+    if (!s_rx || !s_tx || !s_tx_lock) {
         set_error("stream buffer alloc failed");
         return ESP_ERR_NO_MEM;
     }
@@ -665,8 +679,34 @@ bool ssh_is_connected(void) { return s_online; }
 
 esp_err_t ssh_send(const void* data, size_t len)
 {
-    if (!s_online || !s_tx) return ESP_ERR_INVALID_STATE;
-    size_t sent = xStreamBufferSend(s_tx, data, len, pdMS_TO_TICKS(100));
+    if (!s_online || !s_tx || !s_tx_lock) return ESP_ERR_INVALID_STATE;
+    // **1 回の呼び出しで渡されたものは送り切る。** 途中で諦めると、端末の応答
+    // (ESC ] 4 ; ... など) が切れた形で届き、残りがリモートで打鍵として解釈される。
+    // 上限は描画ロック (TermGuard) の 2 秒より短くする。メインループは描画ロックを
+    // 握ったまま応答を送るので、ここで待つ間ほかの描画が止まる。
+    constexpr TickType_t kLimit = pdMS_TO_TICKS(1000);
+    const TickType_t     start = xTaskGetTickCount();
+    if (xSemaphoreTake(s_tx_lock, kLimit) != pdTRUE) return ESP_ERR_TIMEOUT;
+    const auto* p    = static_cast<const uint8_t*>(data);
+    size_t      sent = 0;
+    if (len <= kTxBufSize) {
+        // 丸ごと入る大きさなら、空くまで待って一度に入れる。間に合わなければ何も入れない
+        // （端末の応答は 1 件 30 バイト程度なので、切れた形で届くことがなくなる）。
+        while (s_online && xTaskGetTickCount() - start < kLimit) {
+            if (xStreamBufferSpacesAvailable(s_tx) >= len) {
+                sent = xStreamBufferSend(s_tx, p, len, 0);
+                break;
+            }
+            vTaskDelay(1);
+        }
+    } else {
+        // ponytail: バッファより大きいもの (長い貼り付け) は分けて入れるので、
+        // 上限に当たると途中までになる。貼り付けで問題になったら呼び出し側で分ける。
+        while (sent < len && s_online && xTaskGetTickCount() - start < kLimit) {
+            sent += xStreamBufferSend(s_tx, p + sent, len - sent, pdMS_TO_TICKS(50));
+        }
+    }
+    xSemaphoreGive(s_tx_lock);
     return sent == len ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 

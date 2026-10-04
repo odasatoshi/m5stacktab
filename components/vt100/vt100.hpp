@@ -4,8 +4,9 @@
 // バッファが更新され、UI 側はセルを読んで描画する。ホスト (macOS/Linux) でもそのまま
 // ビルドできるので、テストは実機を使わずに回す。
 //
-// 対応範囲: カーソル移動、消去、SGR (256色 + 24bit色は近似)、スクロール領域、
-//           代替画面バッファ、DECAWM、挿入削除、タブ、UTF-8、East Asian Width。
+// 対応範囲: カーソル移動、消去、SGR (256色 + 24bit色)、スクロール領域、
+//           代替画面バッファ、DECAWM、挿入削除、タブ、UTF-8、East Asian Width、
+//           DEC 特殊図形 (罫線)、REP、同期出力 (?2026)、色の問い合わせ (OSC 4/10/11)。
 #pragma once
 
 #include <cstddef>
@@ -27,15 +28,25 @@ enum AttrFlag : uint16_t {
     kStrike    = 1 << 7,
 };
 
-// 色は 256 色パレットの番号 (0-255)。24bit 色 (SGR 38;2;r;g;b) は最近似に丸める。
+// 色は 0-255 が 256 色パレットの番号、kRgb が立っていれば下位 24bit が RGB。
 // 既定色はパレット外の値で表す。パレット内の番号を流用すると ESC[38;5;255m や
 // 24bit の明るいグレーが「既定色」に潰れる。
-constexpr uint16_t kDefaultFg = 256;
-constexpr uint16_t kDefaultBg = 257;
+// 24bit を 256 色に丸めていた頃は、opencode の背景 (10,10,10) と枠 (30,30,30) が
+// 段差 20 の灰色 2 段に潰れていた。
+constexpr uint32_t kDefaultFg = 256;
+constexpr uint32_t kDefaultBg = 257;
+constexpr uint32_t kRgb       = 1u << 24;
+constexpr uint32_t rgb(int r, int g, int b)
+{
+    return kRgb | (static_cast<uint32_t>(r) << 16) | (static_cast<uint32_t>(g) << 8) | static_cast<uint32_t>(b);
+}
+// 色を RGB にする。パレット番号は xterm の既定値、既定色は前景 229 灰 / 背景 黒。
+// 描画と OSC 4/10/11 の応答が同じ表を見るためにここに置く。
+void color_rgb(uint32_t color, uint8_t& r, uint8_t& g, uint8_t& b);
 
 struct Attr {
-    uint16_t fg    = kDefaultFg;
-    uint16_t bg    = kDefaultBg;
+    uint32_t fg    = kDefaultFg;
+    uint32_t bg    = kDefaultBg;
     uint16_t flags = 0;
 
     bool operator==(const Attr& o) const
@@ -98,6 +109,12 @@ public:
     uint32_t bell_count() const { return bell_count_; }
 
     bool alt_screen() const { return alt_active_; }
+    // 同期出力 (DECSET 2026) の最中か。描画側はこの間フレームを出さない（途中の画面を見せない）。
+    // 閉じ忘れたアプリで画面が止まらないよう、待つ上限は描画側が持つ。
+    bool synchronized() const { return synchronized_; }
+    // ?2026h を受けるたびに増える。フレームが続けて来たとき、描画側が待ち始めを
+    // 前のフレームから持ち越さないために見る（持ち越すと上限を超えて途中の画面を出す）。
+    uint32_t sync_generation() const { return sync_generation_; }
     bool bracketed_paste() const { return bracketed_paste_; }
     bool app_cursor_keys() const { return app_cursor_keys_; }
 
@@ -118,8 +135,10 @@ public:
     // バッファは呼び出し側が用意する (cols * max_lines 個の Cell)。ESP-IDF 側は PSRAM から
     // 確保して渡す。コア側で確保するとアロケータを選べないため。
     // **resize() の扱い**: 桁数が変わったときだけ履歴を破棄する（履歴は cols 単位で
-    // 詰めてあるので使い回せない）。行数だけの変更では履歴は残り、行が減って
-    // 画面から追い出される分はここに積まれる。view_offset はどちらでも 0 に戻る。
+    // 詰めてあるので使い回せない）。行数だけの変更では履歴は残る。行が減るときは
+    // カーソルより下から削り、足りない分だけ上から押し出してここに積む。行が増える
+    // ときはここから引き戻す（tmux と同じ。キーボードを閉じると元の画面に戻る）。
+    // view_offset はどちらでも 0 に戻る。
     // buffer は cols * max_lines 個。**cols は必須。** push_scrollback は現在の
     // cols_ でストライドするので、確保時と食い違うと呼び出し側のバッファを
     // 踏み越える（今は cols が変わらないので到達しない）。既定値を持たせると
@@ -146,7 +165,7 @@ private:
     enum class State {
         kGround,
         kEsc,
-        kEscIntermediate,  // ESC ( ) * + # の次の 1 バイトを読み捨てる
+        kEscIntermediate,  // ESC ( ) * + # SP の次の 1 バイト (文字集合の指定など)
         kCsiParam,
         kOsc,
         kOscEsc,  // OSC 文字列中に ESC が来た (ST = ESC \ の待ち)
@@ -163,7 +182,10 @@ private:
     void exec_esc(uint8_t b);
     void exec_csi(uint8_t final_byte);
     void exec_sgr();
+    void exec_osc();
     void set_mode(bool enable);
+    void report_mode(int mode);  // DECRQM
+    void soft_reset();           // DECSTR
 
     void mark_dirty(int y);
     // 列範囲つき。x2 < 0 なら行全体。
@@ -177,6 +199,7 @@ private:
     void repair_row(int y);
     void clear_region(int from_index, int to_index);
     void switch_alt(bool enable, bool clear, bool save_restore_cursor);
+    int  resize_screen(std::vector<Cell>& src, int cursor_y, int cols, int rows, bool history);
     void scroll_up(int top, int bottom, int n);
     void scroll_down(int top, int bottom, int n);
     void index();      // カーソルを 1 行下げる (必要ならスクロール)
@@ -217,6 +240,17 @@ private:
     bool reverse_video_   = false;
     bool bracketed_paste_ = false;
     bool app_cursor_keys_ = false;
+    bool synchronized_    = false;
+    uint32_t sync_generation_ = 0;
+
+    // 文字集合。G0/G1 のどちらが DEC 特殊図形か (ESC ( 0 / ESC ) 0) と、
+    // どちらを使っているか (SO/SI)。ncurses は罫線をこれで描く。
+    // ponytail: DECSC で文字集合を退避しない。退避と復元の間で切り替えるアプリが出たら足す。
+    bool g_graphics_[2] = {false, false};
+    int  gl_            = 0;
+    uint8_t esc_inter_  = 0;
+    // REP (CSI b) が繰り返す、直前に置いた文字。
+    uint32_t last_cp_   = 0;
 
     std::vector<bool> tab_stops_;
 
@@ -226,6 +260,13 @@ private:
     int   sb_count_    = 0;   // 保持している行数
     int   sb_head_     = 0;   // 次に書く位置
     int   view_offset_ = 0;   // 0 = 最新
+    // 履歴の最新の何行が「端末がずっとこの高さより高かったら、まだ画面に見えていた行」か。
+    // resize で広げるときに引き戻すのはこの行数まで (#100)。数えずに履歴から引き戻すと、
+    // Ctrl-L (ED 2) で消した画面や vim に入る前の出力が、キーボードを閉じたときに戻ってくる。
+    // 縮めて押し出した分だけ増え、画面を消す操作と桁数の変更で 0 に戻る。
+    // 普通のスクロールでは変えない（背の高い端末でも同じ行数が押し出されるので、
+    // 見えていたはずなのは変わらず最新の行）。
+    int   sb_hidden_   = 0;
     int   sb_cols_     = 0;   // 履歴バッファを確保したときの桁数
     const Cell* sb_line(int lines_back) const;
     void  push_scrollback(const Cell* row);
@@ -236,11 +277,16 @@ private:
 
     State                state_ = State::kGround;
     std::vector<int>     params_;
+    // params_[i] が ':' で区切られたサブパラメータなら bit i が立つ (SGR 4:3 や 38:2::r:g:b)。
+    // ';' と同じに扱うと 4:3 が「下線 + 斜体」、58:2::r:g:b が「dim + ...」になる。
+    uint32_t             sub_mask_       = 0;
+    bool                 next_sub_       = false;
     bool                 param_seen_     = false;
     bool                 param_overflow_ = false;
     uint8_t              csi_private_ = 0;
     uint8_t              csi_inter_   = 0;
     std::string          osc_;
+    bool                 osc_bel_ = false;  // OSC が BEL で終わったか (応答も同じ終端で返す)
 
     // UTF-8 デコーダの持ち越し状態 (write() 境界で分断されるため)
     uint32_t utf8_cp_        = 0;

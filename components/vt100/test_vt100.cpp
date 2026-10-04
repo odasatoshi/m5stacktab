@@ -121,22 +121,22 @@ void test_sgr()
     Terminal t(10, 2);
     t.write("\033[1;31mR\033[0mN");
     CHECK(t.cell(0, 0).attr.flags & vt::kBold);
-    CHECK_EQ(t.cell(0, 0).attr.fg, 1);
+    CHECK_EQ(t.cell(0, 0).attr.fg, 1u);
     CHECK_EQ(t.cell(1, 0).attr.flags, 0);
     CHECK_EQ(t.cell(1, 0).attr.fg, vt::kDefaultFg);
 
     // 256 色
     t.write("\033[38;5;208mX");
-    CHECK_EQ(t.cell(2, 0).attr.fg, 208);
-    // 24bit 色は 256 色に丸める (捨てない)
+    CHECK_EQ(t.cell(2, 0).attr.fg, 208u);
+    // 24bit 色はそのまま持つ
     t.write("\033[38;2;255;0;0mY");
-    CHECK_EQ(t.cell(3, 0).attr.fg, 196);
+    CHECK_EQ(t.cell(3, 0).attr.fg, vt::rgb(255, 0, 0));
     // 明るい色
     t.write("\033[92mZ");
-    CHECK_EQ(t.cell(4, 0).attr.fg, 10);
+    CHECK_EQ(t.cell(4, 0).attr.fg, 10u);
     // 背景色つきで消去すると背景が残る
     t.write("\033[41m\033[2K");
-    CHECK_EQ(t.cell(0, 0).attr.bg, 1);
+    CHECK_EQ(t.cell(0, 0).attr.bg, 1u);
     CHECK_EQ(t.cell(0, 0).attr.flags, 0);
 }
 
@@ -286,6 +286,79 @@ void test_tabs_and_bs()
     CHECK_CH(t.cell(7, 0).ch, 'Z');
 }
 
+// 行を減らすときはカーソルより下から削る (tmux と同じ, #100)。
+// 上を捨てていた頃は、シェルで clear した直後にキーボードを出すとプロンプトも
+// 出力も画面外へ消え、キーボードを閉じても戻らなかった。
+void test_resize_trims_below_cursor()
+{
+    Terminal              t(10, 6);
+    std::vector<vt::Cell> sb(10 * 10);
+    t.set_scrollback(sb.data(), 10, 10);
+    t.write("$ ls\r\na b\r\n$ ");  // カーソルは 2 行目、下に 3 行の空き
+    t.write("\0337");              // DECSC も一緒に動くか見る
+    t.resize(10, 3);
+    CHECK_STR(t.row_text(0), "$ ls");
+    CHECK_STR(t.row_text(2), "$");
+    CHECK_EQ(t.cursor_y(), 2);
+    CHECK_EQ(t.scrollback_lines(), 0);  // 削ったのは空行だけ
+    // 下が足りなければ残りは上から履歴へ (DECSC の位置も同じだけ上へ)
+    t.resize(10, 2);
+    CHECK_STR(t.row_text(0), "a b");
+    CHECK_EQ(t.scrollback_lines(), 1);
+    CHECK_EQ(t.cursor_y(), 1);
+    t.write("\033[1;1H\0338");
+    CHECK_EQ(t.cursor_y(), 1);
+    // 戻すと履歴から引き戻して元の並びになる
+    t.resize(10, 6);
+    CHECK_STR(t.row_text(0), "$ ls");
+    CHECK_STR(t.row_text(1), "a b");
+    CHECK_EQ(t.cursor_y(), 2);
+    CHECK_EQ(t.scrollback_lines(), 0);
+
+    // 引き戻すのは縮めて押し出した分だけ。前からあった履歴は引き戻さない。
+    // 数えずに引き戻すと、Ctrl-L (ED 2) で消した画面がキーボードを閉じたときに戻ってくる。
+    {
+        Terminal              c(10, 4);
+        std::vector<vt::Cell> sb2(10 * 10);
+        c.set_scrollback(sb2.data(), 10, 10);
+        c.write("1\r\n2\r\n3\r\n4\r\n5\r\n6");  // 2 行が履歴へ (普通のスクロール)
+        CHECK_EQ(c.scrollback_lines(), 2);
+        c.resize(10, 6);                    // 押し出していないので引き戻さない
+        CHECK_STR(c.row_text(0), "3");
+        CHECK_EQ(c.scrollback_lines(), 2);
+        c.write("\033[2J\033[H$ ");        // Ctrl-L
+        c.resize(10, 3);                    // カーソルは行 0: 下の空行だけ削る
+        c.resize(10, 6);
+        CHECK_STR(c.row_text(0), "$");      // 消した画面も古い履歴も戻ってこない
+        CHECK_EQ(c.cursor_y(), 0);
+        // 押し出した後に普通にスクロールしても、引き戻すのは最新の行 (背の高い端末と同じ)
+        c.write("\r\na\r\nb\r\nc\r\nd\r\ne");  // 画面は $ a b c d e
+        c.resize(10, 3);                    // $ a b を押し出す
+        c.write("\r\nf");                  // a... ではなく c を押し出す
+        c.resize(10, 6);
+        CHECK_STR(c.row_text(0), "a");
+        CHECK_STR(c.row_text(5), "f");
+        CHECK_EQ(c.cursor_y(), 5);
+        // ED 2 の後は、押し出した分も引き戻さない
+        c.resize(10, 3);
+        c.write("\033[2J\033[3;1Hz");
+        c.resize(10, 6);
+        CHECK_STR(c.row_text(2), "z");
+        CHECK_EQ(c.cursor_y(), 2);
+    }
+
+    // 代替画面にいる間: 代替画面は自分のカーソルで、主画面は入ったときの位置で削る。
+    // 主画面の内容は抜けたときに元の位置で戻る。
+    Terminal u(10, 6);
+    u.write("top\r\n$ ");
+    u.write("\033[?1049h\033[6;1Halt");
+    u.resize(10, 3);
+    CHECK_STR(u.row_text(2), "alt");  // 代替画面はカーソル (最下行) を保って上から削る
+    u.write("\033[?1049l");
+    CHECK_STR(u.row_text(0), "top");
+    CHECK_EQ(u.cursor_y(), 1);
+}
+
 void test_resize()
 {
     Terminal t(10, 3);
@@ -344,19 +417,19 @@ void test_real_sequences()
 // レビュー指摘の回帰テスト。番号はレビューの指摘番号。
 void test_review_regressions()
 {
-    // 1. rgb_to_256 の境界: r==248 で 256 になって 0 (黒) に化けていた
+    // 1. 24bit 色はそのまま持つ (256 色に丸めていた頃は r==248 で黒に化けた)
     {
         Terminal t(10, 2);
         t.write("\033[38;2;248;248;248mW");
-        CHECK_EQ(t.cell(0, 0).attr.fg, 231);
+        CHECK_EQ(t.cell(0, 0).attr.fg, vt::rgb(248, 248, 248));
     }
     // 2. 既定色センチネルが実パレット番号と衝突しない
     {
         Terminal t(10, 2);
         t.write("\033[38;5;255mA\033[48;5;254mB");
-        CHECK_EQ(t.cell(0, 0).attr.fg, 255);
+        CHECK_EQ(t.cell(0, 0).attr.fg, 255u);
         CHECK(t.cell(0, 0).attr.fg != vt::kDefaultFg);
-        CHECK_EQ(t.cell(1, 0).attr.bg, 254);
+        CHECK_EQ(t.cell(1, 0).attr.bg, 254u);
         CHECK(t.cell(1, 0).attr.bg != vt::kDefaultBg);
         // 24bit の明るいグレーも既定色に潰れない
         t.write("\033[38;2;247;247;247mC");
@@ -415,9 +488,9 @@ void test_review_regressions()
     {
         Terminal t(10, 2);
         t.write("\033[38:2::255:0:0mR");
-        CHECK_EQ(t.cell(0, 0).attr.fg, 196);
+        CHECK_EQ(t.cell(0, 0).attr.fg, vt::rgb(255, 0, 0));
         t.write("\033[48:2::0:0:255mB");
-        CHECK_EQ(t.cell(1, 0).attr.bg, 21);
+        CHECK_EQ(t.cell(1, 0).attr.bg, vt::rgb(0, 0, 255));
     }
     // 9. 絵文字などの全角判定
     {
@@ -596,9 +669,11 @@ void test_resize_keeps_scrollback()
     // **縮めた分は追い出されて履歴に積まれる**（3 行 → 2 行なので 1 行増える）。
     t.resize(10, 2);
     CHECK(t.scrollback_lines() == 4);
-    // 広げるときは何も追い出さないので増えない。
+    // 広げるときは履歴から引き戻す（キーボードを閉じたら元の画面に戻る）。
     t.resize(10, 3);
-    CHECK(t.scrollback_lines() == 4);
+    CHECK(t.scrollback_lines() == 3);
+    CHECK(t.row_text(0) == "d");
+    CHECK(t.row_text(2) == "f");
     // 見ている位置は最新に戻る。
     CHECK(t.view_offset() == 0);
     CHECK(t.scroll_view(2) == 2);
@@ -638,10 +713,14 @@ void test_resize_keeps_scrollback()
         CHECK(t2.view_row_text(0) == "4");
         CHECK(t2.view_row_text(1) == "5");
 
-        // 広げるときは何も追い出さない。
-        const int held = t2.scrollback_lines();
+        // 広げるときは履歴から引き戻す。3 行あるので 4 行広げても 3 行だけ戻り、
+        // 残り 1 行は下に空行が足される。カーソルは "5" の行に付いていく。
         t2.resize(10, 6);
-        CHECK(t2.scrollback_lines() == held);
+        CHECK(t2.scrollback_lines() == 0);
+        CHECK(t2.row_text(0) == "1");
+        CHECK(t2.row_text(4) == "5");
+        CHECK(t2.row_text(5) == "");
+        CHECK(t2.cursor_y() == 4);
     }
 
     // 代替画面の内容は履歴に入れない（本家の端末も入れない）。
@@ -678,7 +757,8 @@ void test_resize_keeps_scrollback()
     }
 
     // 桁数が変わったら捨てる（履歴は cols 単位で詰めてあるので使い回せない）。
-    CHECK(t.scrollback_lines() == 4);
+    // 3 → 4 行では引き戻さない（残りの履歴はスクロールで入った行で、押し出した行ではない）。
+    CHECK(t.scrollback_lines() == 3);
     t.resize(12, 4);
     CHECK(t.scrollback_lines() == 0);
     // **桁数が確保時と食い違ったままなので、以後は積まれない（#45）。**
@@ -699,6 +779,113 @@ void test_resize_keeps_scrollback()
     CHECK(t.scrollback_lines() == held);
 }
 
+// TUI (herdr / Claude Code / opencode / codex) が実際に送るシーケンス (#100)。
+// どれも tmux で採った生のバイト列に出てきたもの。
+void test_tui_sequences()
+{
+    // private / 中間バイト付きの CSI を素の CSI として実行しない
+    {
+        Terminal t(20, 5);
+        t.write("\033[3;5H\0337");               // DECSC
+        t.write("\033[1;1H\033[>4;1m\033[>4;2mA");  // XTMODKEYS: 下線にも太字にもしない
+        CHECK_EQ(t.cell(0, 0).attr.flags, 0);
+        t.write("\033[2;2H\033[>1u\033[<u\033[?u");  // kitty keyboard: カーソルを復元しない
+        CHECK_EQ(t.cursor_x(), 1);
+        CHECK_EQ(t.cursor_y(), 1);
+        t.write("\033[2;4r\033[3;3H\033[?1r");  // XTRESTORE: スクロール領域を戻さない
+        CHECK_EQ(t.cursor_y(), 2);
+        t.write("\033[5;1H\n");  // 領域外の下端なのでスクロールしない (領域が 2-4 のまま)
+        CHECK_EQ(t.cursor_y(), 4);
+    }
+    // 応答: DA2 は DA1 と別物、DECRQM、DECXCPR、色の問い合わせ
+    {
+        Terminal    t(20, 5);
+        std::string reply;
+        t.set_reply([&](const std::string& s) { reply += s; });
+        t.write("\033[>c");
+        CHECK_STR(reply, "\033[>0;0;0c");
+        reply.clear();
+        t.write("\033[?2026$p\033[?2026h\033[?2026$p\033[?9999$p");
+        CHECK_STR(reply, "\033[?2026;2$y\033[?2026;1$y\033[?9999;0$y");
+        CHECK(t.synchronized());
+        const uint32_t gen = t.sync_generation();
+        t.write("\033[?2026l\033[?2026h");  // 次のフレーム: 世代が進む
+        CHECK(t.synchronized());
+        CHECK(t.sync_generation() == gen + 1);
+        t.write("\033[?2026l");
+        CHECK(!t.synchronized());
+        reply.clear();
+        t.write("\033[2;3H\033[?6n");
+        CHECK_STR(reply, "\033[?2;3R");
+        reply.clear();
+        t.write("\033]11;?\033\\");  // ST で訊かれたら ST で返す
+        CHECK_STR(reply, "\033]11;rgb:0000/0000/0000\033\\");
+        reply.clear();
+        t.write("\033]4;1;?;15;?\a");  // BEL で訊かれたら BEL。複数の番号を 1 本で訊ける
+        CHECK_STR(reply, "\033]4;1;rgb:cdcd/0000/0000\a\033]4;15;rgb:ffff/ffff/ffff\a");
+    }
+    // SGR のサブパラメータ (':') は ';' と別に扱う
+    {
+        Terminal t(20, 2);
+        t.write("\033[4:3mA\033[4:0mB");  // 波線の下線 → 下線。3 を斜体と読まない
+        CHECK_EQ(t.cell(0, 0).attr.flags, vt::kUnderline);
+        CHECK_EQ(t.cell(1, 0).attr.flags, 0);
+        t.write("\033[58:2::1:2:3mC");  // 下線の色は読み飛ばす (2 を dim と読まない)
+        CHECK_EQ(t.cell(2, 0).attr.flags, 0);
+        t.write("\033[58;5;9;1mD");  // ';' 形式でも引数を食ってから次へ進む
+        CHECK_EQ(t.cell(3, 0).attr.flags, vt::kBold);
+    }
+    // DEC 特殊図形 (ncurses の罫線) と SO/SI
+    {
+        Terminal t(20, 2);
+        t.write("\033(0lqk\033(Bq");
+        CHECK_STR(t.row_text(0), "┌─┐q");
+        t.write("\r\n\033)0x\016x\017x");
+        CHECK_STR(t.row_text(1), "x│x");
+    }
+    // REP / CHT / CBT
+    {
+        Terminal t(20, 2);
+        t.write("─\033[4b");
+        CHECK_STR(t.row_text(0), "─────");
+        t.write("\r\033[2I");
+        CHECK_EQ(t.cursor_x(), 16);
+        t.write("\033[Z");
+        CHECK_EQ(t.cursor_x(), 8);
+        t.write("\033[3Z");
+        CHECK_EQ(t.cursor_x(), 0);
+    }
+    // 幅 0 の文字はカーソルを進めない (異体字セレクタ・結合文字・肌色修飾)
+    {
+        CHECK_EQ(vt::char_width(0xFE0F), 0);
+        CHECK_EQ(vt::char_width(0x0301), 0);
+        CHECK_EQ(vt::char_width(0x1F3FB), 0);
+        CHECK_EQ(vt::char_width(0x3099), 0);  // かなの範囲 (幅 2) より先に判定する
+        Terminal t(20, 2);
+        t.write("\u2764\uFE0Fx");  // ❤️x
+        CHECK_EQ(t.cursor_x(), 2);
+        CHECK_STR(t.row_text(0), "\u2764x");
+    }
+    // ED 3 はスクロールバックだけを消す (画面は残す)
+    {
+        Terminal              t(10, 3);
+        std::vector<vt::Cell> sb(10 * 10);
+        t.set_scrollback(sb.data(), 10, 10);
+        t.write("a\r\nb\r\nc\r\nd");
+        CHECK(t.scrollback_lines() > 0);
+        t.write("\033[3J");
+        CHECK_EQ(t.scrollback_lines(), 0);
+        CHECK_STR(t.row_text(2), "d");
+        // 履歴を見ている最中に 3J だけが来たら、最新に戻して全行を描き直させる
+        t.write("\r\ne\r\nf");
+        CHECK(t.scroll_view(1) == 1);
+        t.clear_dirty();
+        t.write("\033[3J");
+        CHECK_EQ(t.view_offset(), 0);
+        CHECK(t.is_dirty(0) && t.is_dirty(2));
+    }
+}
+
 int main()
 {
     test_resize_keeps_scrollback();
@@ -714,10 +901,12 @@ int main()
     test_replies_and_title();
     test_tabs_and_bs();
     test_resize();
+    test_resize_trims_below_cursor();
     test_real_sequences();
     test_review_regressions();
     test_dirty_range();
     test_scrollback();
+    test_tui_sequences();
     std::printf("ok: %d checks passed\n", g_checks);
     return 0;
 }
