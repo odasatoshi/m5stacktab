@@ -105,29 +105,56 @@ def efont_codepoints(path):
     return have
 
 
+def ink(ch, font):
+    """実際に描いて、塗られた画素の外接矩形を返す (ベースライン上の原点からの相対)。
+    getbbox は送り幅込みの値を返す字があるので使わない。"""
+    pad = 64
+    img = Image.new("L", (pad * 2, pad * 2), 0)
+    ImageDraw.Draw(img).text((pad, pad), ch, font=font, fill=255, anchor="ls")
+    box = img.getbbox()
+    if not box:
+        return None
+    l, t, r, b = box
+    return l - pad, t - pad, r - pad, b - pad  # r, b は含まない
+
+
+def fit_scale(ch, path):
+    """SIZE で描いたときにセルへ収めるための縮め率 (1 = 縮めない)。"""
+    box = ink(ch, ImageFont.truetype(path, SIZE))
+    if not box:
+        return 1.0
+    l, t, r, b = box
+    return min(1.0, CELL_W / (r - l), CELL_H / (b - t))
+
+
 def render(ch, font_path):
-    """セルに収まる大きさ・位置で描いて、外接矩形と 4 bit の濃さを返す。"""
+    """セルに収まる大きさ・位置で描いて、外接矩形と 4 bit の濃さを返す。
+
+    縮めないときはベースラインを efont に合わせる (文字と並べて揃う)。
+    縮めるときは**字の中心の高さを保つ**。ベースラインに固定したまま縮めると、縮めた分だけ
+    下に沈む (⸺ が下線の位置に、▶ が小さな点になって下に寄った。#105 の Reality Check)。
+    """
+    base = ink(ch, ImageFont.truetype(font_path, SIZE))
+    if not base:
+        return 0, 0, 0, 0, b""
+    center = (base[1] + base[3]) / 2  # 縮める前の中心の高さ (ベースラインからの相対)
     size = SIZE
     while True:
         font = ImageFont.truetype(font_path, size)
-        l, t, r, b = font.getbbox(ch, anchor="ls")  # ベースラインからの相対
-        if (r - l <= CELL_W and b - t <= CELL_H) or size <= 8:
+        l, t, r, b = ink(ch, font)
+        if (r - l <= CELL_W and b - t <= CELL_H) or size <= 6:
             break
         size -= 1
-    # 横: Mono の字はセル幅 (送り 12px) で設計されているので原点を 0 に置く。
-    # はみ出す字 (記号フォント) は外接矩形を中央に置く。
-    x = 0 if (l >= 0 and r <= CELL_W) else (CELL_W - (r - l)) // 2 - l
-    # 縦: ベースラインを efont に合わせ、はみ出すときだけ内側へずらす。
-    y = BASELINE
-    if y + t < 0:
-        y = -t
-    if y + b > CELL_H:
-        y = CELL_H - b
+    # 横: Mono の字はセル幅 (送り 12px) で設計されているので、収まるなら原点を 0 に置く。
+    # はみ出す字・縮めた字は塗られた範囲を中央に置く。
+    x = 0 if (size == SIZE and l >= 0 and r <= CELL_W) else (CELL_W - (r - l)) // 2 - l
+    # 縦: 縮めないならベースライン、縮めたら中心の高さを合わせる。どちらもはみ出すなら内側へ。
+    y = BASELINE if size == SIZE else round(BASELINE + center - (t + b) / 2)
+    y = min(max(y, -t), CELL_H - b)
     img = Image.new("L", (CELL_W, CELL_H), 0)
     ImageDraw.Draw(img).text((x, y), ch, font=font, fill=255, anchor="ls")
     px = img.load()
-    cells = [(cx, cy, px[cx, cy] * 15 // 255) for cy in range(CELL_H) for cx in range(CELL_W)]
-    lit = [(cx, cy) for cx, cy, a in cells if a]
+    lit = [(cx, cy) for cy in range(CELL_H) for cx in range(CELL_W) if px[cx, cy] * 15 // 255]
     if not lit:
         return 0, 0, 0, 0, b""
     x0 = min(c[0] for c in lit); x1 = max(c[0] for c in lit)
@@ -157,9 +184,11 @@ def main():
                 continue  # 2 セル幅の字 (絵文字など) は対象外
             if cp in efont and cp not in OVERRIDE:
                 continue
-            src = next((p for cmap, p in fonts if cp in cmap), None)
-            if src:
-                cps.append((cp, src))
+            # いちばん縮めずに済むフォントを選ぶ (同じなら FONTS の順)。▶ は Mono だと
+            # 全角相当の幅で、半分に縮めると 6px の点になる。Symbols 2 なら 0.75 倍で済む。
+            have = [p for cmap, p in fonts if cp in cmap]
+            if have:
+                cps.append((cp, max(have, key=lambda p: (round(fit_scale(ch, p), 2), -have.index(p)))))
     index, blob = [], bytearray()
     for cp, src in cps:
         x, y, w, h, data = render(chr(cp), src)

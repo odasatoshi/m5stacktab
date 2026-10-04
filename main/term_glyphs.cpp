@@ -80,10 +80,8 @@ bool find_symbol(const uint8_t* blob, size_t size, uint32_t cp, Symbol* out)
     return true;
 }
 
-void draw_symbol(const Symbol& s, int w, int h, const Fill& fill)
+void draw_symbol(const Symbol& s, const Fill& fill)
 {
-    const int ox = (w - 12) / 2;  // 全角のセルなら中央に
-    const int oy = (h - 24) / 2;
     const int stride = (s.w + 1) / 2;
     for (int r = 0; r < s.h; ++r) {
         const uint8_t* row = s.data + r * stride;
@@ -95,7 +93,7 @@ void draw_symbol(const Symbol& s, int w, int h, const Fill& fill)
                    (((c + run) & 1) ? (row[(c + run) / 2] & 0x0F) : (row[(c + run) / 2] >> 4)) == a) {
                 ++run;
             }
-            if (a) fill(ox + s.x + c, oy + s.y + r, run, 1, static_cast<uint8_t>(a * 17));
+            if (a) fill(s.x + c, s.y + r, run, 1, static_cast<uint8_t>(a * 17));
             c += run;
         }
     }

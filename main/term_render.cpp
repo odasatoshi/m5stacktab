@@ -347,7 +347,7 @@ void TermRenderer::draw_row(vt::Terminal& term, int y, int x_from, int x_to)
                 case Kind::kSymbol: {
                     glyph::Symbol sym{};
                     if (glyph::find_symbol(kSymbols, kSymbolsSize, g.cp, &sym)) {
-                        glyph::draw_symbol(sym, pw, cell_h_, [&](int x, int y, int w, int h, uint8_t a) {
+                        glyph::draw_symbol(sym, [&](int x, int y, int w, int h, uint8_t a) {
                             row_.fillRect(px + x, y, w, h, a == 255 ? st.fg : blend565(st.bg, st.fg, a));
                         });
                     }

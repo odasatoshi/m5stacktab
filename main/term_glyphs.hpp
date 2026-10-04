@@ -36,8 +36,9 @@ struct Symbol {
 // 形式が壊れていたら (magic 違い・範囲外) 何も見つからないものとして扱う。
 bool find_symbol(const uint8_t* blob, size_t size, uint32_t cp, Symbol* out);
 
-// 記号を w x h のセルの中央に描く (記号は 12x24 で焼いてあり、全角のセルなら左右に余白)。
-// 同じ濃さが横に続く区間はまとめて fill を呼ぶ。
-void draw_symbol(const Symbol& s, int w, int h, const Fill& fill);
+// 記号を 12x24 のセルに描く。同じ濃さが横に続く区間はまとめて fill を呼ぶ。
+// 記号フォントには半角幅の字しか入れていない (gen_symbol_font.py が 2 セル幅の字を除く。
+// vt100 が幅 2 と判定する字は 0 件) ので、全角のセルは考えない。
+void draw_symbol(const Symbol& s, const Fill& fill);
 
 }  // namespace glyph

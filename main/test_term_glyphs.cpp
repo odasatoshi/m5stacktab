@@ -197,7 +197,7 @@ void test_symbols()
         CHECK(find(cp, &s));
         CHECK(s.x + s.w <= 12 && s.y + s.h <= 24);
         int lit = 0, minx = 99, maxx = -1, miny = 99, maxy = -1;
-        glyph::draw_symbol(s, kW, kH, [&](int x, int y, int w, int h, uint8_t a) {
+        glyph::draw_symbol(s, [&](int x, int y, int w, int h, uint8_t a) {
             CHECK(x >= 0 && y >= 0 && x + w <= kW && y + h <= kH && h == 1 && a > 0);
             lit += w;
             minx = std::min(minx, x);
@@ -212,11 +212,12 @@ void test_symbols()
             CHECK(minx == s.x && maxx == s.x + s.w - 1 && miny == s.y && maxy == s.y + s.h - 1);
         }
     }
-    // 全角のセルでは左右に 6px ずつ余白を空けて中央に描く
-    CHECK(find(0x2713, &s));
-    int minx = 99;
-    glyph::draw_symbol(s, 24, kH, [&](int x, int, int, int, uint8_t) { minx = std::min(minx, x); });
-    CHECK(minx == s.x + 6);
+    // 縮めた字は中心の高さを保つ (ベースラインに固定すると下に沈む, #105)。
+    // ▶ は全角相当の字形を縮めるので、セルの中ほどに来る。⸺ はダッシュの高さ。
+    CHECK(find(0x25B6, &s) && s.h >= 10 && s.y + s.h <= 19 && s.y >= 4);
+    CHECK(find(0x2E3A, &s) && s.y + s.h / 2 >= 10 && s.y + s.h / 2 <= 15);
+    // 縮めない字はベースライン (y=19) に揃う: ✓ の下端
+    CHECK(find(0x2713, &s) && s.y + s.h >= 17 && s.y + s.h <= 20);
 
     // 壊れた blob は何も見つからない扱いにする (範囲外を読まない)
     std::vector<uint8_t> bad = blob;
