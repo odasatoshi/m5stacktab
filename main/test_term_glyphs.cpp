@@ -172,7 +172,7 @@ void test_symbols()
     glyph::Symbol s{};
     // TUI が使う字は入っている (4 つの TUI のキャプチャに出てきた字)
     for (uint32_t cp : {0x23FAu, 0x23BFu, 0x273Bu, 0x2722u, 0x276Fu, 0x23F5u, 0x2713u, 0x2717u, 0x203Au,
-                        0x26A0u, 0x2318u, 0x2B1Du}) {
+                        0x26A0u, 0x2318u, 0x2B1Du, 0x2E3Au, 0x2E3Bu}) {
         CHECK(find(cp, &s));
         CHECK(s.w > 0 && s.h > 0);
     }
