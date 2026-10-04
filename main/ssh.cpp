@@ -8,6 +8,7 @@
 
 #include <arpa/inet.h>
 #include <esp_log.h>
+#include <fcntl.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/stream_buffer.h>
@@ -371,13 +372,44 @@ int tcp_connect(const char* host, uint16_t port)
         freeaddrinfo(res);
         return -1;
     }
+    // **接続待ちの間も s_run を見る。** ブロッキングの connect は届かない相手だと
+    // 20 秒近く返らず、その間 ssh_disconnect (1 秒しか待たない) が効かない。
+    // メニューで別の接続先に切り替えると、残ったタスクのせいで ssh_connect が
+    // INVALID_STATE で断っていた（実機で再現, #82）。
+    // 繋がった後のハンドシェイクと認証は libssh2 のタイムアウト (ssh_task) で区切る。
+    const int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+    int err = 0;
     if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) {
-        set_error("connect to %s:%u failed: %d", host, port, errno);
-        close(sock);
-        freeaddrinfo(res);
-        return -1;
+        err = errno;
+        if (err == EINPROGRESS) {
+            err = ETIMEDOUT;
+            for (int waited = 0; waited < 15000 && s_run; waited += 100) {
+                fd_set wr;
+                FD_ZERO(&wr);
+                FD_SET(sock, &wr);
+                timeval tv{0, 100 * 1000};
+                const int ready = select(sock + 1, nullptr, &wr, nullptr, &tv);
+                if (ready < 0) {
+                    err = errno;  // 待てていないので、回り続けると理由が ETIMEDOUT に化ける
+                    break;
+                }
+                if (ready > 0) {
+                    socklen_t len = sizeof(err);
+                    getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len);
+                    break;
+                }
+            }
+            if (!s_run) err = ECANCELED;
+        }
     }
     freeaddrinfo(res);
+    if (err != 0) {
+        set_error("connect to %s:%u failed: %d", host, port, err);
+        close(sock);
+        return -1;
+    }
+    fcntl(sock, F_SETFL, flags);  // 以降はこれまでどおり (libssh2 側で非ブロッキングにする)
 
     int one = 1;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));  // 対話操作なので遅延を避ける
@@ -413,6 +445,10 @@ void ssh_task(void*)
             break;
         }
         libssh2_session_set_blocking(session, 1);  // ハンドシェイクまではブロッキングで単純に
+        // **黙り込む相手で永久に止まらないように。** ブロッキングの呼び出しには既定で
+        // 上限が無く、TCP だけ受けて何も返さない相手だとタスクが再起動まで残る。
+        // 残ると、メニューで別の接続先に切り替えても INVALID_STATE で断られる (#82)。
+        libssh2_session_set_timeout(session, 15000);
         if (int rc = libssh2_session_handshake(session, sock); rc) {
             set_error("handshake failed: %d", rc);
             break;
@@ -641,7 +677,11 @@ esp_err_t ssh_config_save(const SshConfig& cfg)
 
 esp_err_t ssh_connect(const SshConfig& cfg, int cols, int rows)
 {
-    if (s_task) return ESP_ERR_INVALID_STATE;
+    if (s_task) {
+        // 呼び出し側は ssh_last_error() を画面に出す。入れないと前の接続の古い文言が出る。
+        set_error("the previous connection is still closing - try again");
+        return ESP_ERR_INVALID_STATE;
+    }
 
     if (!s_rx) s_rx = xStreamBufferCreate(kRxBufSize, 1);
     if (!s_tx) s_tx = xStreamBufferCreate(kTxBufSize, 1);

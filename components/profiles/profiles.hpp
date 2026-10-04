@@ -33,7 +33,10 @@ struct Profile {
     std::string key;       // keys/ 配下のファイル名（鍵そのものは JSON に埋めない）
     std::string via;       // 先に張る VPN プロファイルの name
     std::string password;  // 書けるが既定にしない。空 + auth=password なら入力させる
-    uint16_t    port          = 22;
+    // **既定は 0 = 未指定。** ssh の既定 22 は parse が埋める（`to_json` も 0 なら 22 を書く）。
+    // ここを 22 にすると、tailscale を手で組み立てたときに **22 番が書かれてしまう**
+    // （tailscale の port は「書かれていなければ control のスキームで決める」#68）。
+    uint16_t    port          = 0;
     bool        ask_password  = false;  // auth: "password" で password が無い
 
     // --- wireguard ---
@@ -91,5 +94,30 @@ std::vector<std::string> referenced_keys(const Config& cfg);
 // どちらを指しているか決められないまま先頭を消すと、一覧に残っている方ではなく
 // 壊れている方が消えて「押したのに何も起きない」になる。
 bool remove_profile(const std::string& json, const std::string& name, std::string* out);
+
+// JSON に 1 件足して書き戻す (#82)。`entry` は profiles.json の 1 項目の JSON。
+// 足せたら true。`json` が空なら器から作る（1 件も取り込んでいない端末でも足せる）。
+// **空と「読めない」は別。** 読めない本文には足さない（false）。器で置き換えると、
+// 1 件足したつもりで**今まで取り込んだ分を全部捨てる**。
+//
+// **同じ name が既に有れば false。上書きしない。**
+// 新規作成の画面で既存と同じ名前を打っただけで接続先が差し替わると、
+// **繋ぐ先が変わったことに気づけない**。消してから足させる。
+bool add_profile(const std::string& json, const std::string& entry, std::string* out);
+
+// "10.9.0.0/24, 10.8.0.0/24" をカンマ / 空白で分ける (#82)。画面から複数の値を
+// 1 行で聞くのに使う。空の要素は落とす（", ," や末尾のカンマで空文字を作らない）。
+//
+// **パーサ側に置く。** 書式を知っているのはこちらで、ホストでテストできるのもこちら。
+std::vector<std::string> split_list(const std::string& s);
+
+// Profile を profiles.json の 1 項目 (JSON) にする (#82)。`add_profile` に渡す形。
+//
+// **書式の知識をここから出さない。** 画面で組み立てた接続先を main 側で文字列に
+// すると、parse が読む鍵の名前と 2 か所に散る（片方だけ直すと、保存はできるのに
+// 読み戻せない設定ができる）。ホストでテストできるのもこちら側。
+//
+// 空の項目は書かない（`key` を空で書くと「鍵がある」と読める）。
+std::string to_json(const Profile& p);
 
 }  // namespace prof
