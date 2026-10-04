@@ -33,6 +33,9 @@ static_assert(kMaxWifiScanRows > 0, "スキャン結果を並べる行が残ら�
 
 class MenuUi {
 private:
+    // rebuild() のあとに選び直す行の id (0 = 選び直さない)。行の位置ではなく id で持つので、
+    // 注記の行が出入りしても同じ項目に戻れる。フォーム以外の画面に移ったら捨てる。
+    int keep_id_ = 0;
     enum class Screen {
         kRoot, kSsh, kVpn, kMisc, kWifi, kWifiNet, kWifiScan, kProfile,
         kForm,  // 接続先の新規作成 (#82)。行の中身は呼び出し側が作る
@@ -121,7 +124,9 @@ public:
     void set_form_rows(const std::vector<std::string>* v) { form_rows_ = v; }
     // 新規作成の画面へ移る。`set_form_rows` の中身を作ってから呼ぶ。
     // 1 項目ずつ聞くので**編集から戻るたびに呼ぶ**（set_visible(true) は kRoot に戻す）。
-    void show_form();
+    // field >= 0 なら、その項目にカーソルを置く。1 行入力から戻るたびに先頭へ戻ると、
+    // 上下キーで操作したとき 1 項目打つごとに name まで戻される（実機で踏んだ）。
+    void show_form(int field = -1);
     // 保存した後に、入ってきた一覧 (SSH / VPN) へ戻る (#82)。
     void show_form_list();
 

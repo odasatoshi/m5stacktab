@@ -3340,6 +3340,13 @@ void connect_ssh_profile(const prof::Profile& p, int index, const ViaTarget& via
         start_password_prompt(index, p.user, p.host);
         return;
     }
+    // **繋がっていれば切ってから繋ぎ直す。** 一覧から別の接続先を選ぶのは「切り替えたい」
+    // ということ。切らずに進むと ssh_connect が INVALID_STATE で断り、
+    // 「connecting...」を端末に書いたまま何も起きない（実機で踏んだ, #82）。
+    if (ssh_is_connected()) {
+        term_note("33", "前の接続を切ってから繋ぎ直す");
+        ssh_disconnect();
+    }
     // 先に VPN を張る（`via`）。**張れなければ繋ぎに行かない** —
     // VPN 越しの相手に素の経路で繋ぎに行くと、無関係の相手に当たり得る。
     if (via.named) {
@@ -3891,11 +3898,19 @@ void form_rebuild_rows()
     }
 }
 
+// SSH の key で「本体の鍵 (sshkey パーティション)」を選んだことを表す、フォームの中だけの値。
+// 保存するときは key を空にし、パスワード認証にはしない（= parse が鍵パーティションを使う）。
+// これが無いと、メニューから作った SSH は NVS に鍵が無い限りパスワード認証にしかならず、
+// 鍵パーティションに置いた EC 鍵を使えなかった。
+constexpr const char* kDeviceKey = "(本体の鍵)";
+
 // 鍵の候補。**末尾に「なし」を入れる** — SSH で鍵なしはパスワード認証、
 // Tailscale で authkey なしは対話ログインという意味があるので、外せない選択肢。
-std::vector<std::string> form_key_candidates()
+// SSH だけは「なし」の前に本体の鍵を入れる。
+std::vector<std::string> form_key_candidates(bool ssh)
 {
     std::vector<std::string> v = nvs_key_names();
+    if (ssh) v.emplace_back(kDeviceKey);
     v.emplace_back();
     return v;
 }
@@ -3941,6 +3956,7 @@ void form_start(bool vpn)
     s_form_vpn     = vpn;
     s_form.type    = vpn ? prof::Type::kWireGuard : prof::Type::kSsh;
     s_form.port    = vpn ? 0 : 22;
+    if (!vpn) s_form.key = kDeviceKey;  // 鍵パーティションの鍵 (EC 鍵を置く場所) を既定にする
     s_form_allowed.clear();
     form_rebuild_rows();
     if (!menu) return;
@@ -3963,7 +3979,7 @@ void form_edit(int index)
         // 押し損に見えるだけで、`private_key` が必須の WireGuard では
         // **そもそも作れない**のに理由が分からない（保存で出るのは書式の警告）。
         case FormKind::kKey: {
-            const std::vector<std::string> cand = form_key_candidates();
+            const std::vector<std::string> cand = form_key_candidates(f.value == &s_form.key);
             if (cand.size() <= 1) {
                 form_note("鍵が NVS に無い（`profiles import` で SD から取り込む）");
                 return;
@@ -4012,7 +4028,7 @@ void form_edit(int index)
                 // show_form() を続けて呼ばないと「1 項目打つたびに最上位へ戻る」になる。
                 set_menu_visible(true);
                 if (menu) {
-                    menu->show_form();
+                    menu->show_form(index);  // 編集していた項目に戻る
                     // **断った理由は画面に出す。** 端末に書いてもメニューが覆う。
                     if (!why.empty()) menu->set_note(why);
                     menu->draw();
@@ -4044,6 +4060,11 @@ void form_save()
     // **分け方はパーサ側に置いてある** (`prof::split_list`)。ここで書くと
     // ホストでテストできない（1 本に潰れても parse は通ってしまう）。
     if (p.type == prof::Type::kWireGuard) p.peer.allowed_ips = prof::split_list(s_form_allowed);
+    if (p.type == prof::Type::kSsh) {
+        // 本体の鍵 = key を書かない鍵認証、なし = パスワード認証 (繋ぐときに画面で聞く)。
+        p.ask_password = p.key.empty();
+        if (p.key == kDeviceKey) p.key.clear();
+    }
     std::string json;
     if (const esp_err_t err = nvs_profiles_load(&json);
         err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {

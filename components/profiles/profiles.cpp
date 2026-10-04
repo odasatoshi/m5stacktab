@@ -397,10 +397,12 @@ std::string to_json(const Profile& p)
             cJSON_AddNumberToObject(o, "port", p.port ? p.port : 22);
             put("key", p.key);
             put("via", p.via);
-            // **鍵が無ければパスワード認証。** 書かないと parse が「鍵で繋ぐ」と
-            // 読み、鍵が無いまま接続して失敗する。パスワードそのものは書かない
-            // （NVS を読める人が全部読めてしまう）。繋ぐときに画面から聞く。
-            if (p.ask_password || p.key.empty()) cJSON_AddStringToObject(o, "auth", "password");
+            // **パスワード認証は ask_password で表す。** key が空で ask_password も
+            // 立っていなければ鍵認証で、鍵は本体の鍵パーティションから読む（SD の
+            // `"auth":"key"` で key を書かないときと同じ）。以前は「key が空なら
+            // パスワード」と決め打ちしていて、メニューから鍵パーティションの鍵を選べなかった。
+            // パスワードそのものは書かない（NVS を読める人が全部読めてしまう）。
+            if (p.ask_password) cJSON_AddStringToObject(o, "auth", "password");
             break;
         case Type::kWireGuard: {
             put("address", p.address);

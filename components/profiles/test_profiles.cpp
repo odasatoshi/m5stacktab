@@ -438,14 +438,25 @@ void test_to_json_roundtrip()
     CHECK(got && got->host == "10.0.0.5" && got->user == "user" && got->port == 2222);
     CHECK(got && got->key == "id.pem" && !got->ask_password);
 
-    // **鍵が無ければパスワード認証になる。** auth を書かないと鍵で繋ごうとする。
+    // **パスワード認証は ask_password で表す。** 書き戻すと auth: password になる。
     prof::Profile pw = ssh;
     pw.key.clear();
+    pw.ask_password = true;
     out.clear();
     CHECK(prof::add_profile("", prof::to_json(pw), &out));
     c   = prof::parse(out);
     got = prof::find(c, "jump");
-    CHECK(got && got->ask_password);
+    CHECK(got && got->ask_password && got->key.empty());
+
+    // **key が空でもパスワードでなければ鍵認証** (鍵は本体の鍵パーティションから読む)。
+    // 「key が空ならパスワード」と決め打ちすると、メニューから本体の鍵を選べない。
+    prof::Profile dev = ssh;
+    dev.key.clear();
+    out.clear();
+    CHECK(prof::add_profile("", prof::to_json(dev), &out));
+    c   = prof::parse(out);
+    got = prof::find(c, "jump");
+    CHECK(got && !got->ask_password && got->key.empty());
 
     prof::Profile wg;
     wg.type           = prof::Type::kWireGuard;

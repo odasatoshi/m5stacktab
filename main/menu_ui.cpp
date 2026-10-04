@@ -81,6 +81,7 @@ void MenuUi::refresh()
 
 void MenuUi::enter(Screen s)
 {
+    if (s != Screen::kForm) keep_id_ = 0;
     screen_ = s;
     rebuild();
     dirty_ = true;
@@ -226,6 +227,11 @@ void MenuUi::rebuild()
         }
     }
     menu_.set_items(items_, n);
+    if (keep_id_ != 0) {
+        for (int i = 0; i < n; ++i) {
+            if (items_[i].id == keep_id_) menu_.set_selected(i);
+        }
+    }
 }
 
 // **戻り先を 1 か所にまとめる。** 入れ子が 2 段になったので、"< Back" と Esc が
@@ -262,7 +268,11 @@ void MenuUi::set_note(const std::string& s)
 }
 
 void MenuUi::show_wifi_scan() { enter(Screen::kWifiScan); }
-void MenuUi::show_form() { enter(Screen::kForm); }
+void MenuUi::show_form(int field)
+{
+    keep_id_ = field >= 0 ? kIdFormField + field : 0;
+    enter(Screen::kForm);
+}
 void MenuUi::show_form_list() { enter(form_parent_); }
 void MenuUi::show_wifi_list() { enter(Screen::kWifi); }
 
