@@ -2,10 +2,14 @@
 //
 //   c++ -std=c++17 -Wall -Wextra -Werror -O1 -I main
 //       -o /tmp/test_term_glyphs main/test_term_glyphs.cpp main/term_glyphs.cpp && /tmp/test_term_glyphs
+//
+// main/symbols.bin を読むので、リポジトリの直下で走らせる。
 #include "term_glyphs.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 namespace {
@@ -146,14 +150,80 @@ void test_blocks_and_braille()
     CHECK(render(0x2801).count() * 8 == all.count());  // 8 点が重ならない
 }
 
-void test_substitute()
+std::vector<uint8_t> load_symbols()
 {
-    CHECK(glyph::substitute(0x23FA) == 0x25CF);  // ⏺ → ●
-    CHECK(glyph::substitute(0x276F) == '>');     // ❯
-    CHECK(glyph::substitute(0x23BF) == 0x2514);  // ⎿ → └ (自前で描く字)
-    CHECK(glyph::is_drawn(glyph::substitute(0x23BF)));
-    CHECK(glyph::substitute('A') == 0);
-    CHECK(glyph::substitute(0x3042) == 0);
+    // CI と同じくリポジトリの直下から走らせる前提。
+    std::FILE* f = std::fopen("main/symbols.bin", "rb");
+    CHECK(f != nullptr);
+    std::vector<uint8_t> blob;
+    int                  c;
+    while ((c = std::fgetc(f)) != EOF) blob.push_back(static_cast<uint8_t>(c));
+    std::fclose(f);
+    return blob;
+}
+
+// 記号フォント (#102)。生成した symbols.bin そのものを読む。
+void test_symbols()
+{
+    const std::vector<uint8_t> blob = load_symbols();
+    auto find = [&](uint32_t cp, glyph::Symbol* s) {
+        return glyph::find_symbol(blob.data(), blob.size(), cp, s);
+    };
+    glyph::Symbol s{};
+    // TUI が使う字は入っている (4 つの TUI のキャプチャに出てきた字)
+    for (uint32_t cp : {0x23FAu, 0x23BFu, 0x273Bu, 0x2722u, 0x276Fu, 0x23F5u, 0x2713u, 0x2717u, 0x203Au,
+                        0x26A0u, 0x2318u, 0x2B1Du}) {
+        CHECK(find(cp, &s));
+        CHECK(s.w > 0 && s.h > 0);
+    }
+    CHECK(find(0x25CF, &s) && s.w > 0);  // ● は efont に有るが字形が潰れているので上書きする
+    CHECK(find(0x00A0, &s) && s.w == 0);  // NBSP は「何も描かない字」
+    // efont で描く字・自前で描く字は入っていない
+    CHECK(!find('A', nullptr));
+    CHECK(!find(0x3042, nullptr));  // あ
+    CHECK(!find(0x2192, nullptr));  // → (efont に有る)
+    CHECK(!find(0x2500, nullptr));  // ─ (自前で作図)
+
+    // 全件: 昇順に並び、セルに収まり、画素がちょうど外接矩形まで塗られている
+    uint32_t n;
+    std::memcpy(&n, blob.data() + 4, 4);
+    CHECK(n > 1000);
+    uint32_t prev = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint32_t cp;
+        std::memcpy(&cp, blob.data() + 8 + i * 12, 4);
+        CHECK(i == 0 || cp > prev);
+        prev = cp;
+        CHECK(find(cp, &s));
+        CHECK(s.x + s.w <= 12 && s.y + s.h <= 24);
+        int lit = 0, minx = 99, maxx = -1, miny = 99, maxy = -1;
+        glyph::draw_symbol(s, kW, kH, [&](int x, int y, int w, int h, uint8_t a) {
+            CHECK(x >= 0 && y >= 0 && x + w <= kW && y + h <= kH && h == 1 && a > 0);
+            lit += w;
+            minx = std::min(minx, x);
+            maxx = std::max(maxx, x + w - 1);
+            miny = std::min(miny, y);
+            maxy = std::max(maxy, y);
+        });
+        if (s.w == 0) {
+            CHECK(lit == 0);
+        } else {
+            // 外接矩形で切り出してあるので、上下左右の端の行・列に必ず 1 画素はある
+            CHECK(minx == s.x && maxx == s.x + s.w - 1 && miny == s.y && maxy == s.y + s.h - 1);
+        }
+    }
+    // 全角のセルでは左右に 6px ずつ余白を空けて中央に描く
+    CHECK(find(0x2713, &s));
+    int minx = 99;
+    glyph::draw_symbol(s, 24, kH, [&](int x, int, int, int, uint8_t) { minx = std::min(minx, x); });
+    CHECK(minx == s.x + 6);
+
+    // 壊れた blob は何も見つからない扱いにする (範囲外を読まない)
+    std::vector<uint8_t> bad = blob;
+    bad[0] = 'X';
+    CHECK(!glyph::find_symbol(bad.data(), bad.size(), 0x2713, nullptr));
+    CHECK(!glyph::find_symbol(blob.data(), 64, 0x2713, nullptr));  // 途中で切れている
+    CHECK(!glyph::find_symbol(nullptr, 0, 0x2713, nullptr));
 }
 
 }  // namespace
@@ -162,7 +232,7 @@ int main()
 {
     test_box_joins();
     test_blocks_and_braille();
-    test_substitute();
+    test_symbols();
     std::printf("ok: %d checks passed\n", g_checks);
     return 0;
 }

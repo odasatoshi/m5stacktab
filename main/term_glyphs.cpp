@@ -2,7 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
-#include <iterator>
+#include <cstring>
 
 namespace glyph {
 
@@ -40,37 +40,6 @@ int dashes(uint32_t cp)
     return 0;
 }
 
-struct Sub {
-    uint32_t from;
-    uint32_t to;
-};
-
-// フォントに無い字の代わり (from で昇順)。4 つの TUI のキャプチャに出てきた字が中心。
-// 代わりの字は efontJA_24 に有ること、または自前で描く字であること。
-constexpr Sub kSubs[] = {
-    {0x00A0, ' '},                                                     // NBSP
-    {0x2039, '<'},    {0x203A, '>'},                                   // ‹ › (codex のプロンプト)
-    {0x2219, 0x00B7}, {0x22EF, 0x2026},                                // ∙ ⋯
-    {0x23BA, 0x2594}, {0x23BB, 0x2500}, {0x23BC, 0x2500}, {0x23BD, 0x2581},  // ⎺⎻⎼⎽
-    {0x23BF, 0x2514},                                                  // ⎿ (Claude Code の結果行)
-    {0x23F4, 0x25C0}, {0x23F5, 0x25B6},                                // ⏴ ⏵
-    {0x23FA, 0x25CF},                                                  // ⏺ (Claude Code の行頭)
-    {0x25AA, 0x25A0}, {0x25AB, 0x25A1}, {0x25B8, 0x25B6}, {0x25B9, 0x25B7},
-    {0x25BA, 0x25B6}, {0x25C2, 0x25C0}, {0x25C4, 0x25C0},
-    {0x25FB, 0x25A1}, {0x25FC, 0x25A0},
-    {0x26A0, '!'},
-    {0x2713, 0x221A}, {0x2714, 0x221A}, {0x2715, 0x00D7}, {0x2716, 0x00D7},
-    {0x2717, 0x00D7}, {0x2718, 0x00D7},
-    {0x2722, '*'},    {0x2723, '*'},    {0x2724, '*'},    {0x2725, '*'},   // ✢ (スピナー)
-    {0x2731, '*'},    {0x2732, '*'},    {0x2733, '*'},    {0x2734, '*'},   // ✳
-    {0x2735, '*'},    {0x2736, '*'},    {0x2737, '*'},    {0x2738, '*'},   // ✶
-    {0x2739, '*'},    {0x273A, '*'},    {0x273B, '*'},    {0x273C, '*'},   // ✻
-    {0x273D, '*'},                                                          // ✽
-    {0x276E, '<'},    {0x276F, '>'},                                   // ❮ ❯ (Claude Code のプロンプト)
-    {0x2B1D, 0x00B7}, {0x2B24, 0x25CF},                                // ⬝ ⬤
-    {0x2E3A, 0x2500}, {0x2E3B, 0x2500},                                // ⸺ ⸻
-};
-
 }  // namespace
 
 bool is_drawn(uint32_t cp)
@@ -78,11 +47,58 @@ bool is_drawn(uint32_t cp)
     return (cp >= 0x2500 && cp <= 0x259F) || (cp >= 0x2800 && cp <= 0x28FF);
 }
 
-uint32_t substitute(uint32_t cp)
+bool find_symbol(const uint8_t* blob, size_t size, uint32_t cp, Symbol* out)
 {
-    auto it = std::lower_bound(std::begin(kSubs), std::end(kSubs), cp,
-                               [](const Sub& s, uint32_t v) { return s.from < v; });
-    return (it != std::end(kSubs) && it->from == cp) ? it->to : 0;
+    // "SYM1" u32 件数, 件数 x {u32 cp, u32 位置, u8 x, y, w, h}, 画素
+    constexpr size_t kEntry = 12;
+    if (!blob || size < 8 || std::memcmp(blob, "SYM1", 4) != 0) return false;
+    auto u32 = [](const uint8_t* p) {
+        uint32_t v;
+        std::memcpy(&v, p, 4);  // 埋め込んだ blob は 4 バイト境界とは限らない
+        return v;
+    };
+    const uint32_t n = u32(blob + 4);
+    if (n > (size - 8) / kEntry) return false;
+    const uint8_t* index = blob + 8;
+    const uint8_t* pixels = index + static_cast<size_t>(n) * kEntry;
+    // 二分探索 (cp の昇順に並べてある)
+    uint32_t lo = 0, hi = n;
+    while (lo < hi) {
+        const uint32_t mid = (lo + hi) / 2;
+        if (u32(index + mid * kEntry) < cp) lo = mid + 1;
+        else hi = mid;
+    }
+    if (lo == n || u32(index + lo * kEntry) != cp) return false;
+    const uint8_t* e   = index + lo * kEntry;
+    const uint32_t off = u32(e + 4);
+    Symbol s{e[8], e[9], e[10], e[11], pixels + off};
+    const size_t bytes = static_cast<size_t>((s.w + 1) / 2) * s.h;
+    if (s.x + s.w > 12 || s.y + s.h > 24 || static_cast<size_t>(pixels - blob) + off + bytes > size) {
+        return false;
+    }
+    if (out) *out = s;
+    return true;
+}
+
+void draw_symbol(const Symbol& s, int w, int h, const Fill& fill)
+{
+    const int ox = (w - 12) / 2;  // 全角のセルなら中央に
+    const int oy = (h - 24) / 2;
+    const int stride = (s.w + 1) / 2;
+    for (int r = 0; r < s.h; ++r) {
+        const uint8_t* row = s.data + r * stride;
+        int c = 0;
+        while (c < s.w) {
+            const int a = (c & 1) ? (row[c / 2] & 0x0F) : (row[c / 2] >> 4);
+            int run = 1;
+            while (c + run < s.w &&
+                   (((c + run) & 1) ? (row[(c + run) / 2] & 0x0F) : (row[(c + run) / 2] >> 4)) == a) {
+                ++run;
+            }
+            if (a) fill(ox + s.x + c, oy + s.y + r, run, 1, static_cast<uint8_t>(a * 17));
+            c += run;
+        }
+    }
 }
 
 namespace {
