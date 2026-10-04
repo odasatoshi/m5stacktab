@@ -14,12 +14,19 @@
 #include "rotate.hpp"
 #include "term_glyphs.hpp"
 
+// 記号フォント (main/symbols.bin を EMBED_FILES で埋め込んだもの)。
+extern "C" const uint8_t symbols_bin_start[] asm("_binary_symbols_bin_start");
+extern "C" const uint8_t symbols_bin_end[] asm("_binary_symbols_bin_end");
+
 namespace {
 
 const char* TAG = "render";
 
 // 日本語等幅で一番大きいもの。1280x720 で 106x30 になる。
 const lgfx::IFont* const kFont = &fonts::efontJA_24;
+
+const uint8_t* const kSymbols     = symbols_bin_start;
+const size_t         kSymbolsSize = static_cast<size_t>(symbols_bin_end - symbols_bin_start);
 
 // a から b へ alpha/255 だけ寄せる (RGB565 のまま)。dim とシェード ░▒▓ に使う。
 uint16_t blend565(uint16_t a, uint16_t b, uint8_t alpha)
@@ -108,16 +115,16 @@ int TermRenderer::font_advance(uint32_t cp)
 TermRenderer::Glyph TermRenderer::resolve(uint32_t cp, int width)
 {
     if (cp == 0) cp = ' ';
-    // 置き換えは 1 段だけ（置き換え先も無ければ枠にする）。
-    for (int i = 0; i < 2; ++i) {
-        if (glyph::is_drawn(cp)) return {Kind::kDrawn, cp};
-        const int adv = font_advance(cp);
-        if (adv == cell_w_ * width) return {Kind::kFont, cp};
-        if (adv > 0) return {Kind::kAlone, cp};
-        const uint32_t sub = glyph::substitute(cp);
-        if (sub == 0) break;
-        cp = sub;
+    if (glyph::is_drawn(cp)) return {Kind::kDrawn, cp};
+    // 記号フォントに有れば記号フォント。efont に無い字と、efont の字形が潰れている
+    // 幾何学図形だけが入っている（どちらを入れるかは tools/gen_symbol_font.py が決める）。
+    // 入っているのは U+00A0 以上だけなので、ASCII は探さない。
+    if (cp >= 0xA0 && glyph::find_symbol(kSymbols, kSymbolsSize, cp, nullptr)) {
+        return {Kind::kSymbol, cp};
     }
+    const int adv = font_advance(cp);
+    if (adv == cell_w_ * width) return {Kind::kFont, cp};
+    if (adv > 0) return {Kind::kAlone, cp};
     return {Kind::kTofu, cp};
 }
 
@@ -337,6 +344,15 @@ void TermRenderer::draw_row(vt::Terminal& term, int y, int x_from, int x_to)
                         row_.fillRect(px + x, y, w, h, a == 255 ? st.fg : blend565(st.bg, st.fg, a));
                     });
                     break;
+                case Kind::kSymbol: {
+                    glyph::Symbol sym{};
+                    if (glyph::find_symbol(kSymbols, kSymbolsSize, g.cp, &sym)) {
+                        glyph::draw_symbol(sym, [&](int x, int y, int w, int h, uint8_t a) {
+                            row_.fillRect(px + x, y, w, h, a == 255 ? st.fg : blend565(st.bg, st.fg, a));
+                        });
+                    }
+                    break;
+                }
                 case Kind::kAlone: {
                     std::string s;
                     append_utf8(s, g.cp);
