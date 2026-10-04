@@ -3340,13 +3340,6 @@ void connect_ssh_profile(const prof::Profile& p, int index, const ViaTarget& via
         start_password_prompt(index, p.user, p.host);
         return;
     }
-    // **繋がっていれば切ってから繋ぎ直す。** 一覧から別の接続先を選ぶのは「切り替えたい」
-    // ということ。切らずに進むと ssh_connect が INVALID_STATE で断り、
-    // 「connecting...」を端末に書いたまま何も起きない（実機で踏んだ, #82）。
-    if (ssh_is_connected()) {
-        term_note("33", "前の接続を切ってから繋ぎ直す");
-        ssh_disconnect();
-    }
     // 先に VPN を張る（`via`）。**張れなければ繋ぎに行かない** —
     // VPN 越しの相手に素の経路で繋ぎに行くと、無関係の相手に当たり得る。
     if (via.named) {
@@ -3381,6 +3374,15 @@ void connect_ssh_profile(const prof::Profile& p, int index, const ViaTarget& via
             return;
         }
     }
+    // **前の接続はここで切る。** 一覧から別の接続先を選ぶのは「切り替えたい」ということ。
+    // 切らずに進むと ssh_connect が INVALID_STATE で断り、「connecting...」を端末に
+    // 書いたまま何も起きない（実機で踏んだ, #82）。
+    // - VPN と鍵の準備が済んでから切る。先に切ると、それが失敗したときに動いていた
+    //   セッションだけを失う
+    // - 条件を付けずに呼ぶ。「繋がっている (s_online)」だけを見ると、ハンドシェイク中の
+    //   タスクを見逃して同じように断られる。タスクが無ければ ssh_disconnect はすぐ戻る
+    if (ssh_is_connected()) term_note("33", "前の接続を切ってから繋ぎ直す");
+    ssh_disconnect();
     char line[128];
     std::snprintf(line, sizeof(line), "connecting to %s@%s:%u...", cfg.user.c_str(),
                   cfg.host.c_str(), (unsigned)cfg.port);
