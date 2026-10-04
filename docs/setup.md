@@ -103,13 +103,26 @@ parse ok: type=RSA bits=2048                          ← 鍵が読めている
 
 ## 5. WiFi に繋ぐ（画面から）
 
-`MENU → Settings → WiFi → Create new wifi setting` → SSID を選ぶ → パスワード → Enter。
+`MENU → WiFi → Create new wifi setting` → SSID を選ぶ → パスワード → Enter。
 
 - 端末に緑で `connected to "<SSID>" (192.168.x.x)` と出れば成功。
   パスワードを間違えると 20 秒後に赤で `… に 20 秒繋がらない` と出る
 - 画面から打てない環境なら、コンソールで `wifi <ssid> <password>`
 
-## 6. 接続先を SD から取り込む
+## 6. 接続先を足す
+
+### 画面から作る（SD 不要）
+
+`MENU → SSH → Create new SSH connection` で、`name` / `user` / `host` / `port` / `key` / `via` を
+1 項目ずつ入れて `保存`（項目を押すと 1 行入力が開く。Enter で確定、Esc で中止）。
+
+- `key` は押すたびに「NVS の鍵 → `(本体の鍵)` → `(なし)`」と回る。既定は `(本体の鍵)` =
+  鍵パーティション (`sshkey`) の鍵。`(なし)` はパスワード認証で、繋ぐときに画面で聞く
+- VPN は `MENU → VPN → Create new VPN connection`（`種別` を押すと wireguard ⇄ tailscale）
+- 保存したものは NVS に入り、再起動しても残る。同じ名前は保存しない（消してから作り直す）
+- 一覧の接続先を押すと `接続` / `削除`。接続中に別の接続先を選ぶと、切ってから繋ぎ直す
+
+### SD から取り込む（まとめて入れる・鍵も入れる）
 
 Mac で SD に `tab5/profiles.json` を書く（書式は `docs/profiles.example.json`）。
 鍵を使う接続先は、鍵ファイルを `tab5/keys/` に置いて `"key": "<ファイル名>"` と書く。
