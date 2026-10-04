@@ -587,7 +587,13 @@ bool ssh_key_split_selftest(std::string* detail)
 esp_err_t ssh_config_load(SshConfig& out)
 {
     nvs_handle_t nvs;
-    ESP_RETURN_ON_ERROR(nvs_open(kNvsNamespace, NVS_READONLY, &nvs), TAG, "nvs_open");
+    // 名前空間がまだ無い = `ssh <user> <host>` で保存したことがない。異常ではないので、
+    // 空の設定で ESP_OK を返す（呼び出し側は host.empty() を見る）。メニューの情報集めが
+    // 毎秒ここを呼ぶので、E ログを出すと 1 秒ごとに出続け、screencap の出力にも
+    // 割り込んで行が欠けていた (#101)。
+    esp_err_t open_err = nvs_open(kNvsNamespace, NVS_READONLY, &nvs);
+    if (open_err == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
+    ESP_RETURN_ON_ERROR(open_err, TAG, "nvs_open");
     char   buf[128];
     size_t len = sizeof(buf);
     esp_err_t err = nvs_get_str(nvs, "host", buf, &len);

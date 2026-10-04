@@ -4123,10 +4123,18 @@ int cmd_screencap(int argc, char** argv)
     display.setRotation(screen::rotation());
     const int w = rw / step;
     const int h = rh / step;
+    // **吸い出している間はログを止める。** 同じシリアルに出るので、10 秒ごとの alive や
+    // 描画ロックのタイムアウトが画素の行の途中に割り込み、その行が捨てられていた
+    // (1280x720 のつもりが 712 行, #101)。panic の出力はログを通らないので止まらない。
+    const esp_log_level_t prev_level = esp_log_level_get("*");
+    esp_log_level_set("*", ESP_LOG_NONE);
     std::printf("SCREENCAP %d %d %d rotation=%d\n", w, h, step, (int)screen::rotation());
     // 1 行ぶんをまとめて組んでから出す。1 画素ずつ printf すると桁違いに遅い。
     static char line[1281 * 4 + 8];
     for (int y = 0; y < h; ++y) {
+        // **1 行ごとに CPU を手放す。** 等倍だと 80 秒近く回るので、手放さないと
+        // CPU 1 のアイドルタスクが動けず、タスクウォッチドッグが警告を出し続けた (#101)。
+        vTaskDelay(1);
         char* out = line;
         for (int x = 0; x < w; ++x) {
             const uint16_t px = display.readPixel(x0 + x * step, y0 + y * step);
@@ -4140,6 +4148,7 @@ int cmd_screencap(int argc, char** argv)
         std::printf("%s\n", line);
     }
     std::printf("SCREENCAP END\n");
+    esp_log_level_set("*", prev_level);
     display.setRotation(prev_rotation);
     return 0;
 }
