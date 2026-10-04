@@ -4528,6 +4528,10 @@ extern "C" void app_main(void)
                 // 端末に移るのは set_menu_visible の仕事（画面キーボードの再表示と
                 // 行数の張り直しがここにある）。直に set_visible すると隠れたままになる。
                 set_menu_visible(false);
+                // **繋がっていれば端末に戻るだけ。** 続けると「connecting...」を端末に
+                // 書いてから ssh_connect が INVALID_STATE で失敗し、動いている TUI
+                // (herdr など) の画面にその 1 行が割り込む（実機で発生, #100）。
+                if (ssh_is_connected()) break;
                 // 保存済みの設定で繋ぐ。無ければ端末にそう出す。
                 SshConfig cfg;
                 if (ssh_config_load(cfg) != ESP_OK || cfg.host.empty()) {
