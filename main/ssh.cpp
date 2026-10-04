@@ -689,8 +689,22 @@ esp_err_t ssh_send(const void* data, size_t len)
     if (xSemaphoreTake(s_tx_lock, kLimit) != pdTRUE) return ESP_ERR_TIMEOUT;
     const auto* p    = static_cast<const uint8_t*>(data);
     size_t      sent = 0;
-    while (sent < len && s_online && xTaskGetTickCount() - start < kLimit) {
-        sent += xStreamBufferSend(s_tx, p + sent, len - sent, pdMS_TO_TICKS(50));
+    if (len <= kTxBufSize) {
+        // 丸ごと入る大きさなら、空くまで待って一度に入れる。間に合わなければ何も入れない
+        // （端末の応答は 1 件 30 バイト程度なので、切れた形で届くことがなくなる）。
+        while (s_online && xTaskGetTickCount() - start < kLimit) {
+            if (xStreamBufferSpacesAvailable(s_tx) >= len) {
+                sent = xStreamBufferSend(s_tx, p, len, 0);
+                break;
+            }
+            vTaskDelay(1);
+        }
+    } else {
+        // ponytail: バッファより大きいもの (長い貼り付け) は分けて入れるので、
+        // 上限に当たると途中までになる。貼り付けで問題になったら呼び出し側で分ける。
+        while (sent < len && s_online && xTaskGetTickCount() - start < kLimit) {
+            sent += xStreamBufferSend(s_tx, p + sent, len - sent, pdMS_TO_TICKS(50));
+        }
     }
     xSemaphoreGive(s_tx_lock);
     return sent == len ? ESP_OK : ESP_ERR_TIMEOUT;

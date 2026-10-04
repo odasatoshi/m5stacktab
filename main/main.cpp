@@ -980,7 +980,10 @@ void send_input(const std::string& s)
     // **SSH へ送る前に見る。** 入力中のパスワードをリモートに漏らさない。
     if (line_prompt_input(s)) return;
     if (ssh_is_connected()) {
-        ssh_send(s.data(), s.size());
+        // 失敗したら打鍵が失われているので、少なくとも痕跡を残す。
+        if (esp_err_t err = ssh_send(s.data(), s.size()); err != ESP_OK) {
+            ESP_LOGW(TAG, "key input dropped (%u bytes): %s", (unsigned)s.size(), esp_err_to_name(err));
+        }
         return;
     }
     // **未接続のエコーだけ手当てする。** リモートへ送るバイトは正しい
@@ -4492,7 +4495,9 @@ extern "C" void app_main(void)
     term->write("console: term / termtest / wifi / ssh / key\r\n");
     // DSR/CPR や DA の応答をリモートへ返す。vim などがこれを待つ。
     term->set_reply([](const std::string& s) {
-        if (ssh_is_connected()) ssh_send(s.data(), s.size());
+        if (ssh_is_connected() && ssh_send(s.data(), s.size()) != ESP_OK) {
+            ESP_LOGW(TAG, "terminal reply dropped (%u bytes)", (unsigned)s.size());
+        }
     });
     renderer->render(*term, /*force=*/true);
     ESP_LOGI(TAG, "first full draw: %d rows in %u us (draw %u / push %u)",
