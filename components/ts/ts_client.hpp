@@ -97,6 +97,8 @@ public:
 
     // 実行中に止める。
     void stop() { stop_ = true; }
+    bool stopped() const { return stop_; }
+    void reset_stop() { stop_ = false; }  // 起動のときだけ。run_once() は触らない
 
     // **同じタスクからだけ使うこと。** 中身に std::string があるので、
     // run_once() が走っているタスク以外から参照で受けると、読んでいる最中に
