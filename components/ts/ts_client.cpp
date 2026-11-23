@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <cstdio>
 #include <cstring>
 
@@ -32,8 +33,11 @@ constexpr int      kAuthPollSec    = 3;
 constexpr int      kRegisterTimeoutSec = 60;
 // 対話ログインで人間の承認を待つ持ち時間。**スマホを取り出して認証するまで分単位**。
 constexpr int      kAuthTimeoutSec     = 300;
-// netmap の long-poll を保持する時間。DISCO の往復はこのストリームが開いている間に起きる。
-constexpr int      kMapTimeoutSec      = 600;
+// netmap の long-poll は**時間で打ち切らない**（DISCO の往復はこのストリームが開いている間に
+// 起きる。10 分で切ると制御プレーンから offline になり、相手から見えなくなる）。
+// 代わりに、この秒数まったく受信が無ければ死んだ接続とみなして抜ける。
+// 制御プレーンは約 60 秒ごとに KeepAlive を送る（実機: 600 秒で keepalives=10）。
+constexpr int      kMapIdleSec         = 180;
 
 // 制御プレーンとの I/O。**平文と TLS を同じ型で扱う** (#68)。
 // esp_transport は tcp と ssl が同じハンドルを返すので、切り替えは init だけで済む。
@@ -206,7 +210,9 @@ void Client::reset_status()
 bool Client::run_once()
 {
     const auto& c = wg::default_crypto();
-    stop_         = false;
+    // **stop_ をここで下ろさない** (#107)。再試行の間に来た ts-stop を落とすと、
+    // 持ち時間が無いので止まらなくなる。下ろすのは起動のとき（reset_stop）。
+    if (stop_) return false;
     reset_status();
 
     uint8_t server_pub[32];
@@ -318,6 +324,7 @@ bool Client::run_once()
     constexpr size_t kMaxBuffered = 256 * 1024;
 
     std::vector<uint8_t> plain;
+    auto last_rx = std::chrono::steady_clock::now();
     auto pump = [&](int timeout_ms) -> bool {
         // まず溜まっている分を処理する。recv を先に呼ぶと、既にバッファにある
         // レコードを扱う前にタイムアウト分だけ待ってしまう。
@@ -350,6 +357,7 @@ bool Client::run_once()
             return false;
         }
         if (r == 0) return true;  // タイムアウトだけを続行扱いにする
+        last_rx = std::chrono::steady_clock::now();
         in.insert(in.end(), buf, buf + r);
         if (in.size() > kMaxBuffered || plain.size() > kMaxBuffered) {
             set_error("receive buffer limit exceeded");
@@ -532,6 +540,11 @@ bool Client::run_once()
     // 人間が 5 分かけて承認したときに long-poll へ 5 分しか残らず、
     // 参加した直後にトンネルが黙って落ちる。
     while (!stop_ && now_s() < deadline_s) {
+        if (sent_map && std::chrono::steady_clock::now() - last_rx > std::chrono::seconds(kMapIdleSec)) {
+            set_error("map stream idle");
+            st_.state = ClientStatus::State::kFailed;
+            return false;
+        }
         if (!pump(1000)) {
             if (st_.error.empty()) set_error("connection closed");
             st_.state = ClientStatus::State::kFailed;
@@ -618,7 +631,7 @@ bool Client::run_once()
             if (!shown_auth_url.empty()) set_auth_url("");
             // **ここから long-poll の持ち時間を数え直す。** 承認に何分かかっても
             // netmap を受け取る時間が削られないようにする。
-            deadline_s = now_s() + kMapTimeoutSec;
+            deadline_s = std::numeric_limits<int>::max();
             if (!rr.machine_authorized) {
                 set_error("machine not authorized");
                 st_.state = ClientStatus::State::kFailed;
@@ -648,6 +661,7 @@ bool Client::run_once()
                 return false;
             }
             sent_map  = true;
+            last_rx   = std::chrono::steady_clock::now();  // 無受信の数え始めは map を投げた時点
             st_.state = ClientStatus::State::kMapping;
             continue;
         }

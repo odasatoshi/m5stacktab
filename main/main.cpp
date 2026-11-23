@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <utility>
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -1351,8 +1352,38 @@ int64_t      s_ts_started_us = 0;
 void ts_task(void* arg)
 {
     auto* client = static_cast<ts::Client*>(arg);
-    const bool ok = client->run_once();
-    // **QR を必ず畳む。** 承認されずにタイムアウトした / GOAWAY を食らった場合、
+    auto fold_qr = [] {
+        TermGuard guard;
+        if (guard.ok()) s_auth_qr_url.clear();
+        hide_auth_qr(/*redraw=*/guard.ok());
+    };
+    // **一度でも netmap まで届いたら、切れても張り直す** (#107)。制御プレーンから
+    // 外れると offline になり、相手から見えなくなる。最初から通らないとき（authkey の誤り、
+    // 承認されない）は繰り返さない。待っている間も ts-stop を効かせる。
+    // 張り直しが netmap まで届かないまま続くときは kMaxFutile 回で諦める
+    // （鍵の失効や authkey の失効で、永久に回らないため）。
+    // ponytail: 上限 60 秒の指数バックオフ。揺らぎの統計が要るなら出す。
+    constexpr int kMaxFutile = 20;
+    bool ok       = false;
+    bool was_up   = false;
+    int  futile   = 0;
+    int  backoff  = 5;
+    for (;;) {
+        const auto t0 = std::chrono::steady_clock::now();
+        ok = client->run_once();
+        fold_qr();
+        const bool mapped = client->status().map_messages > 0;
+        if (mapped) { was_up = true; futile = 0; } else { ++futile; }
+        // 1 分以上つながっていたなら、次の失敗は新しい障害として 5 秒から数える。
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(60)) backoff = 5;
+        if (!was_up || client->stopped() || futile >= kMaxFutile) break;
+        ESP_LOGW(TAG, "ts: disconnected (%s), retry in %d s", client->status().error.c_str(),
+                 backoff);
+        for (int i = 0; i < backoff && !client->stopped(); ++i) vTaskDelay(pdMS_TO_TICKS(1000));
+        if (client->stopped()) break;
+        backoff = std::min(backoff * 2, 60);
+    }
+    // **QR を必ず畳む。**（run_once() の後は毎回呼ぶ。再試行の待ちの間も死んだ QR を残さない）
     // 畳まないと死んだ QR が残り、端末も更新されなくなる (#59)。
     // **畳むことをロックに依存させない。** TermGuard は 2 秒でタイムアウトする
     // （メニューの再描画は NVS 読みを含むので実際に長い）ので、取れたときだけ
@@ -1364,11 +1395,6 @@ void ts_task(void* arg)
     // 外から clear() すると生成中に解放済みバッファを読ませることになる。
     // 取れなくても実害は無い: run_once() が抜けるとき state が kFailed になるので、
     // メニューを開閉しても「まだ承認待ち」の条件が成立せず出し直されない。
-    {
-        TermGuard guard;
-        if (guard.ok()) s_auth_qr_url.clear();
-        hide_auth_qr(/*redraw=*/guard.ok());
-    }
     // run_once() から戻ったあとなので、この参照を書き換える者はもういない。
     const auto& st = client->status();
     ESP_LOGI(TAG, "ts finished: %s state=%d registered=%d map_messages=%u", ok ? "ok" : "failed",
@@ -1531,6 +1557,7 @@ bool ts_start(const std::string& host, const std::string& authkey, uint16_t port
     // 起動できてから公開する。先に入れると、鍵導出や xTaskCreate で失敗した後に
     // ts-status が「一度も動いていないのに finished」と表示する。
     s_ts_started_us = esp_timer_get_time();
+    client.reset_stop();  // 前回の ts-stop を持ち越さない（run_once は下ろさない）
     s_ts_client     = &client;
     // X25519 が 1 回で 10KB 近く使い、HTTP/2 のバッファも重なるので広く取る。
     if (xTaskCreate(&ts_task, "ts", 32768, &client, 5, &s_ts_task) != pdPASS) {
